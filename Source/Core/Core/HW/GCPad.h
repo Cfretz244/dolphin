@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "Common/CommonTypes.h"
 #include "InputCommon/ControllerInterface/CoreDevice.h"
 
@@ -31,4 +33,9 @@ void Rumble(int pad_num, ControlState strength);
 void ResetRumble(int pad_num);
 
 bool GetMicButton(int pad_num);
+
+// External input provider for embedding (e.g., Delta emulator frontend).
+// When set, GetStatus() calls this instead of reading from ControllerInterface.
+void SetExternalProvider(std::function<GCPadStatus(int)> provider);
+void ClearExternalProvider();
 }  // namespace Pad

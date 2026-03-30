@@ -3,6 +3,8 @@
 
 #include "Core/HW/GCPad.h"
 
+#include <functional>
+
 #include "Common/Common.h"
 #include "Core/HW/GCPadEmu.h"
 #include "InputCommon/ControllerEmu/ControlGroup/ControlGroup.h"
@@ -12,6 +14,9 @@
 namespace Pad
 {
 static InputConfig s_config("GCPadNew", _trans("Pad"), "GCPad", "Pad");
+
+// External input provider for embedding (e.g., Delta emulator frontend)
+static std::function<GCPadStatus(int)> s_external_provider;
 InputConfig* GetConfig()
 {
   return &s_config;
@@ -55,6 +60,8 @@ bool IsInitialized()
 
 GCPadStatus GetStatus(int pad_num)
 {
+  if (s_external_provider)
+    return s_external_provider(pad_num);
   return static_cast<GCPad*>(s_config.GetController(pad_num))->GetInput();
 }
 
@@ -76,5 +83,15 @@ void ResetRumble(const int pad_num)
 bool GetMicButton(const int pad_num)
 {
   return static_cast<GCPad*>(s_config.GetController(pad_num))->GetMicButton();
+}
+
+void SetExternalProvider(std::function<GCPadStatus(int)> provider)
+{
+  s_external_provider = std::move(provider);
+}
+
+void ClearExternalProvider()
+{
+  s_external_provider = nullptr;
 }
 }  // namespace Pad

@@ -57,6 +57,9 @@ static bool WindowSystemTypeSupportsMetal(WindowSystemType type)
   {
   case WindowSystemType::MacOS:
   case WindowSystemType::Headless:
+#if TARGET_OS_IOS || TARGET_OS_SIMULATOR
+  case WindowSystemType::IOS:
+#endif
     return true;
   default:
     return false;
