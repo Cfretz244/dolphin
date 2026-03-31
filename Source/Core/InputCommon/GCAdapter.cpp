@@ -3,12 +3,16 @@
 
 #include "InputCommon/GCAdapter.h"
 
-#ifndef ANDROID
-#define GCADAPTER_USE_LIBUSB_IMPLEMENTATION true
-#define GCADAPTER_USE_ANDROID_IMPLEMENTATION false
-#else
+#if defined(ANDROID)
 #define GCADAPTER_USE_LIBUSB_IMPLEMENTATION false
 #define GCADAPTER_USE_ANDROID_IMPLEMENTATION true
+#elif !defined(__LIBUSB__)
+// No libusb available (e.g. iOS builds)
+#define GCADAPTER_USE_LIBUSB_IMPLEMENTATION false
+#define GCADAPTER_USE_ANDROID_IMPLEMENTATION false
+#else
+#define GCADAPTER_USE_LIBUSB_IMPLEMENTATION true
+#define GCADAPTER_USE_ANDROID_IMPLEMENTATION false
 #endif
 
 #include <array>
