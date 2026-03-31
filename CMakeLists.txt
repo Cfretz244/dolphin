@@ -722,9 +722,12 @@ endif()
 
 dolphin_find_optional_system_library(MBEDTLS Externals/mbedtls 2.28)
 
-dolphin_find_optional_system_library(CURL Externals/curl)
+# CURL disabled for iOS builds — not needed for core emulation
+if(NOT DOLPHIN_IOS_BUILD)
+  dolphin_find_optional_system_library(CURL Externals/curl)
+endif()
 
-if(NOT ANDROID)
+if(NOT ANDROID AND NOT DOLPHIN_IOS_BUILD)
   dolphin_find_optional_system_library(HIDAPI Externals/hidapi)
 endif()
 

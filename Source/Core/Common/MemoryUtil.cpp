@@ -1,6 +1,18 @@
 // Copyright 2008 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// On iOS, pthread_jit_write_protect_np exists at runtime (with JIT entitlement)
+// but Apple's SDK marks it as API_UNAVAILABLE(ios). We declare it ourselves
+// to bypass the availability check. This is standard practice for iOS JIT apps
+// distributed via AltStore/TrollStore/TestFlight.
+#if defined(__APPLE__) && defined(__arm64__) && __has_include(<TargetConditionals.h>)
+#include <TargetConditionals.h>
+#if TARGET_OS_IOS
+extern "C" void pthread_jit_write_protect_np(int enabled);
+#define DOLPHIN_IOS_JIT_OVERRIDE 1
+#endif
+#endif
+
 #include "Common/MemoryUtil.h"
 
 #include <cstddef>
@@ -17,7 +29,11 @@
 #include <stdio.h>
 #include <sys/mman.h>
 #if defined(_M_ARM_64) && defined(__APPLE__)
+#ifndef DOLPHIN_IOS_JIT_OVERRIDE
+// On macOS, pthread.h provides pthread_jit_write_protect_np.
+// On iOS, we declare it ourselves above to bypass the API_UNAVAILABLE annotation.
 #include <pthread.h>
+#endif
 #endif
 #if defined __APPLE__ || defined __FreeBSD__ || defined __OpenBSD__ || defined __NetBSD__
 #include <sys/sysctl.h>

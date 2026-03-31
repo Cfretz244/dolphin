@@ -65,7 +65,7 @@ add_library(common
   FatFsUtil.h
   FileSearch.cpp
   FileSearch.h
-  FilesystemWatcher.cpp
+  $<$<NOT:$<BOOL:${DOLPHIN_IOS_BUILD}>>:FilesystemWatcher.cpp>
   FilesystemWatcher.h
   FileUtil.cpp
   FileUtil.h
@@ -83,7 +83,7 @@ add_library(common
   HookableEvent.h
   HostDisassembler.cpp
   HostDisassembler.h
-  HttpRequest.cpp
+  $<$<NOT:$<BOOL:${DOLPHIN_IOS_BUILD}>>:HttpRequest.cpp>
   HttpRequest.h
   Image.cpp
   Image.h
@@ -187,10 +187,10 @@ PUBLIC
   sfml-network
 
 PRIVATE
-  CURL::libcurl
+  $<$<NOT:$<BOOL:${DOLPHIN_IOS_BUILD}>>:CURL::libcurl>
   FatFs
   spng::spng
-  watcher
+  $<$<NOT:$<BOOL:${DOLPHIN_IOS_BUILD}>>:watcher>
   ${VTUNE_LIBRARIES}
 )
 
@@ -199,12 +199,17 @@ if ((DEFINED CMAKE_ANDROID_ARCH_ABI AND CMAKE_ANDROID_ARCH_ABI MATCHES "x86|x86_
   target_link_libraries(common PRIVATE bdisasm)
 endif()
 
-if (APPLE)
+if (APPLE AND NOT DOLPHIN_IOS_BUILD)
   target_link_libraries(common
   PRIVATE
     ${APPKIT_LIBRARY}
     ${COREFOUNDATION_LIBRARY}
     ${IOK_LIBRARY}
+  )
+elseif(APPLE AND DOLPHIN_IOS_BUILD)
+  target_link_libraries(common
+  PRIVATE
+    ${COREFOUNDATION_LIBRARY}
   )
 elseif(WIN32)
   target_link_libraries(common
@@ -315,7 +320,7 @@ if(WIN32)
     WindowsDevice.h
     WindowsRegistry.cpp
   )
-elseif(APPLE)
+elseif(APPLE AND NOT DOLPHIN_IOS_BUILD)
   target_sources(common PRIVATE
     GL/GLInterface/AGL.h
     GL/GLInterface/AGL.mm
