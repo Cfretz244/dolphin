@@ -108,7 +108,7 @@ if(WIN32)
     ControllerInterface/ForceFeedback/ForceFeedbackDevice.cpp
     ControllerInterface/ForceFeedback/ForceFeedbackDevice.h
   )
-elseif(APPLE)
+elseif(APPLE AND NOT DOLPHIN_IOS_BUILD)
   target_sources(inputcommon PRIVATE
     ControllerInterface/Quartz/Quartz.h
     ControllerInterface/Quartz/Quartz.mm
@@ -120,6 +120,13 @@ elseif(APPLE)
     ${CARBON_LIBRARY}
     ${COCOA_LIBRARY}
     ${FORCEFEEDBACK_LIBRARY}
+  )
+  target_compile_options(inputcommon PRIVATE
+    -fobjc-arc
+  )
+elseif(APPLE AND DOLPHIN_IOS_BUILD)
+  target_link_libraries(inputcommon PRIVATE
+    ${COREFOUNDATION_LIBRARY}
   )
   target_compile_options(inputcommon PRIVATE
     -fobjc-arc
