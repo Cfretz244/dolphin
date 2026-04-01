@@ -76,6 +76,7 @@ typedef struct AOTState {
 // Runtime helpers (implemented in the Dolphin runtime harness)
 extern uint32_t aot_read_u8(AOTState* s, uint32_t addr);
 extern uint32_t aot_read_u16(AOTState* s, uint32_t addr);
+extern uint32_t aot_read_u16_se(AOTState* s, uint32_t addr);  // sign-extended half
 extern uint32_t aot_read_u32(AOTState* s, uint32_t addr);
 extern uint64_t aot_read_u64(AOTState* s, uint32_t addr);
 extern void aot_write_u8(AOTState* s, uint32_t val, uint32_t addr);
@@ -85,6 +86,23 @@ extern void aot_write_u64(AOTState* s, uint64_t val, uint32_t addr);
 extern void aot_interpreter_single_step(AOTState* s);
 extern void aot_sc(AOTState* s);
 extern void aot_rfi(AOTState* s);
+
+// FP conversion helpers
+extern uint64_t aot_convert_to_double(uint32_t single_bits);
+extern uint32_t aot_convert_to_single(uint64_t double_bits);
+
+// SPR/CR/MSR helpers
+extern uint32_t aot_mfspr_special(AOTState* s, uint32_t spr);
+extern void aot_mtspr_special(AOTState* s, uint32_t spr, uint32_t val);
+extern uint32_t aot_mfcr(AOTState* s);
+extern void aot_mtcrf(AOTState* s, uint32_t mask, uint32_t rs_reg);
+extern void aot_msr_updated(AOTState* s);
+extern void aot_cr_logical(AOTState* s, int crbD, int crbA, int crbB, const char* op);
+
+// Cache ops
+extern void aot_dcbz(AOTState* s, uint32_t addr);
+extern void aot_dcbt(AOTState* s, uint32_t addr);
+extern void aot_icbi(AOTState* s, uint32_t addr);
 
 // CR helpers (inline for performance)
 static const uint64_t aot_cr_table[16] = {

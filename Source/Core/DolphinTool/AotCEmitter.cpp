@@ -77,6 +77,40 @@ bool AOTCEmitter::EmitInstruction(std::string& out, UGeckoInstruction inst, u32 
   case 23: EmitRlwnmx(out, inst); return true;
   case 18: EmitBx(out, inst, pc); return true;
   case 16: EmitBcx(out, inst, pc); return true;
+
+  // Load integer
+  case 32: EmitLoadInt(out, inst, "aot_read_u32", false, false); return true; // lwz
+  case 33: EmitLoadInt(out, inst, "aot_read_u32", true, false); return true;  // lwzu
+  case 40: EmitLoadInt(out, inst, "aot_read_u16", false, false); return true; // lhz
+  case 41: EmitLoadInt(out, inst, "aot_read_u16", true, false); return true;  // lhzu
+  case 42: EmitLoadInt(out, inst, "aot_read_u16_se", false, false); return true; // lha
+  case 43: EmitLoadInt(out, inst, "aot_read_u16_se", true, false); return true;  // lhau
+  case 34: EmitLoadInt(out, inst, "aot_read_u8", false, false); return true;  // lbz
+  case 35: EmitLoadInt(out, inst, "aot_read_u8", true, false); return true;   // lbzu
+  // Store integer
+  case 36: EmitStoreInt(out, inst, "aot_write_u32", false, false); return true; // stw
+  case 37: EmitStoreInt(out, inst, "aot_write_u32", true, false); return true;  // stwu
+  case 44: EmitStoreInt(out, inst, "aot_write_u16", false, false); return true; // sth
+  case 45: EmitStoreInt(out, inst, "aot_write_u16", true, false); return true;  // sthu
+  case 38: EmitStoreInt(out, inst, "aot_write_u8", false, false); return true;  // stb
+  case 39: EmitStoreInt(out, inst, "aot_write_u8", true, false); return true;   // stbu
+  // Load/store multiple
+  case 46: EmitLmw(out, inst); return true;
+  case 47: EmitStmw(out, inst); return true;
+  // Load FP
+  case 48: EmitLfs(out, inst, false, false); return true; // lfs
+  case 49: EmitLfs(out, inst, true, false); return true;  // lfsu
+  case 50: EmitLfd(out, inst, false, false); return true; // lfd
+  case 51: EmitLfd(out, inst, true, false); return true;  // lfdu
+  // Store FP
+  case 52: EmitStfs(out, inst, false, false); return true; // stfs
+  case 53: EmitStfs(out, inst, true, false); return true;  // stfsu
+  case 54: EmitStfd(out, inst, false, false); return true; // stfd
+  case 55: EmitStfd(out, inst, true, false); return true;  // stfdu
+  // Sync/isync (no-ops)
+  case 17: out += "    aot_sc(s); return;\n"; return true; // sc
+  case 46 + 128: return true; // placeholder
+
   case 31: return EmitTable31(out, inst, pc);
   case 19: return EmitTable19(out, inst, pc);
   default: return false;
@@ -319,6 +353,46 @@ bool AOTCEmitter::EmitTable31(std::string& out, UGeckoInstruction inst, u32 pc)
   case 922: EmitExtshx(out, inst); return true;
   case 0:   EmitCmp(out, inst); return true;
   case 32:  EmitCmpl(out, inst); return true;
+  // Indexed load/store integer
+  case 23:  EmitLoadInt(out, inst, "aot_read_u32", false, true); return true;  // lwzx
+  case 55:  EmitLoadInt(out, inst, "aot_read_u32", true, true); return true;   // lwzux
+  case 279: EmitLoadInt(out, inst, "aot_read_u16", false, true); return true;  // lhzx
+  case 311: EmitLoadInt(out, inst, "aot_read_u16", true, true); return true;   // lhzux
+  case 343: EmitLoadInt(out, inst, "aot_read_u16_se", false, true); return true; // lhax
+  case 375: EmitLoadInt(out, inst, "aot_read_u16_se", true, true); return true;  // lhaux
+  case 87:  EmitLoadInt(out, inst, "aot_read_u8", false, true); return true;   // lbzx
+  case 119: EmitLoadInt(out, inst, "aot_read_u8", true, true); return true;    // lbzux
+  case 151: EmitStoreInt(out, inst, "aot_write_u32", false, true); return true; // stwx
+  case 183: EmitStoreInt(out, inst, "aot_write_u32", true, true); return true;  // stwux
+  case 407: EmitStoreInt(out, inst, "aot_write_u16", false, true); return true; // sthx
+  case 439: EmitStoreInt(out, inst, "aot_write_u16", true, true); return true;  // sthux
+  case 215: EmitStoreInt(out, inst, "aot_write_u8", false, true); return true;  // stbx
+  case 247: EmitStoreInt(out, inst, "aot_write_u8", true, true); return true;   // stbux
+  // Indexed load/store FP
+  case 535: EmitLfs(out, inst, false, true); return true;   // lfsx
+  case 567: EmitLfs(out, inst, true, true); return true;    // lfsux
+  case 599: EmitLfd(out, inst, false, true); return true;   // lfdx
+  case 631: EmitLfd(out, inst, true, true); return true;    // lfdux
+  case 663: EmitStfs(out, inst, false, true); return true;  // stfsx
+  case 695: EmitStfs(out, inst, true, true); return true;   // stfsux
+  case 727: EmitStfd(out, inst, false, true); return true;  // stfdx
+  case 759: EmitStfd(out, inst, true, true); return true;   // stfdux
+  // SPR
+  case 339: EmitMfspr(out, inst); return true;
+  case 467: EmitMtspr(out, inst); return true;
+  case 19:  EmitMfcr(out, inst); return true;
+  case 144: EmitMtcrf(out, inst); return true;
+  // Sync
+  case 598: return true; // sync (no-op)
+  case 854: return true; // eieio (no-op)
+  // Cache
+  case 278: out += fmt::format("    aot_dcbt(s,0);\n"); return true; // dcbt (no-op)
+  case 246: out += fmt::format("    aot_dcbt(s,0);\n"); return true; // dcbtst (no-op)
+  case 1014: out += fmt::format("    aot_dcbz(s,s->gpr[{}]+s->gpr[{}]);\n", I(inst.RA), I(inst.RB)); return true;
+  case 86:  return true; // dcbf (no-op for AOT)
+  case 54:  return true; // dcbst (no-op for AOT)
+  case 470: return true; // dcbi (no-op for AOT)
+  case 982: out += fmt::format("    aot_icbi(s,s->gpr[{}]+s->gpr[{}]);\n", I(inst.RA), I(inst.RB)); return true;
   default:  return false;
   }
 }
@@ -329,6 +403,17 @@ bool AOTCEmitter::EmitTable19(std::string& out, UGeckoInstruction inst, u32 pc)
   {
   case 528: EmitBcctrx(out, inst, pc); return true;
   case 16:  EmitBclrx(out, inst, pc); return true;
+  case 0:   EmitMcrf(out, inst); return true;
+  case 257: EmitCrLogical(out, inst, "^"); return true;  // crxor
+  case 449: EmitCrLogical(out, inst, "|"); return true;  // cror
+  case 289: EmitCrLogical(out, inst, "~^"); return true; // creqv (XNOR)
+  case 225: EmitCrLogical(out, inst, "&"); return true;  // crand
+  case 129: EmitCrLogical(out, inst, "&~"); return true; // crandc
+  case 417: EmitCrLogical(out, inst, "|~"); return true; // crorc
+  case 33:  EmitCrLogical(out, inst, "~&"); return true; // crnand
+  case 193: EmitCrLogical(out, inst, "~|"); return true; // crnor
+  case 150: return true; // isync (no-op)
+  case 50:  out += "    aot_rfi(s); return;\n"; return true; // rfi
   default:  return false;
   }
 }
@@ -632,6 +717,269 @@ void AOTCEmitter::EmitBranchTo(std::string& out, u32 target)
 void AOTCEmitter::EmitIndirectDispatch(std::string& out)
 {
   out += fmt::format("    {}_dispatch(s); return;\n", m_prefix);
+}
+
+// ============================================================================
+// Load/store integer
+// ============================================================================
+
+void AOTCEmitter::EmitLoadInt(std::string& out, UGeckoInstruction inst, const char* helper,
+                              bool update, bool indexed)
+{
+  u32 rd = I(inst.RD), ra = I(inst.RA);
+  out += "    {\n";
+  if (indexed)
+  {
+    u32 rb = I(inst.RB);
+    if (ra)
+      out += fmt::format("        uint32_t ea=s->gpr[{}]+s->gpr[{}];\n", ra, rb);
+    else
+      out += fmt::format("        uint32_t ea=s->gpr[{}];\n", rb);
+  }
+  else
+  {
+    s32 offset = s32(s16(inst.SIMM_16));
+    if (ra)
+      out += fmt::format("        uint32_t ea=s->gpr[{}]+{};\n", ra, offset);
+    else
+      out += fmt::format("        uint32_t ea=(uint32_t){};\n", offset);
+  }
+  out += fmt::format("        uint32_t val={}(s,ea);\n", helper);
+  out += fmt::format("        s->gpr[{}]=val;\n", rd);
+  if (update && ra)
+    out += fmt::format("        s->gpr[{}]=ea;\n", ra);
+  out += "    }\n";
+}
+
+void AOTCEmitter::EmitStoreInt(std::string& out, UGeckoInstruction inst, const char* helper,
+                               bool update, bool indexed)
+{
+  u32 rs = I(inst.RS), ra = I(inst.RA);
+  out += "    {\n";
+  if (indexed)
+  {
+    u32 rb = I(inst.RB);
+    if (ra)
+      out += fmt::format("        uint32_t ea=s->gpr[{}]+s->gpr[{}];\n", ra, rb);
+    else
+      out += fmt::format("        uint32_t ea=s->gpr[{}];\n", rb);
+  }
+  else
+  {
+    s32 offset = s32(s16(inst.SIMM_16));
+    if (ra)
+      out += fmt::format("        uint32_t ea=s->gpr[{}]+{};\n", ra, offset);
+    else
+      out += fmt::format("        uint32_t ea=(uint32_t){};\n", offset);
+  }
+  out += fmt::format("        {}(s,s->gpr[{}],ea);\n", helper, rs);
+  if (update && ra)
+    out += fmt::format("        s->gpr[{}]=ea;\n", ra);
+  out += "    }\n";
+}
+
+void AOTCEmitter::EmitLmw(std::string& out, UGeckoInstruction inst)
+{
+  u32 rd = I(inst.RD), ra = I(inst.RA);
+  s32 offset = s32(s16(inst.SIMM_16));
+  out += "    {\n";
+  if (ra)
+    out += fmt::format("        uint32_t ea=s->gpr[{}]+{};\n", ra, offset);
+  else
+    out += fmt::format("        uint32_t ea=(uint32_t){};\n", offset);
+  out += fmt::format("        for(int r={};r<32;r++,ea+=4) s->gpr[r]=aot_read_u32(s,ea);\n", rd);
+  out += "    }\n";
+}
+
+void AOTCEmitter::EmitStmw(std::string& out, UGeckoInstruction inst)
+{
+  u32 rs = I(inst.RS), ra = I(inst.RA);
+  s32 offset = s32(s16(inst.SIMM_16));
+  out += "    {\n";
+  if (ra)
+    out += fmt::format("        uint32_t ea=s->gpr[{}]+{};\n", ra, offset);
+  else
+    out += fmt::format("        uint32_t ea=(uint32_t){};\n", offset);
+  out += fmt::format("        for(int r={};r<32;r++,ea+=4) aot_write_u32(s,s->gpr[r],ea);\n", rs);
+  out += "    }\n";
+}
+
+// ============================================================================
+// Load/store FP
+// ============================================================================
+
+void AOTCEmitter::EmitLfs(std::string& out, UGeckoInstruction inst, bool update, bool indexed)
+{
+  u32 fd = I(inst.RD), ra = I(inst.RA);
+  out += "    {\n";
+  if (indexed)
+  {
+    u32 rb = I(inst.RB);
+    out += fmt::format("        uint32_t ea={}+s->gpr[{}];\n",
+                       ra ? fmt::format("s->gpr[{}]", ra) : "0", rb);
+  }
+  else
+  {
+    s32 offset = s32(s16(inst.SIMM_16));
+    out += fmt::format("        uint32_t ea={}+{};\n",
+                       ra ? fmt::format("s->gpr[{}]", ra) : "0", offset);
+  }
+  out += "        uint32_t raw=aot_read_u32(s,ea);\n";
+  out += fmt::format("        uint64_t dv=aot_convert_to_double(raw); "
+                     "s->ps[{}].ps0=dv; s->ps[{}].ps1=dv;\n", fd, fd);
+  if (update && ra)
+    out += fmt::format("        s->gpr[{}]=ea;\n", ra);
+  out += "    }\n";
+}
+
+void AOTCEmitter::EmitLfd(std::string& out, UGeckoInstruction inst, bool update, bool indexed)
+{
+  u32 fd = I(inst.RD), ra = I(inst.RA);
+  out += "    {\n";
+  if (indexed)
+  {
+    u32 rb = I(inst.RB);
+    out += fmt::format("        uint32_t ea={}+s->gpr[{}];\n",
+                       ra ? fmt::format("s->gpr[{}]", ra) : "0", rb);
+  }
+  else
+  {
+    s32 offset = s32(s16(inst.SIMM_16));
+    out += fmt::format("        uint32_t ea={}+{};\n",
+                       ra ? fmt::format("s->gpr[{}]", ra) : "0", offset);
+  }
+  out += fmt::format("        s->ps[{}].ps0=aot_read_u64(s,ea);\n", fd);
+  if (update && ra)
+    out += fmt::format("        s->gpr[{}]=ea;\n", ra);
+  out += "    }\n";
+}
+
+void AOTCEmitter::EmitStfs(std::string& out, UGeckoInstruction inst, bool update, bool indexed)
+{
+  u32 fs = I(inst.RS), ra = I(inst.RA);
+  out += "    {\n";
+  if (indexed)
+  {
+    u32 rb = I(inst.RB);
+    out += fmt::format("        uint32_t ea={}+s->gpr[{}];\n",
+                       ra ? fmt::format("s->gpr[{}]", ra) : "0", rb);
+  }
+  else
+  {
+    s32 offset = s32(s16(inst.SIMM_16));
+    out += fmt::format("        uint32_t ea={}+{};\n",
+                       ra ? fmt::format("s->gpr[{}]", ra) : "0", offset);
+  }
+  out += fmt::format("        aot_write_u32(s,aot_convert_to_single(s->ps[{}].ps0),ea);\n", fs);
+  if (update && ra)
+    out += fmt::format("        s->gpr[{}]=ea;\n", ra);
+  out += "    }\n";
+}
+
+void AOTCEmitter::EmitStfd(std::string& out, UGeckoInstruction inst, bool update, bool indexed)
+{
+  u32 fs = I(inst.RS), ra = I(inst.RA);
+  out += "    {\n";
+  if (indexed)
+  {
+    u32 rb = I(inst.RB);
+    out += fmt::format("        uint32_t ea={}+s->gpr[{}];\n",
+                       ra ? fmt::format("s->gpr[{}]", ra) : "0", rb);
+  }
+  else
+  {
+    s32 offset = s32(s16(inst.SIMM_16));
+    out += fmt::format("        uint32_t ea={}+{};\n",
+                       ra ? fmt::format("s->gpr[{}]", ra) : "0", offset);
+  }
+  out += fmt::format("        aot_write_u64(s,s->ps[{}].ps0,ea);\n", fs);
+  if (update && ra)
+    out += fmt::format("        s->gpr[{}]=ea;\n", ra);
+  out += "    }\n";
+}
+
+// ============================================================================
+// SPR/system
+// ============================================================================
+
+void AOTCEmitter::EmitMfspr(std::string& out, UGeckoInstruction inst)
+{
+  u32 rd = I(inst.RD);
+  u32 spr = (I(inst.SPR) & 0x1F) << 5 | (I(inst.SPR) >> 5);
+  // Common SPRs inline, special ones via runtime
+  switch (spr)
+  {
+  case 8:   // LR
+  case 9:   // CTR
+    out += fmt::format("    s->gpr[{}]=s->spr[{}];\n", rd, spr);
+    break;
+  case 1:   // XER
+    out += fmt::format("    s->gpr[{}]=((uint32_t)(s->xer_so_ov>>1)<<31)|"
+                       "((uint32_t)(s->xer_so_ov&1)<<30)|((uint32_t)s->xer_ca<<29)|"
+                       "((uint32_t)s->xer_stringctrl);\n", rd);
+    break;
+  default:
+    out += fmt::format("    s->gpr[{}]=aot_mfspr_special(s,{});\n", rd, spr);
+    break;
+  }
+}
+
+void AOTCEmitter::EmitMtspr(std::string& out, UGeckoInstruction inst)
+{
+  u32 rs = I(inst.RS);
+  u32 spr = (I(inst.SPR) & 0x1F) << 5 | (I(inst.SPR) >> 5);
+  switch (spr)
+  {
+  case 8:   // LR
+  case 9:   // CTR
+    out += fmt::format("    s->spr[{}]=s->gpr[{}];\n", spr, rs);
+    break;
+  case 1:   // XER
+    out += fmt::format("    {{ uint32_t v=s->gpr[{}]; s->xer_so_ov=((v>>31)<<1)|((v>>30)&1); "
+                       "s->xer_ca=(v>>29)&1; s->xer_stringctrl=v&0xFFFF; }}\n", rs);
+    break;
+  default:
+    out += fmt::format("    aot_mtspr_special(s,{},s->gpr[{}]);\n", spr, rs);
+    break;
+  }
+}
+
+void AOTCEmitter::EmitMfcr(std::string& out, UGeckoInstruction inst)
+{
+  out += fmt::format("    s->gpr[{}]=aot_mfcr(s);\n", I(inst.RD));
+}
+
+void AOTCEmitter::EmitMtcrf(std::string& out, UGeckoInstruction inst)
+{
+  u32 rs = I(inst.RS);
+  u32 crm = I(inst.CRM);
+  out += fmt::format("    aot_mtcrf(s,{:#x},{});\n", crm, rs);
+}
+
+void AOTCEmitter::EmitMfmsr(std::string& out, UGeckoInstruction inst)
+{
+  out += fmt::format("    s->gpr[{}]=s->msr;\n", I(inst.RD));
+}
+
+void AOTCEmitter::EmitMtmsr(std::string& out, UGeckoInstruction inst)
+{
+  out += fmt::format("    s->msr=s->gpr[{}]; aot_msr_updated(s);\n", I(inst.RS));
+}
+
+void AOTCEmitter::EmitCrLogical(std::string& out, UGeckoInstruction inst, const char* op)
+{
+  // CRM field encoding differs for CR logical ops
+  u32 crbD = I(inst.RD);  // actually crbD
+  u32 crbA = I(inst.RA);  // actually crbA
+  u32 crbB = I(inst.RB);  // actually crbB
+
+  // Use runtime helper for simplicity
+  out += fmt::format("    aot_cr_logical(s,{},{},{},\"{}\");\n", crbD, crbA, crbB, op);
+}
+
+void AOTCEmitter::EmitMcrf(std::string& out, UGeckoInstruction inst)
+{
+  out += fmt::format("    s->cr_fields[{}]=s->cr_fields[{}];\n", I(inst.CRFD), I(inst.CRFS));
 }
 
 #undef I

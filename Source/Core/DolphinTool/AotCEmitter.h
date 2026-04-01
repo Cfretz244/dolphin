@@ -94,6 +94,30 @@ private:
   bool EmitTable31(std::string& out, UGeckoInstruction inst, u32 pc);
   bool EmitTable19(std::string& out, UGeckoInstruction inst, u32 pc);
 
+  // Load/store integer
+  void EmitLoadInt(std::string& out, UGeckoInstruction inst, const char* helper, bool update,
+                   bool indexed);
+  void EmitStoreInt(std::string& out, UGeckoInstruction inst, const char* helper, bool update,
+                    bool indexed);
+  void EmitLmw(std::string& out, UGeckoInstruction inst);
+  void EmitStmw(std::string& out, UGeckoInstruction inst);
+
+  // Load/store FP
+  void EmitLfs(std::string& out, UGeckoInstruction inst, bool update, bool indexed);
+  void EmitLfd(std::string& out, UGeckoInstruction inst, bool update, bool indexed);
+  void EmitStfs(std::string& out, UGeckoInstruction inst, bool update, bool indexed);
+  void EmitStfd(std::string& out, UGeckoInstruction inst, bool update, bool indexed);
+
+  // System/SPR
+  void EmitMfspr(std::string& out, UGeckoInstruction inst);
+  void EmitMtspr(std::string& out, UGeckoInstruction inst);
+  void EmitMfcr(std::string& out, UGeckoInstruction inst);
+  void EmitMtcrf(std::string& out, UGeckoInstruction inst);
+  void EmitMfmsr(std::string& out, UGeckoInstruction inst);
+  void EmitMtmsr(std::string& out, UGeckoInstruction inst);
+  void EmitCrLogical(std::string& out, UGeckoInstruction inst, const char* op);
+  void EmitMcrf(std::string& out, UGeckoInstruction inst);
+
   // Branches
   void EmitBx(std::string& out, UGeckoInstruction inst, u32 pc);
   void EmitBcx(std::string& out, UGeckoInstruction inst, u32 pc);
