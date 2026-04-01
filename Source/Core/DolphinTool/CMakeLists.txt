@@ -1,5 +1,7 @@
 add_executable(dolphin-tool
   ToolHeadlessPlatform.cpp
+  CfgCommand.cpp
+  CfgCommand.h
   ExtractCommand.cpp
   ExtractCommand.h
   ConvertCommand.cpp
@@ -22,10 +24,12 @@ endif()
 
 target_link_libraries(dolphin-tool
 PRIVATE
+  core
   discio
   uicommon
   cpp-optparse
   fmt::fmt
+  sqlite3
 )
 
 if(MSVC)

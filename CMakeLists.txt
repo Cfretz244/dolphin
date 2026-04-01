@@ -619,6 +619,7 @@ if (_M_X86_64)
   add_subdirectory(Externals/Bochs_disasm)
 endif()
 add_subdirectory(Externals/cpp-optparse)
+add_subdirectory(Externals/sqlite3)
 
 dolphin_find_optional_system_library_pkgconfig(FMT
   fmt>=10.1 fmt::fmt Externals/fmt

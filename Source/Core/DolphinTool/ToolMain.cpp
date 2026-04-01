@@ -9,6 +9,7 @@
 
 #include <fmt/ostream.h>
 
+#include "DolphinTool/CfgCommand.h"
 #include "DolphinTool/ConvertCommand.h"
 #include "DolphinTool/ExtractCommand.h"
 #include "DolphinTool/HeaderCommand.h"
@@ -22,7 +23,7 @@ static void PrintUsage()
 {
   fmt::print(std::cerr, "usage: dolphin-tool COMMAND -h\n"
                         "\n"
-                        "commands supported: [convert, verify, header, extract]\n");
+                        "commands supported: [convert, verify, header, extract, cfg]\n");
 }
 
 #ifdef _WIN32
@@ -49,6 +50,8 @@ int main(int argc, char* argv[])
     return DolphinTool::HeaderCommand(args);
   else if (command_str == "extract")
     return DolphinTool::Extract(args);
+  else if (command_str == "cfg")
+    return DolphinTool::CfgCommand(args);
   PrintUsage();
   return EXIT_FAILURE;
 }
