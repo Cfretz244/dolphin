@@ -17,12 +17,17 @@
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 
+#include <sqlite3.h>
+#include <unordered_map>
+
+#include "Common/CommonTypes.h"
 #include "Common/ScopeGuard.h"
 #include "Common/WindowSystemInfo.h"
 #include "Core/Boot/Boot.h"
 #include "Core/BootManager.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
+#include "Core/PowerPC/AOTCore.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
@@ -86,8 +91,8 @@ int DiffCommand(const std::vector<std::string>& args)
 
   const optparse::Values options = parser.parse_args(args);
 
-  const std::string iso_path = options.get("iso");
-  const std::string cfg_path = options.get("cfg");
+  const std::string iso_path = options["iso"];
+  const std::string cfg_path = options["cfg"];
 
   if (iso_path.empty())
   {
@@ -103,10 +108,13 @@ int DiffCommand(const std::vector<std::string>& args)
   }
 
   // Parse hex addresses
-  const u32 filter_min =
-      static_cast<u32>(std::stoul(options.get("filter_min"), nullptr, 0));
-  const u32 filter_max =
-      static_cast<u32>(std::stoul(options.get("filter_max"), nullptr, 0));
+  const std::string filter_min_str = options["filter_min"];
+  const std::string filter_max_str = options["filter_max"];
+  const u32 filter_min = static_cast<u32>(std::stoul(filter_min_str, nullptr, 0));
+  const u32 filter_max = static_cast<u32>(std::stoul(filter_max_str, nullptr, 0));
+  const u32 max_blocks_val = static_cast<u32>(std::stoul(std::string(options["max_blocks"])));
+  const u32 max_div_val = static_cast<u32>(std::stoul(std::string(options["max_divergences"])));
+  const bool self_diff = options.is_set("self_diff");
 
   // Initialize UICommon (config system, video backend)
   UICommon::Init();
@@ -129,21 +137,44 @@ int DiffCommand(const std::vector<std::string>& args)
   Config::SetBaseOrCurrent(Config::MAIN_CPU_CORE, PowerPC::CPUCore::AOT);
   Config::SetBaseOrCurrent(Config::MAIN_GFX_BACKEND, std::string("Null"));
   Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_MODE, true);
-  Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_SELF_DIFF,
-                           static_cast<bool>(options.get("self_diff")));
+  Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_SELF_DIFF, self_diff);
   Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_COMPARE_RAM,
-                           static_cast<bool>(options.get("compare_ram")));
+                           options.is_set("compare_ram"));
   Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_CFG_DB_PATH, cfg_path);
-  Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_MAX_BLOCKS,
-                           static_cast<u32>(std::stoul(options.get("max_blocks"))));
-  Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_MAX_DIVERGENCES,
-                           static_cast<u32>(std::stoul(options.get("max_divergences"))));
+  Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_MAX_BLOCKS, max_blocks_val);
+  Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_MAX_DIVERGENCES, max_div_val);
   Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_FILTER_MIN, filter_min);
   Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_FILTER_MAX, filter_max);
 
-  const std::string log_path = options.get("log");
+  const std::string log_path = options["log"];
   if (!log_path.empty())
     Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_LOG_PATH, log_path);
+
+  // Load block sizes from CFG database and pass to AOTCore
+  {
+    std::unordered_map<u32, u32> block_sizes;
+    sqlite3* db = nullptr;
+    if (sqlite3_open_v2(cfg_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK)
+    {
+      fmt::println(std::cerr, "Error: Cannot open CFG database: {}", cfg_path);
+      return EXIT_FAILURE;
+    }
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "SELECT ppc_addr, num_instructions FROM blocks WHERE is_translatable = 1";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK)
+    {
+      while (sqlite3_step(stmt) == SQLITE_ROW)
+      {
+        u32 addr = static_cast<u32>(sqlite3_column_int64(stmt, 0));
+        u32 num_instr = static_cast<u32>(sqlite3_column_int64(stmt, 1));
+        block_sizes[addr] = num_instr;
+      }
+      sqlite3_finalize(stmt);
+    }
+    sqlite3_close(db);
+    fmt::println(std::cerr, "AOT Diff: Loaded {} block boundaries", block_sizes.size());
+    AOTCore::SetDiffBlockSizes(std::move(block_sizes));
+  }
 
   // Create boot parameters
   auto boot = BootParameters::GenerateFromFile(iso_path);
@@ -162,9 +193,9 @@ int DiffCommand(const std::vector<std::string>& args)
 
   fmt::println(std::cerr, "AOT Diff: Booting {}...", iso_path);
   fmt::println(std::cerr, "AOT Diff: CFG database: {}", cfg_path);
-  fmt::println(std::cerr, "AOT Diff: Max blocks: {}, Max divergences: {}",
-               options.get("max_blocks"), options.get("max_divergences"));
-  if (options.get("self_diff"))
+  fmt::println(std::cerr, "AOT Diff: Max blocks: {}, Max divergences: {}", max_blocks_val,
+               max_div_val);
+  if (self_diff)
     fmt::println(std::cerr, "AOT Diff: Self-diff mode (interpreter vs interpreter)");
 
   if (!BootManager::BootCore(system, std::move(boot), wsi))

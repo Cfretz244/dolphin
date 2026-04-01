@@ -7,7 +7,6 @@
 #include <cstring>
 
 #include <fmt/format.h>
-#include <sqlite3.h>
 
 #include "Common/CommonTypes.h"
 #include "Common/GekkoDisassembler.h"
@@ -75,6 +74,14 @@ static_assert(offsetof(PowerPC::PowerPCState, spr) == offsetof(AOTState, spr),
 // This symbol is resolved at link time.
 extern "C" void GALE01_dispatch(AOTState* s);
 
+// Static storage for diff block sizes (set by DiffCommand before boot)
+std::unordered_map<u32, u32> AOTCore::s_diff_block_sizes;
+
+void AOTCore::SetDiffBlockSizes(std::unordered_map<u32, u32> sizes)
+{
+  s_diff_block_sizes = std::move(sizes);
+}
+
 AOTCore::AOTCore(Core::System& system)
     : m_system(system), m_ppc_state(system.GetPPCState())
 {
@@ -94,34 +101,13 @@ void AOTCore::Init()
   // Load diff mode settings
   if (Config::Get(Config::MAIN_DEBUG_AOT_DIFF_MODE))
   {
-    const std::string cfg_path = Config::Get(Config::MAIN_DEBUG_AOT_CFG_DB_PATH);
-    if (cfg_path.empty())
+    // Block sizes are loaded by DiffCommand before boot via SetDiffBlockSizes()
+    m_block_sizes = std::move(s_diff_block_sizes);
+    if (m_block_sizes.empty())
     {
-      ERROR_LOG_FMT(POWERPC, "AOTDiff: CFG database path is required for diff mode");
+      ERROR_LOG_FMT(POWERPC, "AOTDiff: No block sizes loaded — call SetDiffBlockSizes() before boot");
       return;
     }
-
-    // Load block sizes from CFG database
-    sqlite3* db = nullptr;
-    if (sqlite3_open_v2(cfg_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK)
-    {
-      ERROR_LOG_FMT(POWERPC, "AOTDiff: Cannot open CFG database: {}", cfg_path);
-      return;
-    }
-
-    sqlite3_stmt* stmt = nullptr;
-    const char* sql = "SELECT ppc_addr, num_instructions FROM blocks WHERE is_translatable = 1";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK)
-    {
-      while (sqlite3_step(stmt) == SQLITE_ROW)
-      {
-        u32 addr = static_cast<u32>(sqlite3_column_int64(stmt, 0));
-        u32 num_instr = static_cast<u32>(sqlite3_column_int64(stmt, 1));
-        m_block_sizes[addr] = num_instr;
-      }
-      sqlite3_finalize(stmt);
-    }
-    sqlite3_close(db);
 
     INFO_LOG_FMT(POWERPC, "AOTDiff: Loaded {} block boundaries from CFG DB",
                  m_block_sizes.size());

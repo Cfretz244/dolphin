@@ -39,6 +39,10 @@ public:
   void ClearCache() override {}
   const char* GetName() const override { return "AOT"; }
 
+  // Set block sizes for diff mode (called by DiffCommand before boot)
+  static void SetDiffBlockSizes(std::unordered_map<u32, u32> sizes);
+  static std::unordered_map<u32, u32> s_diff_block_sizes;
+
 private:
   void RunDiff();
 
