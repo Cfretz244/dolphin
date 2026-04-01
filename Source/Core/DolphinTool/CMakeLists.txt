@@ -1,7 +1,12 @@
 add_executable(dolphin-tool
   ToolHeadlessPlatform.cpp
+  AotCommand.cpp
+  AotCommand.h
+  AotCEmitter.cpp
+  AotCEmitter.h
   CfgCommand.cpp
   CfgCommand.h
+  PPCMemoryImage.h
   ExtractCommand.cpp
   ExtractCommand.h
   ConvertCommand.cpp
