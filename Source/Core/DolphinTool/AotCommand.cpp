@@ -261,9 +261,6 @@ static bool ReadCFGBlocks(const std::string& db_path, std::vector<CFGBlockInfo>&
     CFGBlockInfo block{};
     block.ppc_addr = static_cast<u32>(sqlite3_column_int64(stmt, 0));
     block.num_instructions = static_cast<u32>(sqlite3_column_int(stmt, 1));
-    // num_instructions is stored as size_bytes in Phase 2, convert
-    if (block.num_instructions > 4)
-      block.num_instructions /= 4;  // convert bytes to instruction count
     block.function_addr =
         sqlite3_column_type(stmt, 2) != SQLITE_NULL ? static_cast<u32>(sqlite3_column_int64(stmt, 2)) : 0;
     block.is_translatable = sqlite3_column_int(stmt, 3) != 0;
