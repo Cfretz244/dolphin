@@ -18,6 +18,9 @@
 #include "Core/PowerPC/BreakPoints.h"
 #include "Core/PowerPC/ConditionRegister.h"
 #include "Core/PowerPC/Gekko.h"
+#ifdef DOLPHIN_HAS_AOT
+#include "Core/PowerPC/AOTCore.h"
+#endif
 #include "Core/PowerPC/PPCCache.h"
 #include "Core/PowerPC/PPCSymbolDB.h"
 
@@ -38,6 +41,7 @@ enum class CPUCore
   JIT64 = 1,
   JITARM64 = 4,
   CachedInterpreter = 5,
+  AOT = 6,
 };
 
 enum class CoreMode
@@ -317,6 +321,9 @@ private:
 
   CPUCoreBase* m_cpu_core_base = nullptr;
   bool m_cpu_core_base_is_injected = false;
+#ifdef DOLPHIN_HAS_AOT
+  std::unique_ptr<AOTCore> m_aot_core;
+#endif
   CoreMode m_mode = CoreMode::Interpreter;
 
   BreakPoints m_breakpoints;

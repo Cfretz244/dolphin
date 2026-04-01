@@ -556,6 +556,8 @@ add_library(core
   PowerPC/PPCAnalyst.h
   PowerPC/PPCCache.cpp
   PowerPC/PPCCache.h
+  PowerPC/AOTCore.cpp
+  PowerPC/AOTCore.h
   PowerPC/AotRuntime.cpp
   PowerPC/TraceCollector.cpp
   PowerPC/TraceCollector.h
@@ -844,4 +846,14 @@ if(USE_RETRO_ACHIEVEMENTS)
   if(RC_CLIENT_SUPPORTS_RAINTEGRATION)
     target_compile_definitions(core PUBLIC -DRC_CLIENT_SUPPORTS_RAINTEGRATION)
   endif()
+endif()
+
+set(AOT_STATIC_LIB "" CACHE FILEPATH "Path to precompiled AOT static library for AOT CPU core")
+if(AOT_STATIC_LIB)
+  if(NOT EXISTS "${AOT_STATIC_LIB}")
+    message(FATAL_ERROR "AOT_STATIC_LIB points to non-existent file: ${AOT_STATIC_LIB}")
+  endif()
+  target_compile_definitions(core PUBLIC DOLPHIN_HAS_AOT)
+  target_link_libraries(core PRIVATE "${AOT_STATIC_LIB}")
+  message(STATUS "AOT support enabled with library: ${AOT_STATIC_LIB}")
 endif()

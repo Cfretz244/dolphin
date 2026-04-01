@@ -211,6 +211,14 @@ void PowerPCManager::InitializeCPUCore(CPUCore cpu_core)
     m_cpu_core_base = &interpreter;
     break;
 
+#ifdef DOLPHIN_HAS_AOT
+  case CPUCore::AOT:
+    m_aot_core = std::make_unique<AOTCore>(m_system);
+    m_aot_core->Init();
+    m_cpu_core_base = m_aot_core.get();
+    break;
+#endif
+
   default:
     m_cpu_core_base = m_system.GetJitInterface().InitJitCore(cpu_core);
     if (!m_cpu_core_base)  // Handle Situations where JIT core isn't available
@@ -235,6 +243,9 @@ std::span<const CPUCore> AvailableCPUCores()
 #endif
       CPUCore::CachedInterpreter,
       CPUCore::Interpreter,
+#ifdef DOLPHIN_HAS_AOT
+      CPUCore::AOT,
+#endif
   };
 
   return cpu_cores;
@@ -315,6 +326,13 @@ void PowerPCManager::Shutdown()
 {
   CPUThreadConfigCallback::RemoveConfigChangedCallback(m_registered_config_callback_id);
   InjectExternalCPUCore(nullptr);
+#ifdef DOLPHIN_HAS_AOT
+  if (m_aot_core)
+  {
+    m_aot_core->Shutdown();
+    m_aot_core.reset();
+  }
+#endif
   m_system.GetJitInterface().Shutdown();
   m_system.GetInterpreter().Shutdown();
   m_cpu_core_base = nullptr;
