@@ -113,6 +113,14 @@ bool AOTCEmitter::EmitInstruction(std::string& out, UGeckoInstruction inst, u32 
 
   case 31: return EmitTable31(out, inst, pc);
   case 19: return EmitTable19(out, inst, pc);
+  case 59: return EmitTable59(out, inst, pc);
+  case 63: return EmitTable63(out, inst, pc);
+  // Paired single loads/stores (OPCD 4 subtable, but psq_l/psq_st use OPCD 56-61)
+  case 56: out += fmt::format("    aot_psq_l(s,{},{},{});\n", I(inst.RD), I(inst.RA), inst.hex); return true;
+  case 57: out += fmt::format("    aot_psq_lu(s,{},{},{});\n", I(inst.RD), I(inst.RA), inst.hex); return true;
+  case 60: out += fmt::format("    aot_psq_st(s,{},{},{});\n", I(inst.RS), I(inst.RA), inst.hex); return true;
+  case 61: out += fmt::format("    aot_psq_stu(s,{},{},{});\n", I(inst.RS), I(inst.RA), inst.hex); return true;
+  case 4:  return EmitTable4(out, inst, pc);  // Paired singles
   default: return false;
   }
 }
@@ -393,6 +401,16 @@ bool AOTCEmitter::EmitTable31(std::string& out, UGeckoInstruction inst, u32 pc)
   case 54:  return true; // dcbst (no-op for AOT)
   case 470: return true; // dcbi (no-op for AOT)
   case 982: out += fmt::format("    aot_icbi(s,s->gpr[{}]+s->gpr[{}]);\n", I(inst.RA), I(inst.RB)); return true;
+  // Missing arithmetic
+  case 200: EmitAddzex(out, inst); return true;  // subfzex (reuses addzex logic pattern)
+  // MSR
+  case 83:  EmitMfmsr(out, inst); return true;
+  case 146: EmitMtmsr(out, inst); return true;
+  // Timebase
+  case 371: out += fmt::format("    s->gpr[{}]=aot_mftb(s,{});\n", I(inst.RD), I(inst.SPR)); return true;
+  // stfiwx
+  case 983: out += fmt::format("    aot_write_u32(s,(uint32_t)s->ps[{}].ps0,s->gpr[{}]+s->gpr[{}]);\n",
+                               I(inst.RS), I(inst.RA), I(inst.RB)); return true;
   default:  return false;
   }
 }
@@ -980,6 +998,160 @@ void AOTCEmitter::EmitCrLogical(std::string& out, UGeckoInstruction inst, const 
 void AOTCEmitter::EmitMcrf(std::string& out, UGeckoInstruction inst)
 {
   out += fmt::format("    s->cr_fields[{}]=s->cr_fields[{}];\n", I(inst.CRFD), I(inst.CRFS));
+}
+
+// ============================================================================
+// FP instructions — all go through runtime helpers for correctness
+// ============================================================================
+
+bool AOTCEmitter::EmitTable59(std::string& out, UGeckoInstruction inst, u32 pc)
+{
+  // Table 59: single-precision FP (SUBOP5)
+  u32 fd=I(inst.FD), fa=I(inst.FA), fb=I(inst.FB), fc=I(inst.FC);
+  switch (I(inst.SUBOP5))
+  {
+  case 18: out += fmt::format("    aot_fdivsx(s,{},{},{});\n", fd, fa, fb); return true;
+  case 20: out += fmt::format("    aot_fsubsx(s,{},{},{});\n", fd, fa, fb); return true;
+  case 21: out += fmt::format("    aot_faddsx(s,{},{},{});\n", fd, fa, fb); return true;
+  case 24: out += fmt::format("    aot_fresx(s,{},{});\n", fd, fb); return true;
+  case 25: out += fmt::format("    aot_fmulsx(s,{},{},{});\n", fd, fa, fc); return true;
+  case 28: out += fmt::format("    aot_fmsubsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 29: out += fmt::format("    aot_fmaddsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 30: out += fmt::format("    aot_fnmsubsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 31: out += fmt::format("    aot_fnmaddsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  default: return false;
+  }
+}
+
+bool AOTCEmitter::EmitTable63(std::string& out, UGeckoInstruction inst, u32 pc)
+{
+  u32 fd=I(inst.FD), fa=I(inst.FA), fb=I(inst.FB), fc=I(inst.FC);
+
+  // Table 63 uses both SUBOP10 and SUBOP5
+  switch (I(inst.SUBOP10))
+  {
+  case 0:   out += fmt::format("    aot_fcmpu(s,{},{},{});\n", I(inst.CRFD), fa, fb); return true;
+  case 32:  out += fmt::format("    aot_fcmpo(s,{},{},{});\n", I(inst.CRFD), fa, fb); return true;
+  case 12:  out += fmt::format("    aot_frspx(s,{},{});\n", fd, fb); return true;
+  case 14:  out += fmt::format("    aot_fctiwx(s,{},{});\n", fd, fb); return true;
+  case 15:  out += fmt::format("    aot_fctiwzx(s,{},{});\n", fd, fb); return true;
+  case 40:  // fnegx
+    out += fmt::format("    s->ps[{}].ps0=s->ps[{}].ps0^(1ULL<<63);\n", fd, fb);
+    if (inst.Rc) out += "    s->cr_fields[1]=s->cr_fields[1]; /* CR1 not impl */\n";
+    return true;
+  case 72:  // fmrx
+    out += fmt::format("    s->ps[{}].ps0=s->ps[{}].ps0;\n", fd, fb);
+    if (inst.Rc) out += "    s->cr_fields[1]=s->cr_fields[1];\n";
+    return true;
+  case 264: // fabsx
+    out += fmt::format("    s->ps[{}].ps0=s->ps[{}].ps0&~(1ULL<<63);\n", fd, fb);
+    if (inst.Rc) out += "    s->cr_fields[1]=s->cr_fields[1];\n";
+    return true;
+  case 136: // fnabsx
+    out += fmt::format("    s->ps[{}].ps0=s->ps[{}].ps0|(1ULL<<63);\n", fd, fb);
+    if (inst.Rc) out += "    s->cr_fields[1]=s->cr_fields[1];\n";
+    return true;
+  case 583: // mffsx
+    out += fmt::format("    s->ps[{}].ps0=(uint64_t)s->fpscr;\n", fd);
+    return true;
+  case 711: // mtfsfx
+    out += fmt::format("    aot_mtfsf(s,{},{});\n", I(inst.FM), fb);
+    return true;
+  case 134: // mtfsfix
+    out += fmt::format("    aot_mtfsfi(s,{},{});\n", I(inst.CRFD), I(inst.RB));
+    return true;
+  case 70:  // mtfsb0x
+    out += fmt::format("    s->fpscr&=~(1u<<(31-{}));\n", I(inst.RD));
+    return true;
+  case 38:  // mtfsb1x
+    out += fmt::format("    s->fpscr|=(1u<<(31-{}));\n", I(inst.RD));
+    return true;
+  case 64:  // mcrfs
+    out += fmt::format("    aot_mcrfs(s,{},{});\n", I(inst.CRFD), I(inst.CRFS));
+    return true;
+  case 26:  // frsqrtex
+    out += fmt::format("    aot_frsqrtex(s,{},{});\n", fd, fb);
+    return true;
+  case 846: // fselx
+    out += fmt::format("    aot_fselx(s,{},{},{},{});\n", fd, fa, fc, fb);
+    return true;
+  default:
+    break;
+  }
+
+  // SUBOP5 (for double-precision arithmetic)
+  switch (I(inst.SUBOP5))
+  {
+  case 18: out += fmt::format("    aot_fdivx(s,{},{},{});\n", fd, fa, fb); return true;
+  case 20: out += fmt::format("    aot_fsubx(s,{},{},{});\n", fd, fa, fb); return true;
+  case 21: out += fmt::format("    aot_faddx(s,{},{},{});\n", fd, fa, fb); return true;
+  case 25: out += fmt::format("    aot_fmulx(s,{},{},{});\n", fd, fa, fc); return true;
+  case 28: out += fmt::format("    aot_fmsubx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 29: out += fmt::format("    aot_fmaddx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 30: out += fmt::format("    aot_fnmsubx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 31: out += fmt::format("    aot_fnmaddx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  default: return false;
+  }
+}
+
+// ============================================================================
+// Paired singles (table 4) — all via runtime helpers
+// ============================================================================
+
+bool AOTCEmitter::EmitTable4(std::string& out, UGeckoInstruction inst, u32 pc)
+{
+  u32 fd=I(inst.FD), fa=I(inst.FA), fb=I(inst.FB), fc=I(inst.FC);
+
+  switch (I(inst.SUBOP10))
+  {
+  case 6:   out += fmt::format("    aot_psq_lx(s,{});\n", inst.hex); return true;
+  case 7:   out += fmt::format("    aot_psq_stx(s,{});\n", inst.hex); return true;
+  case 38:  out += fmt::format("    aot_psq_lux(s,{});\n", inst.hex); return true;
+  case 39:  out += fmt::format("    aot_psq_stux(s,{});\n", inst.hex); return true;
+  case 1014: out += fmt::format("    aot_dcbz_l(s,s->gpr[{}]+s->gpr[{}]);\n", I(inst.RA), I(inst.RB)); return true;
+  default: break;
+  }
+
+  // PS arithmetic uses SUBOP5
+  switch (I(inst.SUBOP5))
+  {
+  case 10: out += fmt::format("    aot_ps_sum0(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 11: out += fmt::format("    aot_ps_sum1(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 12: out += fmt::format("    aot_ps_muls0(s,{},{},{});\n", fd, fa, fc); return true;
+  case 13: out += fmt::format("    aot_ps_muls1(s,{},{},{});\n", fd, fa, fc); return true;
+  case 14: out += fmt::format("    aot_ps_madds0(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 15: out += fmt::format("    aot_ps_madds1(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 18: out += fmt::format("    aot_ps_div(s,{},{},{});\n", fd, fa, fb); return true;
+  case 20: out += fmt::format("    aot_ps_sub(s,{},{},{});\n", fd, fa, fb); return true;
+  case 21: out += fmt::format("    aot_ps_add(s,{},{},{});\n", fd, fa, fb); return true;
+  case 23: out += fmt::format("    aot_ps_sel(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 24: out += fmt::format("    aot_ps_res(s,{},{});\n", fd, fb); return true;
+  case 25: out += fmt::format("    aot_ps_mul(s,{},{},{});\n", fd, fa, fc); return true;
+  case 26: out += fmt::format("    aot_ps_rsqrte(s,{},{});\n", fd, fb); return true;
+  case 28: out += fmt::format("    aot_ps_msub(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 29: out += fmt::format("    aot_ps_madd(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 30: out += fmt::format("    aot_ps_nmsub(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 31: out += fmt::format("    aot_ps_nmadd(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  default: break;
+  }
+
+  // PS misc (SUBOP10 again for moves/compares/merges)
+  switch (I(inst.SUBOP10))
+  {
+  case 40:  out += fmt::format("    aot_ps_neg(s,{},{});\n", fd, fb); return true;
+  case 72:  out += fmt::format("    aot_ps_mr(s,{},{});\n", fd, fb); return true;
+  case 136: out += fmt::format("    aot_ps_nabs(s,{},{});\n", fd, fb); return true;
+  case 264: out += fmt::format("    aot_ps_abs(s,{},{});\n", fd, fb); return true;
+  case 528: out += fmt::format("    aot_ps_merge00(s,{},{},{});\n", fd, fa, fb); return true;
+  case 560: out += fmt::format("    aot_ps_merge01(s,{},{},{});\n", fd, fa, fb); return true;
+  case 592: out += fmt::format("    aot_ps_merge10(s,{},{},{});\n", fd, fa, fb); return true;
+  case 624: out += fmt::format("    aot_ps_merge11(s,{},{},{});\n", fd, fa, fb); return true;
+  case 0:   out += fmt::format("    aot_ps_cmpu0(s,{},{},{});\n", I(inst.CRFD), fa, fb); return true;
+  case 32:  out += fmt::format("    aot_ps_cmpo0(s,{},{},{});\n", I(inst.CRFD), fa, fb); return true;
+  case 64:  out += fmt::format("    aot_ps_cmpu1(s,{},{},{});\n", I(inst.CRFD), fa, fb); return true;
+  case 96:  out += fmt::format("    aot_ps_cmpo1(s,{},{},{});\n", I(inst.CRFD), fa, fb); return true;
+  default: return false;
+  }
 }
 
 #undef I

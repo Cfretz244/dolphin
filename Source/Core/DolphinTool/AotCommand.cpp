@@ -101,8 +101,80 @@ extern void aot_cr_logical(AOTState* s, int crbD, int crbA, int crbB, const char
 
 // Cache ops
 extern void aot_dcbz(AOTState* s, uint32_t addr);
+extern void aot_dcbz_l(AOTState* s, uint32_t addr);
 extern void aot_dcbt(AOTState* s, uint32_t addr);
 extern void aot_icbi(AOTState* s, uint32_t addr);
+
+// Timebase
+extern uint32_t aot_mftb(AOTState* s, uint32_t spr);
+
+// FP arithmetic (all via runtime for NaN/exception correctness)
+extern void aot_faddx(AOTState* s, int fd, int fa, int fb);
+extern void aot_fsubx(AOTState* s, int fd, int fa, int fb);
+extern void aot_fmulx(AOTState* s, int fd, int fa, int fc);
+extern void aot_fdivx(AOTState* s, int fd, int fa, int fb);
+extern void aot_fmaddx(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_fmsubx(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_fnmsubx(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_fnmaddx(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_faddsx(AOTState* s, int fd, int fa, int fb);
+extern void aot_fsubsx(AOTState* s, int fd, int fa, int fb);
+extern void aot_fmulsx(AOTState* s, int fd, int fa, int fc);
+extern void aot_fdivsx(AOTState* s, int fd, int fa, int fb);
+extern void aot_fmaddsx(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_fmsubsx(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_fnmsubsx(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_fnmaddsx(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_fcmpu(AOTState* s, int crfd, int fa, int fb);
+extern void aot_fcmpo(AOTState* s, int crfd, int fa, int fb);
+extern void aot_frspx(AOTState* s, int fd, int fb);
+extern void aot_fctiwx(AOTState* s, int fd, int fb);
+extern void aot_fctiwzx(AOTState* s, int fd, int fb);
+extern void aot_fresx(AOTState* s, int fd, int fb);
+extern void aot_frsqrtex(AOTState* s, int fd, int fb);
+extern void aot_fselx(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_mtfsf(AOTState* s, int fm, int fb);
+extern void aot_mtfsfi(AOTState* s, int crfd, int imm);
+extern void aot_mcrfs(AOTState* s, int crfd, int crfs);
+
+// Paired singles (all via runtime)
+extern void aot_ps_add(AOTState* s, int fd, int fa, int fb);
+extern void aot_ps_sub(AOTState* s, int fd, int fa, int fb);
+extern void aot_ps_mul(AOTState* s, int fd, int fa, int fc);
+extern void aot_ps_div(AOTState* s, int fd, int fa, int fb);
+extern void aot_ps_madd(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_ps_msub(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_ps_nmadd(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_ps_nmsub(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_ps_sum0(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_ps_sum1(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_ps_muls0(AOTState* s, int fd, int fa, int fc);
+extern void aot_ps_muls1(AOTState* s, int fd, int fa, int fc);
+extern void aot_ps_madds0(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_ps_madds1(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_ps_sel(AOTState* s, int fd, int fa, int fc, int fb);
+extern void aot_ps_res(AOTState* s, int fd, int fb);
+extern void aot_ps_rsqrte(AOTState* s, int fd, int fb);
+extern void aot_ps_neg(AOTState* s, int fd, int fb);
+extern void aot_ps_mr(AOTState* s, int fd, int fb);
+extern void aot_ps_abs(AOTState* s, int fd, int fb);
+extern void aot_ps_nabs(AOTState* s, int fd, int fb);
+extern void aot_ps_merge00(AOTState* s, int fd, int fa, int fb);
+extern void aot_ps_merge01(AOTState* s, int fd, int fa, int fb);
+extern void aot_ps_merge10(AOTState* s, int fd, int fa, int fb);
+extern void aot_ps_merge11(AOTState* s, int fd, int fa, int fb);
+extern void aot_ps_cmpu0(AOTState* s, int crfd, int fa, int fb);
+extern void aot_ps_cmpo0(AOTState* s, int crfd, int fa, int fb);
+extern void aot_ps_cmpu1(AOTState* s, int crfd, int fa, int fb);
+extern void aot_ps_cmpo1(AOTState* s, int crfd, int fa, int fb);
+extern void aot_psq_l(AOTState* s, int fd, int ra, uint32_t inst);
+extern void aot_psq_lu(AOTState* s, int fd, int ra, uint32_t inst);
+extern void aot_psq_st(AOTState* s, int fs, int ra, uint32_t inst);
+extern void aot_psq_stu(AOTState* s, int fs, int ra, uint32_t inst);
+extern void aot_psq_lx(AOTState* s, uint32_t inst);
+extern void aot_psq_stx(AOTState* s, uint32_t inst);
+extern void aot_psq_lux(AOTState* s, uint32_t inst);
+extern void aot_psq_stux(AOTState* s, uint32_t inst);
 
 // CR helpers (inline for performance)
 static const uint64_t aot_cr_table[16] = {

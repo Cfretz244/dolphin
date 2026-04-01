@@ -93,6 +93,9 @@ private:
   // Opcode table dispatch
   bool EmitTable31(std::string& out, UGeckoInstruction inst, u32 pc);
   bool EmitTable19(std::string& out, UGeckoInstruction inst, u32 pc);
+  bool EmitTable59(std::string& out, UGeckoInstruction inst, u32 pc);
+  bool EmitTable63(std::string& out, UGeckoInstruction inst, u32 pc);
+  bool EmitTable4(std::string& out, UGeckoInstruction inst, u32 pc);
 
   // Load/store integer
   void EmitLoadInt(std::string& out, UGeckoInstruction inst, const char* helper, bool update,
