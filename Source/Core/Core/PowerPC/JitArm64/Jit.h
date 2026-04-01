@@ -338,6 +338,10 @@ protected:
                                       UGeckoInstruction inst, BitSet32 gpr_caller_save,
                                       BitSet32 fpr_caller_save);
 
+  // Trace Collection
+  void WriteTraceLogDynamicBranch(u32 origin, Arm64Gen::ARM64Reg destination,
+                                  BitSet32 gpr_caller_save, BitSet32 fpr_caller_save);
+
   // Exits
   void
   WriteExit(u32 destination, bool LK = false, u32 exit_address_after_return = 0,

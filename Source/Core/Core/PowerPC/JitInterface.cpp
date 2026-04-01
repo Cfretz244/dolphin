@@ -10,6 +10,7 @@
 #include "Common/ChunkFile.h"
 #include "Common/CommonTypes.h"
 
+#include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
 #include "Core/PowerPC/CPUCoreBase.h"
 #include "Core/PowerPC/CachedInterpreter/CachedInterpreter.h"
@@ -17,6 +18,7 @@
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PPCSymbolDB.h"
 #include "Core/PowerPC/PowerPC.h"
+#include "Core/PowerPC/TraceCollector.h"
 #include "Core/System.h"
 
 #ifdef _M_X86_64
@@ -358,6 +360,18 @@ void JitInterface::Shutdown()
 {
   if (m_jit)
   {
+    // Flush trace data before destroying the JIT and its block cache.
+    if (m_jit->IsTraceCollectionEnabled())
+    {
+      const std::string path = Config::Get(Config::MAIN_DEBUG_TRACE_OUTPUT_PATH);
+      if (!path.empty())
+      {
+        auto& trace_collector = m_jit->m_trace_collector;
+        trace_collector.MergeFromDisk(path);
+        trace_collector.FlushToDisk(path);
+      }
+    }
+
     m_jit->Shutdown();
     m_jit.reset();
   }

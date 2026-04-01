@@ -24,6 +24,7 @@
 #include "Core/PowerPC/JitCommon/JitCache.h"
 #include "Core/PowerPC/PPCAnalyst.h"
 #include "Core/PowerPC/PowerPC.h"
+#include "Core/PowerPC/TraceCollector.h"
 
 namespace Core
 {
@@ -163,12 +164,13 @@ protected:
   bool m_fastmem_enabled = false;
   bool m_page_table_fastmem_enabled = false;
   bool m_accurate_cpu_cache_enabled = false;
+  bool m_enable_trace_collection = false;
 
   bool m_enable_blr_optimization = false;
   bool m_cleanup_after_stackfault = false;
   u8* m_stack_guard = nullptr;
 
-  static const std::array<std::pair<bool JitBase::*, const Config::Info<bool>*>, 25> JIT_SETTINGS;
+  static const std::array<std::pair<bool JitBase::*, const Config::Info<bool>*>, 26> JIT_SETTINGS;
 
   bool DoesConfigNeedRefresh() const;
   void RefreshConfig();
@@ -207,6 +209,7 @@ public:
     auto& branch_watch = m_system.GetPowerPC().GetBranchWatch();
     return branch_watch.GetRecordingActive();
   }
+  bool IsTraceCollectionEnabled() const { return m_trace_collector.IsActive(); }
 
   static const u8* Dispatch(JitBase& jit);
   virtual JitBaseBlockCache* GetBlockCache() = 0;
@@ -239,6 +242,7 @@ public:
   PowerPC::PowerPCState& m_ppc_state;
   PowerPC::MMU& m_mmu;
   Core::BranchWatch& m_branch_watch;
+  Core::TraceCollector m_trace_collector;
   PPCSymbolDB& m_ppc_symbol_db;
 };
 

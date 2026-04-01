@@ -1,0 +1,95 @@
+// Copyright 2024 Dolphin Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include "Common/CommonTypes.h"
+
+namespace Core
+{
+
+// Collects PPC execution trace data for AOT (Ahead-of-Time) static recompilation.
+// Records block entries, branch edges (static and dynamic), and self-modifying code events.
+// Data accumulates across play sessions via merge-on-flush.
+class TraceCollector final
+{
+public:
+  enum class EdgeType : u8
+  {
+    Static = 0,
+    Dynamic = 1,
+    Call = 2,
+  };
+
+  // Static function callable from JIT-emitted code via ABI_CallFunction.
+  // Follows the same pattern as BranchWatch::HitVirtualTrue_fk.
+  static void LogDynamicBranch(TraceCollector* collector, u32 origin, u32 destination);
+
+  // Called from C++ code paths (not from JIT-emitted code)
+  void RecordStaticEdge(u32 from_addr, u32 to_addr, bool is_call);
+  void OnICacheInvalidation(u32 address, u32 length);
+
+  // Record a block's metadata. Called at JIT compile time (FinalizeBlock).
+  void RecordBlock(u32 ppc_addr, u32 block_size);
+
+  bool IsActive() const { return m_active; }
+  void SetActive(bool active) { m_active = active; }
+
+  void FlushToDisk(const std::string& path) const;
+  void MergeFromDisk(const std::string& path);
+  void Clear();
+
+private:
+  struct BlockRecord
+  {
+    u32 ppc_addr;
+    u32 block_size;
+  };
+
+  struct EdgeRecord
+  {
+    u32 from_addr;
+    u32 to_addr;
+    EdgeType type;
+  };
+
+  struct SMCRecord
+  {
+    u32 addr;
+    u32 length;
+    u64 event_counter;
+  };
+
+  // Binary file format constants
+  static constexpr u32 MAGIC = 0x54485044;  // "DPHT" little-endian
+  static constexpr u32 FORMAT_VERSION = 2;
+
+  struct FileHeader
+  {
+    u32 magic;
+    u32 version;
+    u32 block_count;
+    u32 edge_count;
+    u32 smc_count;
+  };
+
+  static u64 MakeEdgeKey(u32 from, u32 to, EdgeType type)
+  {
+    return (u64(from) << 32) | ((u64(to) & 0xFFFFFFFF) ^ (u64(type) << 62));
+  }
+
+  bool m_active = false;
+  std::unordered_map<u32, BlockRecord> m_blocks;
+  std::unordered_map<u64, EdgeRecord> m_edges;
+  std::vector<SMCRecord> m_smc_events;
+  u64 m_event_counter = 0;
+  mutable std::mutex m_mutex;
+};
+
+}  // namespace Core

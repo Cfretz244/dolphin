@@ -12,6 +12,7 @@
 #include "Core/PowerPC/JitArm64/JitArm64_RegCache.h"
 #include "Core/PowerPC/PPCTables.h"
 #include "Core/PowerPC/PowerPC.h"
+#include "Core/PowerPC/TraceCollector.h"
 #include "Core/System.h"
 
 using namespace Arm64Gen;
@@ -102,6 +103,16 @@ void JitArm64::WriteBranchWatchDestInRegister(u32 origin, ARM64Reg destination,
   ABI_CallFunction(m_ppc_state.msr.IR ? &Core::BranchWatch::HitVirtualTrue :
                                         &Core::BranchWatch::HitPhysicalTrue,
                    &m_branch_watch, origin, destination, inst.hex);
+  m_float_emit.ABI_PopRegisters(fpr_caller_save, ARM64Reg::X8);
+  ABI_PopRegisters(gpr_caller_save);
+}
+
+void JitArm64::WriteTraceLogDynamicBranch(u32 origin, ARM64Reg destination,
+                                          BitSet32 gpr_caller_save, BitSet32 fpr_caller_save)
+{
+  ABI_PushRegisters(gpr_caller_save);
+  m_float_emit.ABI_PushRegisters(fpr_caller_save, ARM64Reg::X8);
+  ABI_CallFunction(&Core::TraceCollector::LogDynamicBranch, &m_trace_collector, origin, destination);
   m_float_emit.ABI_PopRegisters(fpr_caller_save, ARM64Reg::X8);
   ABI_PopRegisters(gpr_caller_save);
 }
@@ -299,6 +310,14 @@ void JitArm64::bcctrx(UGeckoInstruction inst)
     gpr_caller_save &= CALLER_SAVED_GPRS;
     WriteBranchWatchDestInRegister(js.compilerPC, WA, inst, gpr_caller_save, {});
   }
+  if (IsTraceCollectionEnabled())
+  {
+    BitSet32 gpr_caller_save = BitSet32{DecodeReg(WA)};
+    if (WB != ARM64Reg::INVALID_REG)
+      gpr_caller_save[DecodeReg(WB)] = true;
+    gpr_caller_save &= CALLER_SAVED_GPRS;
+    WriteTraceLogDynamicBranch(js.compilerPC, WA, gpr_caller_save, {});
+  }
   WriteExit(WA, inst.LK_3, js.compilerPC + 4, WB);
 }
 
@@ -366,6 +385,22 @@ void JitArm64::bclrx(UGeckoInstruction inst)
         fpr_caller_save = {};
       }
       WriteBranchWatchDestInRegister(js.compilerPC, WA, inst, gpr_caller_save, fpr_caller_save);
+    }
+    if (IsTraceCollectionEnabled())
+    {
+      BitSet32 gpr_caller_save;
+      BitSet32 fpr_caller_save;
+      if (conditional)
+      {
+        gpr_caller_save = gpr.GetCallerSavedUsed();
+        fpr_caller_save = fpr.GetCallerSavedUsed();
+      }
+      else
+      {
+        gpr_caller_save = BitSet32{DecodeReg(WA)} & CALLER_SAVED_GPRS;
+        fpr_caller_save = {};
+      }
+      WriteTraceLogDynamicBranch(js.compilerPC, WA, gpr_caller_save, fpr_caller_save);
     }
     if (js.op->branchIsIdleLoop)
     {

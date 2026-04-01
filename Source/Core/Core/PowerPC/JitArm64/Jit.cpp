@@ -1061,6 +1061,15 @@ void JitArm64::Jit(u32 em_address, bool clear_cache_and_retry_on_failure)
 
       blocks.FinalizeBlock(*b, jo.enableBlocklink, code_block, m_code_buffer);
 
+      if (IsTraceCollectionEnabled())
+      {
+        m_trace_collector.RecordBlock(em_address, code_block.m_num_instructions);
+        for (const auto& link : b->linkData)
+        {
+          m_trace_collector.RecordStaticEdge(em_address, link.exitAddress, link.call);
+        }
+      }
+
 #ifdef JIT_LOG_GENERATED_CODE
       LogGeneratedCode();
 #endif

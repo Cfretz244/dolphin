@@ -58,7 +58,7 @@
 // After resetting the stack to the top, we call _resetstkoflw() to restore
 // the guard page at the 256kb mark.
 
-const std::array<std::pair<bool JitBase::*, const Config::Info<bool>*>, 25> JitBase::JIT_SETTINGS{{
+const std::array<std::pair<bool JitBase::*, const Config::Info<bool>*>, 26> JitBase::JIT_SETTINGS{{
     {&JitBase::bJITOff, &Config::MAIN_DEBUG_JIT_OFF},
     {&JitBase::bJITLoadStoreOff, &Config::MAIN_DEBUG_JIT_LOAD_STORE_OFF},
     {&JitBase::bJITLoadStorelXzOff, &Config::MAIN_DEBUG_JIT_LOAD_STORE_LXZ_OFF},
@@ -84,6 +84,7 @@ const std::array<std::pair<bool JitBase::*, const Config::Info<bool>*>, 25> JitB
     {&JitBase::m_fastmem_enabled, &Config::MAIN_FASTMEM},
     {&JitBase::m_page_table_fastmem_enabled, &Config::MAIN_PAGE_TABLE_FASTMEM},
     {&JitBase::m_accurate_cpu_cache_enabled, &Config::MAIN_ACCURATE_CPU_CACHE},
+    {&JitBase::m_enable_trace_collection, &Config::MAIN_DEBUG_TRACE_COLLECTION},
 }};
 
 const u8* JitBase::Dispatch(JitBase& jit)
@@ -133,6 +134,8 @@ void JitBase::RefreshConfig()
     // This hack is unneeded if the data cache is being emulated.
     m_low_dcbz_hack = false;
   }
+
+  m_trace_collector.SetActive(m_enable_trace_collection);
 
   analyzer.SetDebuggingEnabled(m_enable_debugging);
   analyzer.SetBranchFollowingEnabled(m_enable_branch_following);

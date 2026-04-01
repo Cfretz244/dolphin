@@ -556,6 +556,8 @@ add_library(core
   PowerPC/PPCAnalyst.h
   PowerPC/PPCCache.cpp
   PowerPC/PPCCache.h
+  PowerPC/TraceCollector.cpp
+  PowerPC/TraceCollector.h
   PowerPC/PPCSymbolDB.cpp
   PowerPC/PPCSymbolDB.h
   PowerPC/PPCTables.cpp

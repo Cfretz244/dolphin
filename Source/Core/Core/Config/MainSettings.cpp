@@ -572,6 +572,9 @@ const Info<bool> MAIN_DEBUG_JIT_REGISTER_CACHE_OFF{{System::Main, "Debug", "JitR
                                                    false};
 const Info<bool> MAIN_DEBUG_JIT_ENABLE_PROFILING{{System::Main, "Debug", "JitEnableProfiling"},
                                                  false};
+const Info<bool> MAIN_DEBUG_TRACE_COLLECTION{{System::Main, "Debug", "TraceCollection"}, false};
+const Info<std::string> MAIN_DEBUG_TRACE_OUTPUT_PATH{{System::Main, "Debug", "TraceOutputPath"},
+                                                     ""};
 
 // Main.BluetoothPassthrough
 

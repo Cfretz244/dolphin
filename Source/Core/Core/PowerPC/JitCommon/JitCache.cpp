@@ -338,6 +338,11 @@ void JitBaseBlockCache::InvalidateICacheInternal(u32 physical_address, u32 addre
     // being in the right place between instructions).
     if (!forced)
     {
+      if (m_jit.IsTraceCollectionEnabled())
+      {
+        m_jit.m_trace_collector.OnICacheInvalidation(address, length);
+      }
+
       for (u32 i = address; i < address + length; i += 4)
       {
         m_jit.js.fifoWriteAddresses.erase(i);
