@@ -86,6 +86,9 @@ void AOTCore::Run()
   auto& core_timing = m_system.GetCoreTiming();
   auto& cpu = m_system.GetCPU();
 
+  u64 dispatch_count = 0;
+  auto start = std::chrono::steady_clock::now();
+
   while (cpu.GetState() == CPU::State::Running)
   {
     core_timing.Advance();
@@ -94,8 +97,22 @@ void AOTCore::Run()
     {
       auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
       m_dispatch(aot_state);
+      dispatch_count++;
+    }
+
+    if ((dispatch_count & 0x3FFF) == 0 && dispatch_count > 0)
+    {
+      auto now = std::chrono::steady_clock::now();
+      double secs = std::chrono::duration<double>(now - start).count();
+      fprintf(stderr, "AOT: %.1fM dispatches in %.1fs (%.1fM/s)\n",
+              dispatch_count / 1e6, secs, dispatch_count / secs / 1e6);
     }
   }
+
+  auto end = std::chrono::steady_clock::now();
+  double total = std::chrono::duration<double>(end - start).count();
+  fprintf(stderr, "AOT total: %llu dispatches in %.1fs (%.1fM/s)\n",
+          dispatch_count, total, dispatch_count / total / 1e6);
 }
 
 void AOTCore::SingleStep()

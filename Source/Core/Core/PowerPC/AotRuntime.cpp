@@ -183,11 +183,21 @@ void aot_write_u64(AOTState* s, uint64_t val, uint32_t addr)
 // Interpreter fallback
 // ============================================================================
 
+static u32 s_interp_miss_count = 0;
+static u32 s_interp_last_pc = 0;
+
 void aot_interpreter_single_step(AOTState* s)
 {
   auto& ppc_state = GetPPCState(s);
   auto& system = GetSystem();
   auto& interpreter = system.GetInterpreter();
+
+  if (++s_interp_miss_count <= 20 || (s_interp_miss_count % 100000 == 0))
+  {
+    fprintf(stderr, "AOT miss #%u: pc=%08x (prev=%08x)\n",
+            s_interp_miss_count, ppc_state.pc, s_interp_last_pc);
+  }
+  s_interp_last_pc = ppc_state.pc;
 
   ppc_state.npc = ppc_state.pc + 4;
   int cycles = interpreter.SingleStepInner();

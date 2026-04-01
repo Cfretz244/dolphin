@@ -358,6 +358,13 @@ void PowerPCManager::ApplyMode()
 
   case CoreMode::JIT:  // Switching from interpreter to JIT.
     // Don't really need to do much. It'll work, the cache will refill itself.
+#ifdef DOLPHIN_HAS_AOT
+    if (m_aot_core)
+    {
+      m_cpu_core_base = m_aot_core.get();
+      break;
+    }
+#endif
     m_cpu_core_base = m_system.GetJitInterface().GetCore();
     if (!m_cpu_core_base)  // Has a chance to not get a working JIT core if one isn't active on host
       m_cpu_core_base = &interpreter;
