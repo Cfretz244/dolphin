@@ -48,6 +48,17 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions)
       m_unhandled_opcodes[opname]++;
       out += fmt::format("    s->pc = {:#010x}u; aot_interpreter_single_step(s);\n", pc);
     }
+
+  }
+
+  // Always emit a fallthrough exit at the end of every block.
+  // Branch instructions that are taken will `return` before reaching this.
+  // This handles: blocks without branches, conditional branches not taken,
+  // and any other case where execution falls through.
+  {
+    u32 next_pc = block_addr + num_instructions * 4;
+    out += fmt::format("    s->downcount -= {};\n", m_block_cycle_count);
+    out += fmt::format("    s->pc = {:#010x}u;\n", next_pc);
   }
 
   out += "}\n";

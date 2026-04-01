@@ -218,10 +218,8 @@ void aot_rfi(AOTState* s)
 
 void aot_msr_updated(AOTState* s)
 {
-  // Notify subsystems that MSR changed (BAT translations may need update)
+  // Update feature flags from MSR bits — lightweight, no subsystem calls
   auto& ppc_state = GetPPCState(s);
-  auto& mmu = GetMMU();
-  // Update feature flags
   CPUEmuFeatureFlags flags{};
   if (ppc_state.msr.DR)
     flags = static_cast<CPUEmuFeatureFlags>(flags | FEATURE_FLAG_MSR_DR);
