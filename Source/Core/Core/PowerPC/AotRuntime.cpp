@@ -56,56 +56,126 @@ static UGeckoInstruction MakeCRInst(int crfd, int fa, int fb)
   return inst;
 }
 
+// ============================================================================
+// Fast memory access
+//
+// For addresses in main RAM (0x80000000-0x81800000 and mirrors), we bypass
+// the full MMU translation and read/write directly from the RAM buffer.
+// This is equivalent to the JIT's "slow path" (without fastmem signal handlers)
+// and eliminates 5+ levels of function call indirection per memory access.
+// ============================================================================
+
+static inline u8* GetRAMPtr()
+{
+  return GetSystem().GetMemory().GetRAM();
+}
+
+static inline u32 GetRAMSize()
+{
+  return GetSystem().GetMemory().GetRamSizeReal();
+}
+
+// Check if address is in main RAM (cached or uncached mirror)
+static inline bool IsRAMAddress(u32 addr)
+{
+  // 0x80000000-0x81800000 (cached) or 0xC0000000-0xC1800000 (uncached)
+  u32 physical = addr & 0x3FFFFFFF;
+  return physical < GetRAMSize();
+}
+
 extern "C"
 {
 
 // ============================================================================
-// Memory access
+// Memory access — fast path for RAM, slow path for MMIO/other
 // ============================================================================
 
 uint32_t aot_read_u8(AOTState* s, uint32_t addr)
 {
+  if (IsRAMAddress(addr))
+    return GetRAMPtr()[addr & 0x3FFFFFFF];
   return PowerPC::ReadFromJit<u8>(GetMMU(), addr);
 }
 
 uint32_t aot_read_u16(AOTState* s, uint32_t addr)
 {
+  if (IsRAMAddress(addr))
+  {
+    u16 val;
+    std::memcpy(&val, &GetRAMPtr()[addr & 0x3FFFFFFF], sizeof(u16));
+    return Common::swap16(val);
+  }
   return PowerPC::ReadFromJit<u16>(GetMMU(), addr);
 }
 
 uint32_t aot_read_u16_se(AOTState* s, uint32_t addr)
 {
-  return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(
-      PowerPC::ReadFromJit<u16>(GetMMU(), addr))));
+  return static_cast<uint32_t>(static_cast<int32_t>(
+      static_cast<int16_t>(aot_read_u16(s, addr))));
 }
 
 uint32_t aot_read_u32(AOTState* s, uint32_t addr)
 {
+  if (IsRAMAddress(addr))
+  {
+    u32 val;
+    std::memcpy(&val, &GetRAMPtr()[addr & 0x3FFFFFFF], sizeof(u32));
+    return Common::swap32(val);
+  }
   return PowerPC::ReadFromJit<u32>(GetMMU(), addr);
 }
 
 uint64_t aot_read_u64(AOTState* s, uint32_t addr)
 {
+  if (IsRAMAddress(addr))
+  {
+    u64 val;
+    std::memcpy(&val, &GetRAMPtr()[addr & 0x3FFFFFFF], sizeof(u64));
+    return Common::swap64(val);
+  }
   return PowerPC::ReadFromJit<u64>(GetMMU(), addr);
 }
 
 void aot_write_u8(AOTState* s, uint32_t val, uint32_t addr)
 {
+  if (IsRAMAddress(addr))
+  {
+    GetRAMPtr()[addr & 0x3FFFFFFF] = static_cast<u8>(val);
+    return;
+  }
   PowerPC::WriteFromJit<u8>(GetMMU(), static_cast<u8>(val), addr);
 }
 
 void aot_write_u16(AOTState* s, uint32_t val, uint32_t addr)
 {
+  if (IsRAMAddress(addr))
+  {
+    u16 swapped = Common::swap16(static_cast<u16>(val));
+    std::memcpy(&GetRAMPtr()[addr & 0x3FFFFFFF], &swapped, sizeof(u16));
+    return;
+  }
   PowerPC::WriteFromJit<u16>(GetMMU(), static_cast<u16>(val), addr);
 }
 
 void aot_write_u32(AOTState* s, uint32_t val, uint32_t addr)
 {
+  if (IsRAMAddress(addr))
+  {
+    u32 swapped = Common::swap32(val);
+    std::memcpy(&GetRAMPtr()[addr & 0x3FFFFFFF], &swapped, sizeof(u32));
+    return;
+  }
   PowerPC::WriteFromJit<u32>(GetMMU(), val, addr);
 }
 
 void aot_write_u64(AOTState* s, uint64_t val, uint32_t addr)
 {
+  if (IsRAMAddress(addr))
+  {
+    u64 swapped = Common::swap64(val);
+    std::memcpy(&GetRAMPtr()[addr & 0x3FFFFFFF], &swapped, sizeof(u64));
+    return;
+  }
   PowerPC::WriteFromJit<u64>(GetMMU(), val, addr);
 }
 
