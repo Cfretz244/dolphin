@@ -3,6 +3,12 @@
 
 #pragma once
 
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include <unordered_map>
+
+#include "Common/CommonTypes.h"
 #include "Core/PowerPC/CPUCoreBase.h"
 
 namespace Core
@@ -15,6 +21,7 @@ namespace PowerPC
 struct PowerPCState;
 }
 
+class Interpreter;
 struct AOTState;
 
 // AOT CPU core backend: executes pre-compiled C functions for translated PPC blocks.
@@ -33,9 +40,39 @@ public:
   const char* GetName() const override { return "AOT"; }
 
 private:
+  void RunDiff();
+
+  // Snapshot of CPU register state for comparison
+  struct PPCSnapshot
+  {
+    u32 pc, npc;
+    u32 gpr[32];
+    u64 ps[32][2];
+    u64 cr_fields[8];
+    u32 msr, fpscr;
+    u32 exceptions;
+    s32 downcount;
+    u8 xer_ca, xer_so_ov;
+    u32 spr_lr, spr_ctr, spr_xer;
+  };
+
+  void CaptureSnapshot(PPCSnapshot& snap);
+  void RestoreSnapshot(const PPCSnapshot& snap);
+  bool CompareSnapshots(const PPCSnapshot& a, const PPCSnapshot& b, u32 block_pc, FILE* log);
+  void LogDivergence(u32 block_pc, u32 num_instr, const PPCSnapshot& pre,
+                     const PPCSnapshot& aot_result, const PPCSnapshot& interp_result, FILE* log);
+  int RunInterpreterBlock(Interpreter& interp, u32 block_addr, u32 num_instructions);
+
   Core::System& m_system;
   PowerPC::PowerPCState& m_ppc_state;
 
   using DispatchFunc = void (*)(AOTState*);
   DispatchFunc m_dispatch = nullptr;
+
+  // Block boundary map: ppc_addr -> num_instructions (loaded from CFG DB for diff mode)
+  std::unordered_map<u32, u32> m_block_sizes;
+
+  // RAM shadow buffer for diff mode (24 MB)
+  u8* m_ram_shadow = nullptr;
+  u8* m_ram_shadow_aot = nullptr;  // For optional RAM comparison
 };

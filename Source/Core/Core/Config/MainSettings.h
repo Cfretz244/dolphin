@@ -364,6 +364,15 @@ extern const Info<bool> MAIN_DEBUG_JIT_REGISTER_CACHE_OFF;
 extern const Info<bool> MAIN_DEBUG_JIT_ENABLE_PROFILING;
 extern const Info<bool> MAIN_DEBUG_TRACE_COLLECTION;
 extern const Info<std::string> MAIN_DEBUG_TRACE_OUTPUT_PATH;
+extern const Info<bool> MAIN_DEBUG_AOT_DIFF_MODE;
+extern const Info<bool> MAIN_DEBUG_AOT_SELF_DIFF;
+extern const Info<bool> MAIN_DEBUG_AOT_COMPARE_RAM;
+extern const Info<std::string> MAIN_DEBUG_AOT_CFG_DB_PATH;
+extern const Info<std::string> MAIN_DEBUG_AOT_DIFF_LOG_PATH;
+extern const Info<u32> MAIN_DEBUG_AOT_DIFF_MAX_BLOCKS;
+extern const Info<u32> MAIN_DEBUG_AOT_DIFF_MAX_DIVERGENCES;
+extern const Info<u32> MAIN_DEBUG_AOT_DIFF_FILTER_MIN;
+extern const Info<u32> MAIN_DEBUG_AOT_DIFF_FILTER_MAX;
 
 // Main.BluetoothPassthrough
 

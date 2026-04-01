@@ -97,6 +97,7 @@ extern void aot_mtspr_special(AOTState* s, uint32_t spr, uint32_t val);
 extern uint32_t aot_mfcr(AOTState* s);
 extern void aot_mtcrf(AOTState* s, uint32_t mask, uint32_t rs_reg);
 extern void aot_msr_updated(AOTState* s);
+extern void aot_mtmsr(AOTState* s, uint32_t val);
 extern void aot_cr_logical(AOTState* s, int crbD, int crbA, int crbB, const char* op);
 
 // Cache ops
@@ -177,11 +178,14 @@ extern void aot_psq_lux(AOTState* s, uint32_t inst);
 extern void aot_psq_stux(AOTState* s, uint32_t inst);
 
 // CR helpers (inline for performance)
+// Values from ConditionRegister::PPCToInternal() — Dolphin's optimized 64-bit CR encoding.
+// Index = 4-bit PPC CR field value (LT=8, GT=4, EQ=2, SO=1).
+// Internal: SO=bit59, EQ=(low32==0), GT=((s64)val>0), LT=bit62.
 static const uint64_t aot_cr_table[16] = {
-    0x100000008ULL, 0x100000009ULL, 0x100000000ULL, 0x100000001ULL,
-    0x900000008ULL, 0x900000009ULL, 0x900000000ULL, 0x900000001ULL,
-    0x500000008ULL, 0x500000009ULL, 0x500000000ULL, 0x500000001ULL,
-    0xD00000008ULL, 0xD00000009ULL, 0xD00000000ULL, 0xD00000001ULL,
+    0x8000000100000001ULL, 0x8800000100000001ULL, 0x8000000100000000ULL, 0x8800000100000000ULL,
+    0x0000000100000001ULL, 0x0800000100000001ULL, 0x0000000100000000ULL, 0x0800000100000000ULL,
+    0xC000000100000001ULL, 0xC800000100000001ULL, 0xC000000100000000ULL, 0xC800000100000000ULL,
+    0x4000000100000001ULL, 0x4800000100000001ULL, 0x4000000100000000ULL, 0x4800000100000000ULL,
 };
 
 static inline void aot_cr_set_field(AOTState* s, int field, uint32_t value) {

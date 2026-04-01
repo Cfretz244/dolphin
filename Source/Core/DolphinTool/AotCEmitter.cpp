@@ -992,7 +992,7 @@ void AOTCEmitter::EmitMfmsr(std::string& out, UGeckoInstruction inst)
 
 void AOTCEmitter::EmitMtmsr(std::string& out, UGeckoInstruction inst)
 {
-  out += fmt::format("    s->msr=s->gpr[{}]; aot_msr_updated(s);\n", I(inst.RS));
+  out += fmt::format("    aot_mtmsr(s,s->gpr[{}]); return;\n", I(inst.RS));
 }
 
 void AOTCEmitter::EmitCrLogical(std::string& out, UGeckoInstruction inst, const char* op)

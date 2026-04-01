@@ -6,6 +6,8 @@ add_executable(dolphin-tool
   AotCEmitter.h
   CfgCommand.cpp
   CfgCommand.h
+  DiffCommand.cpp
+  DiffCommand.h
   PPCMemoryImage.h
   ExtractCommand.cpp
   ExtractCommand.h

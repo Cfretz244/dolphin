@@ -575,6 +575,17 @@ const Info<bool> MAIN_DEBUG_JIT_ENABLE_PROFILING{{System::Main, "Debug", "JitEna
 const Info<bool> MAIN_DEBUG_TRACE_COLLECTION{{System::Main, "Debug", "TraceCollection"}, false};
 const Info<std::string> MAIN_DEBUG_TRACE_OUTPUT_PATH{{System::Main, "Debug", "TraceOutputPath"},
                                                      ""};
+const Info<bool> MAIN_DEBUG_AOT_DIFF_MODE{{System::Main, "Debug", "AOTDiffMode"}, false};
+const Info<bool> MAIN_DEBUG_AOT_SELF_DIFF{{System::Main, "Debug", "AOTSelfDiff"}, false};
+const Info<bool> MAIN_DEBUG_AOT_COMPARE_RAM{{System::Main, "Debug", "AOTCompareRAM"}, false};
+const Info<std::string> MAIN_DEBUG_AOT_CFG_DB_PATH{{System::Main, "Debug", "AOTCfgDbPath"}, ""};
+const Info<std::string> MAIN_DEBUG_AOT_DIFF_LOG_PATH{{System::Main, "Debug", "AOTDiffLogPath"}, ""};
+const Info<u32> MAIN_DEBUG_AOT_DIFF_MAX_BLOCKS{{System::Main, "Debug", "AOTDiffMaxBlocks"}, 0};
+const Info<u32> MAIN_DEBUG_AOT_DIFF_MAX_DIVERGENCES{{System::Main, "Debug", "AOTDiffMaxDivergences"},
+                                                    1};
+const Info<u32> MAIN_DEBUG_AOT_DIFF_FILTER_MIN{{System::Main, "Debug", "AOTDiffFilterMin"}, 0};
+const Info<u32> MAIN_DEBUG_AOT_DIFF_FILTER_MAX{{System::Main, "Debug", "AOTDiffFilterMax"},
+                                               0xFFFFFFFF};
 
 // Main.BluetoothPassthrough
 

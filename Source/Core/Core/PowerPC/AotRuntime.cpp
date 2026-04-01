@@ -214,18 +214,21 @@ void aot_rfi(AOTState* s)
   ppc_state.msr.Hex = ((ppc_state.msr.Hex & ~mask) | (SRR1(ppc_state) & mask)) & clearMSR13;
   ppc_state.pc = SRR0(ppc_state);
   ppc_state.npc = ppc_state.pc;
+  GetSystem().GetPowerPC().MSRUpdated();
 }
 
 void aot_msr_updated(AOTState* s)
 {
-  // Update feature flags from MSR bits — lightweight, no subsystem calls
+  GetSystem().GetPowerPC().MSRUpdated();
+}
+
+void aot_mtmsr(AOTState* s, uint32_t val)
+{
   auto& ppc_state = GetPPCState(s);
-  CPUEmuFeatureFlags flags{};
-  if (ppc_state.msr.DR)
-    flags = static_cast<CPUEmuFeatureFlags>(flags | FEATURE_FLAG_MSR_DR);
-  if (ppc_state.msr.IR)
-    flags = static_cast<CPUEmuFeatureFlags>(flags | FEATURE_FLAG_MSR_IR);
-  ppc_state.feature_flags = flags;
+  ppc_state.msr.Hex = val;
+  auto& power_pc = GetSystem().GetPowerPC();
+  power_pc.MSRUpdated();
+  power_pc.CheckExceptions();
 }
 
 // ============================================================================

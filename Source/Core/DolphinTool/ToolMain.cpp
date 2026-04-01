@@ -12,6 +12,7 @@
 #include "DolphinTool/AotCommand.h"
 #include "DolphinTool/CfgCommand.h"
 #include "DolphinTool/ConvertCommand.h"
+#include "DolphinTool/DiffCommand.h"
 #include "DolphinTool/ExtractCommand.h"
 #include "DolphinTool/HeaderCommand.h"
 #include "DolphinTool/VerifyCommand.h"
@@ -22,9 +23,10 @@
 
 static void PrintUsage()
 {
-  fmt::print(std::cerr, "usage: dolphin-tool COMMAND -h\n"
-                        "\n"
-                        "commands supported: [convert, verify, header, extract, cfg, translate]\n");
+  fmt::print(std::cerr,
+             "usage: dolphin-tool COMMAND -h\n"
+             "\n"
+             "commands supported: [convert, verify, header, extract, cfg, translate, diff]\n");
 }
 
 #ifdef _WIN32
@@ -55,6 +57,8 @@ int main(int argc, char* argv[])
     return DolphinTool::CfgCommand(args);
   else if (command_str == "translate")
     return DolphinTool::AotCommand(args);
+  else if (command_str == "diff")
+    return DolphinTool::DiffCommand(args);
   PrintUsage();
   return EXIT_FAILURE;
 }
