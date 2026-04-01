@@ -411,40 +411,67 @@ int AotCommand(const std::vector<std::string>& args)
     }
   }
 
-  // 5. Write dispatch table
+  // 5. Write dispatch table — flat direct-mapped array for O(1) lookup
   {
+    // Find the address range of all translatable blocks
+    u32 min_addr = UINT32_MAX, max_addr = 0;
+    for (const auto& b : cfg_blocks)
+    {
+      if (b.is_translatable)
+      {
+        min_addr = std::min(min_addr, b.ppc_addr);
+        max_addr = std::max(max_addr, b.ppc_addr);
+      }
+    }
+    // Align base to 4-byte boundary
+    min_addr &= ~3u;
+    u32 table_entries = ((max_addr - min_addr) >> 2) + 1;
+
+    fmt::println(std::cerr, "  Dispatch table: {:#010x}-{:#010x} ({} entries, {:.1f} MB)",
+                 min_addr, max_addr, table_entries,
+                 table_entries * sizeof(void*) / (1024.0 * 1024.0));
+
     std::string dispatch_file = fmt::format("{}/{}_dispatch.c", output_dir, prefix);
     std::ofstream file(dispatch_file);
     file << "#include \"aot_runtime.h\"\n";
     file << fmt::format("#include \"{}_forward_decls.h\"\n\n", prefix);
 
     file << "typedef void (*AOTBlockFunc)(AOTState*);\n\n";
-    file << "typedef struct { uint32_t addr; AOTBlockFunc func; } AOTDispatchEntry;\n\n";
 
-    file << fmt::format("static const AOTDispatchEntry {}_table[] = {{\n", prefix);
+    // Emit the flat lookup table
+    file << fmt::format("#define {}_TABLE_BASE {:#010x}u\n", prefix, min_addr);
+    file << fmt::format("#define {}_TABLE_SIZE {}u\n\n", prefix, table_entries);
+
+    file << fmt::format("static AOTBlockFunc {}_fast_table[{}] = {{\n", prefix, table_entries);
+
+    // Build a set for quick lookup
+    std::map<u32, std::string> addr_to_sym;
     for (const auto& b : cfg_blocks)
     {
       if (b.is_translatable)
-        file << fmt::format("    {{ {:#010x}u, {}_block_{:08x} }},\n", b.ppc_addr, prefix,
-                            b.ppc_addr);
+        addr_to_sym[b.ppc_addr] = fmt::format("{}_block_{:08x}", prefix, b.ppc_addr);
+    }
+
+    // Emit table entries — NULL for gaps, function pointer for known blocks
+    // Write in chunks to keep file manageable
+    for (u32 i = 0; i < table_entries; i++)
+    {
+      u32 addr = min_addr + (i << 2);
+      auto it = addr_to_sym.find(addr);
+      if (it != addr_to_sym.end())
+        file << fmt::format("    {},\n", it->second);
+      else
+        file << "    0,\n";
     }
     file << "};\n\n";
 
-    file << fmt::format(
-        "static const uint32_t {}_table_size = sizeof({}_table) / sizeof({}_table[0]);\n\n",
-        prefix, prefix, prefix);
-
-    // Binary search dispatcher
+    // Emit the fast dispatch function — O(1) array lookup
     file << fmt::format("void {}_dispatch(AOTState* s) {{\n", prefix);
     file << "    uint32_t pc = s->pc;\n";
-    file << fmt::format("    int lo = 0, hi = (int){}_table_size - 1;\n", prefix);
-    file << "    while (lo <= hi) {\n";
-    file << "        int mid = (lo + hi) / 2;\n";
-    file << fmt::format("        if ({}_table[mid].addr == pc) {{ {}_table[mid].func(s); return; "
-                        "}}\n",
-                        prefix, prefix);
-    file << fmt::format(
-        "        if ({}_table[mid].addr < pc) lo = mid + 1; else hi = mid - 1;\n", prefix);
+    file << fmt::format("    uint32_t idx = (pc - {}_TABLE_BASE) >> 2;\n", prefix);
+    file << fmt::format("    if (idx < {}_TABLE_SIZE) {{\n", prefix);
+    file << fmt::format("        AOTBlockFunc fn = {}_fast_table[idx];\n", prefix);
+    file << "        if (fn) { fn(s); return; }\n";
     file << "    }\n";
     file << "    aot_interpreter_single_step(s);\n";
     file << "}\n";
