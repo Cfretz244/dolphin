@@ -205,7 +205,6 @@ void PowerPCManager::InitializeCPUCore(CPUCore cpu_core)
   auto& interpreter = m_system.GetInterpreter();
   interpreter.Init();
 
-  fprintf(stderr, "InitializeCPUCore: requested core = %d\n", static_cast<int>(cpu_core));
 
   switch (cpu_core)
   {
@@ -218,7 +217,6 @@ void PowerPCManager::InitializeCPUCore(CPUCore cpu_core)
     m_aot_core = std::make_unique<AOTCore>(m_system);
     m_aot_core->Init();
     m_cpu_core_base = m_aot_core.get();
-    fprintf(stderr, "AOT core initialized successfully, dispatch = %p\n", (void*)m_aot_core.get());
     break;
 #endif
 
