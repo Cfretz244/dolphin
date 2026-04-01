@@ -90,11 +90,32 @@ void AOTCore::Run()
   {
     core_timing.Advance();
 
+    // Idle loop detection: track recent PCs. If we see the same PC
+    // appear twice within a short window, we're in a spin loop.
+    u32 pc_history[8] = {};
+    u32 pc_idx = 0;
+
     while (m_ppc_state.downcount > 0 && cpu.GetState() == CPU::State::Running)
     {
+      u32 pc = m_ppc_state.pc;
+
+      // Check if this PC appeared recently in history
+      for (u32 i = 0; i < 8; i++)
+      {
+        if (pc_history[i] == pc && pc != 0)
+        {
+          // Idle loop detected — skip remaining timeslice
+          m_ppc_state.downcount = 0;
+          goto next_slice;
+        }
+      }
+      pc_history[pc_idx & 7] = pc;
+      pc_idx++;
+
       auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
       m_dispatch(aot_state);
     }
+    next_slice:;
   }
 }
 
