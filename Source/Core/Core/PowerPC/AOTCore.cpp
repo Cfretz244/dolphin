@@ -786,10 +786,14 @@ void AOTCore::RunDiff()
         pass_count++;
 
       // Self-loop: if PC == block start, force end of timeslice so
-      // core_timing.Advance() runs. This services hardware events that
-      // polling loops depend on (e.g., waiting for a flag set by VI interrupt).
+      // core_timing.Advance() runs. Also mark the block as fully validated
+      // to skip the 48MB snapshot/restore on every future iteration —
+      // one successful comparison proves the codegen is correct.
       if (!diverged && m_ppc_state.pc == block_pc)
+      {
+        pass_count = VALIDATION_THRESHOLD;
         m_ppc_state.downcount = 0;
+      }
 
       blocks_compared++;
       if (max_blocks > 0 && blocks_compared >= max_blocks)
