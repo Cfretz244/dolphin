@@ -615,10 +615,18 @@ void AOTCore::RunDiff()
       if (is_mmio)
       {
         blocks_skipped_mmio++;
-        // Run AOT dispatch for MMIO blocks (NOT interpreter — interpreter MMU reads
-        // can deadlock waiting for hardware synchronization in our execution context)
-        auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
-        m_dispatch(aot_state);
+        // Run single AOT block for MMIO blocks (NOT interpreter — it deadlocks on MMIO reads,
+        // and NOT full dispatch — it chains and may hit other deadlocking blocks)
+        if (aot_block_fn)
+        {
+          s32 saved_dc = m_ppc_state.downcount;
+          m_ppc_state.downcount = static_cast<s32>(num_instr);
+          aot_single_block_mode = 1;
+          auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
+          aot_block_fn(aot_state);
+          aot_single_block_mode = 0;
+          m_ppc_state.downcount = saved_dc - static_cast<s32>(num_instr);
+        }
         if (m_ppc_state.Exceptions != 0)
         {
           m_ppc_state.npc = m_ppc_state.pc;
