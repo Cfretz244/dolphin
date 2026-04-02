@@ -413,7 +413,7 @@ bool AOTCEmitter::EmitTable31(std::string& out, UGeckoInstruction inst, u32 pc)
   case 470: return true; // dcbi (no-op for AOT)
   case 982: out += fmt::format("    aot_icbi(s,s->gpr[{}]+s->gpr[{}]);\n", I(inst.RA), I(inst.RB)); return true;
   // Missing arithmetic
-  case 200: EmitAddzex(out, inst); return true;  // subfzex (reuses addzex logic pattern)
+  case 200: EmitSubfzex(out, inst); return true;  // subfzex
   // MSR
   case 83:  EmitMfmsr(out, inst); return true;
   case 146: EmitMtmsr(out, inst, pc); return true;
@@ -498,6 +498,16 @@ void AOTCEmitter::EmitAddzex(std::string& out, UGeckoInstruction inst)
 {
   u32 rd=I(inst.RD), ra=I(inst.RA);
   out += fmt::format("    {{ uint32_t c=s->xer_ca,a=s->gpr[{}],r=a+c; s->gpr[{}]=r; s->xer_ca=(c>(~a));", ra, rd);
+  if (inst.OE) out += " { uint32_t ov=(((a^r)&(0^r))>>31)!=0; s->xer_so_ov=(s->xer_so_ov&0xfe)|ov; if(ov) s->xer_so_ov|=2; }";
+  if (inst.Rc) { out += "\n"; EmitUpdateCR0(out, "r"); }
+  out += " }\n";
+}
+
+void AOTCEmitter::EmitSubfzex(std::string& out, UGeckoInstruction inst)
+{
+  u32 rd=I(inst.RD), ra=I(inst.RA);
+  // subfze: rD = ~rA + carry (subtract from zero extended)
+  out += fmt::format("    {{ uint32_t c=s->xer_ca,a=~s->gpr[{}],r=a+c; s->gpr[{}]=r; s->xer_ca=(c>(~a));", ra, rd);
   if (inst.OE) out += " { uint32_t ov=(((a^r)&(0^r))>>31)!=0; s->xer_so_ov=(s->xer_so_ov&0xfe)|ov; if(ov) s->xer_so_ov|=2; }";
   if (inst.Rc) { out += "\n"; EmitUpdateCR0(out, "r"); }
   out += " }\n";

@@ -52,6 +52,7 @@ private:
   void EmitAddex(std::string& out, UGeckoInstruction inst);
   void EmitAddmex(std::string& out, UGeckoInstruction inst);
   void EmitAddzex(std::string& out, UGeckoInstruction inst);
+  void EmitSubfzex(std::string& out, UGeckoInstruction inst);
   void EmitSubfx(std::string& out, UGeckoInstruction inst);
   void EmitSubfcx(std::string& out, UGeckoInstruction inst);
   void EmitSubfex(std::string& out, UGeckoInstruction inst);
