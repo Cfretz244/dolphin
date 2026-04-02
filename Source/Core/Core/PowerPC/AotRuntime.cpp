@@ -220,6 +220,19 @@ int aot_check_fpu(AOTState* s, uint32_t pc)
   return 0;
 }
 
+void aot_msr_updated(AOTState* s)
+{
+  // Lightweight MSR update for AOT — update feature flags and page table,
+  // but skip JitInterface::UpdateMembase() which triggers expensive BAT
+  // remapping that the AOT doesn't use (it accesses RAM via GetRAMPtr()).
+  auto& ppc_state = GetPPCState(s);
+  ppc_state.feature_flags = static_cast<CPUEmuFeatureFlags>(
+      (ppc_state.feature_flags & FEATURE_FLAG_PERFMON) | ((ppc_state.msr.Hex >> 4) & 0x3));
+
+  if (ppc_state.msr.DR && ppc_state.pagetable_update_pending)
+    GetSystem().GetMMU().PageTableUpdated();
+}
+
 void aot_rfi(AOTState* s)
 {
   auto& ppc_state = GetPPCState(s);
@@ -228,21 +241,15 @@ void aot_rfi(AOTState* s)
   ppc_state.msr.Hex = ((ppc_state.msr.Hex & ~mask) | (SRR1(ppc_state) & mask)) & clearMSR13;
   ppc_state.pc = SRR0(ppc_state);
   ppc_state.npc = ppc_state.pc;
-  GetSystem().GetPowerPC().MSRUpdated();
-}
-
-void aot_msr_updated(AOTState* s)
-{
-  GetSystem().GetPowerPC().MSRUpdated();
+  aot_msr_updated(s);
 }
 
 void aot_mtmsr(AOTState* s, uint32_t val)
 {
   auto& ppc_state = GetPPCState(s);
   ppc_state.msr.Hex = val;
-  auto& power_pc = GetSystem().GetPowerPC();
-  power_pc.MSRUpdated();
-  power_pc.CheckExceptions();
+  aot_msr_updated(s);  // Lightweight — no BAT remapping
+  GetSystem().GetPowerPC().CheckExceptions();
 }
 
 // ============================================================================
