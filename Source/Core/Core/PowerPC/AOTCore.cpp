@@ -405,12 +405,15 @@ int AOTCore::RunInterpreterBlock(Interpreter& interp, u32 block_addr, u32 num_in
 {
   int total_cycles = 0;
   const u32 block_end = block_addr + num_instructions * 4;
+  // Safety limit: allow self-looping blocks (e.g. memset loops that branch back to
+  // their own start) to complete, but cap at a generous maximum to prevent infinite loops.
+  const u32 max_steps = num_instructions * 4096;
 
-  for (u32 i = 0; i < num_instructions; i++)
+  for (u32 i = 0; i < max_steps; i++)
   {
     total_cycles += interp.SingleStepInner();
 
-    // Stop if PC left the block range (branch taken) or exception fired
+    // Stop when PC exits the block's address range or exception fires
     if (m_ppc_state.pc < block_addr || m_ppc_state.pc >= block_end)
       break;
     if (m_ppc_state.Exceptions != 0)
