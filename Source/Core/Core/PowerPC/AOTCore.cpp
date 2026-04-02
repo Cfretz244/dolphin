@@ -655,67 +655,38 @@ void AOTCore::RunDiff()
         continue;
       }
 
-      std::memcpy(m_ram_shadow, memory.GetRAM(), ram_size);
+      // REGISTER-ONLY COMPARISON: interpreter runs first as oracle,
+      // then AOT runs from same register pre-state. No RAM copies.
 
-      // 2. Run path A: call the SINGLE AOT block function directly.
-      //    Set downcount=0 to prevent tail-call chaining — AOT blocks check
-      //    `if(s->downcount<=0){ s->pc=TARGET; return; }` before tail-calling,
-      //    so this forces them to set pc and return instead.
-      if (self_diff)
+      // 2. Run interpreter (oracle) — drives execution, memory stays correct
+      RunInterpreterBlock(interp, block_pc, num_instr);
+      m_ppc_state.downcount -= static_cast<s32>(num_instr);
+
+      PPCSnapshot interp_result;
+      CaptureSnapshot(interp_result);
+
+      // 3. Restore registers, run AOT from same pre-state
+      //    (memory has interpreter's writes — correct for AOT if codegen matches)
+      RestoreSnapshot(pre_snap);
       {
-        RunInterpreterBlock(interp, block_pc, num_instr);
-        m_ppc_state.downcount -= static_cast<s32>(num_instr);
-      }
-      else
-      {
-        // Force single-block execution:
-        // 1. Set aot_single_block_mode so dispatch() returns immediately
-        //    (prevents indirect branches like blr/bctr from chaining)
-        // 2. Set downcount = num_instr so direct tail-calls bail out
-        //    (AOT blocks check downcount<=0 before tail-calling)
-        s32 saved_downcount = m_ppc_state.downcount;
+        s32 saved_dc = m_ppc_state.downcount;
         m_ppc_state.downcount = static_cast<s32>(num_instr);
         aot_single_block_mode = 1;
         auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
         aot_block_fn(aot_state);
         aot_single_block_mode = 0;
-        m_ppc_state.downcount = saved_downcount - static_cast<s32>(num_instr);
+        m_ppc_state.downcount = saved_dc - static_cast<s32>(num_instr);
       }
 
-      PPCSnapshot path_a_result;
-      CaptureSnapshot(path_a_result);
+      PPCSnapshot aot_result;
+      CaptureSnapshot(aot_result);
 
-      // 3. Restore CPU + RAM for path B
-      RestoreSnapshot(pre_snap);
-      std::memcpy(memory.GetRAM(), m_ram_shadow, ram_size);
+      // 4. Restore interpreter result — interpreter is always authoritative
+      RestoreSnapshot(interp_result);
 
-      // 4. Run path B: interpreter for same block (one iteration only —
-      //    matching the AOT path which also runs one iteration due to downcount trick)
+      // 5. Compare (skip if either path hit an exception)
+      if (aot_result.exceptions != 0 || interp_result.exceptions != 0)
       {
-        int total_cycles = 0;
-        const u32 block_end = block_pc + num_instr * 4;
-        for (u32 i = 0; i < num_instr; i++)
-        {
-          total_cycles += interp.SingleStepInner();
-          if (m_ppc_state.pc < block_pc || m_ppc_state.pc >= block_end)
-            break;
-          if (m_ppc_state.Exceptions != 0)
-            break;
-        }
-        m_ppc_state.downcount -= static_cast<s32>(num_instr);
-      }
-
-      PPCSnapshot path_b_result;
-      CaptureSnapshot(path_b_result);
-
-      // 5. Compare
-      // Skip comparison if either path hit an exception
-      if (path_a_result.exceptions != 0 || path_b_result.exceptions != 0)
-      {
-        // Continue from path A result (consistent with hardware state from first run)
-        RestoreSnapshot(path_a_result);
-        if (compare_ram && m_ram_shadow_aot)
-          std::memcpy(memory.GetRAM(), m_ram_shadow_aot, ram_size);
         if (m_ppc_state.Exceptions != 0)
         {
           m_ppc_state.npc = m_ppc_state.pc;
@@ -725,47 +696,14 @@ void AOTCore::RunDiff()
         continue;
       }
 
-      bool diverged = !CompareSnapshots(path_a_result, path_b_result, block_pc, log);
+      bool diverged = !CompareSnapshots(aot_result, interp_result, block_pc, log);
 
       if (diverged)
       {
         divergence_count++;
-        u32 num_instr_for_log = 0;
-        auto log_it = m_block_sizes.find(block_pc);
-        if (log_it != m_block_sizes.end())
-          num_instr_for_log = log_it->second;
-        LogDivergence(block_pc, num_instr_for_log, pre_snap, path_a_result, path_b_result, log);
+        LogDivergence(block_pc, num_instr, pre_snap, aot_result, interp_result, log);
 
-        // Optional RAM comparison
-        if (compare_ram && m_ram_shadow_aot)
-        {
-          u32 ram_diffs = 0;
-          for (u32 offset = 0; offset < ram_size; offset += 4)
-          {
-            u32 a_val, b_val;
-            std::memcpy(&a_val, m_ram_shadow_aot + offset, 4);
-            std::memcpy(&b_val, memory.GetRAM() + offset, 4);
-            if (a_val != b_val)
-            {
-              if (ram_diffs < 20)
-              {
-                fmt::print(log, "  RAM[{:#010x}]: pathA={:#010x}  pathB={:#010x}\n",
-                           0x80000000 + offset, a_val, b_val);
-              }
-              ram_diffs++;
-            }
-          }
-          if (ram_diffs > 0)
-            fmt::print(log, "  Total RAM differences: {} words\n", ram_diffs);
-        }
-
-        // After divergence, ALWAYS restore path A state + RAM.
-        // Path A ran first and is consistent with hardware state.
-        // Path B ran on restored RAM but with stale hardware state, so its
-        // results may be inconsistent (causing hangs if we continue from B).
-        RestoreSnapshot(path_a_result);
-        if (compare_ram && m_ram_shadow_aot)
-          std::memcpy(memory.GetRAM(), m_ram_shadow_aot, ram_size);
+        // Interpreter result already restored above — continue from oracle
 
         if (divergence_count >= max_divergences)
         {
@@ -784,17 +722,7 @@ void AOTCore::RunDiff()
         }
       }
 
-      // In non-divergent case for AOT-vs-interp mode: continue from path B (interpreter = oracle)
-      // In self-diff mode or after divergence: continue from path A (consistent with HW)
-      if (!diverged && !self_diff)
-      {
-        // path B result is already in m_ppc_state — continue from interpreter
-      }
-      else if (!diverged)
-      {
-        // Self-diff, no divergence — path A and B are equivalent, already on path B, that's fine
-      }
-      // diverged case already restored path A above
+      // Interpreter result already restored — always continue from oracle
       if (m_ppc_state.Exceptions != 0)
       {
         m_ppc_state.npc = m_ppc_state.pc;
