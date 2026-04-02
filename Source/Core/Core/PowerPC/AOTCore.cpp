@@ -615,8 +615,10 @@ void AOTCore::RunDiff()
       if (is_mmio)
       {
         blocks_skipped_mmio++;
-        RunInterpreterBlock(interp, block_pc, num_instr);
-        m_ppc_state.downcount -= static_cast<s32>(num_instr);
+        // Run AOT dispatch for MMIO blocks (NOT interpreter — interpreter MMU reads
+        // can deadlock waiting for hardware synchronization in our execution context)
+        auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
+        m_dispatch(aot_state);
         if (m_ppc_state.Exceptions != 0)
         {
           m_ppc_state.npc = m_ppc_state.pc;
