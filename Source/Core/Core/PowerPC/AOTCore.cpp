@@ -11,6 +11,7 @@
 
 #include "Common/CommonTypes.h"
 #include "Common/GekkoDisassembler.h"
+#include "Common/Swap.h"
 #include "Common/Logging/Log.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
@@ -384,11 +385,14 @@ bool AOTCore::BlockAccessesMMIO(const PPCSnapshot& pre, u32 block_addr, u32 num_
   }
 
   // Scan instructions for `lis rN, 0xCC00` (addis rD, r0, 0xCC00) or similar
-  // Also check for loads/stores with base in CC range
-  auto& mmu = m_system.GetMMU();
+  // Read directly from RAM (not through iCache/MMU which may return stale data)
+  u8* ram = m_system.GetMemory().GetRAM();
   for (u32 i = 0; i < num_instructions; i++)
   {
-    u32 opcode = mmu.Read_Opcode(block_addr + i * 4);
+    u32 phys = (block_addr + i * 4) & 0x3FFFFFFF;
+    u32 opcode;
+    std::memcpy(&opcode, &ram[phys], sizeof(u32));
+    opcode = Common::swap32(opcode);  // PPC is big-endian
     u32 primary = (opcode >> 26) & 0x3F;
 
     // addis (lis is addis with rA=0): opcode 15
@@ -607,7 +611,8 @@ void AOTCore::RunDiff()
       CaptureSnapshot(pre_snap);
 
       // Check MMIO access
-      if (BlockAccessesMMIO(pre_snap, block_pc, num_instr))
+      bool is_mmio = BlockAccessesMMIO(pre_snap, block_pc, num_instr);
+      if (is_mmio)
       {
         blocks_skipped_mmio++;
         RunInterpreterBlock(interp, block_pc, num_instr);
@@ -808,14 +813,11 @@ void AOTCore::RunDiff()
         return;
       }
 
-      // Progress reporting
-      if (blocks_compared % 1000 == 0)
-      {
-        fmt::print(stderr,
-                   "AOTDiff: {} blocks compared, {} divergences, {} skipped, {} MMIO | pc={:#010x}\n",
-                   blocks_compared, divergence_count, blocks_skipped_unknown, blocks_skipped_mmio,
-                   m_ppc_state.pc);
-      }
+      // Progress reporting — every iteration
+      fmt::print(stderr,
+                 "AOTDiff: #{} pc={:#010x} div={} skip={} mmio={}\n",
+                 blocks_compared, m_ppc_state.pc, divergence_count,
+                 blocks_skipped_unknown, blocks_skipped_mmio);
     }
   }
 
