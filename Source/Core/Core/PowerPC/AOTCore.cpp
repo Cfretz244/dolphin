@@ -558,15 +558,25 @@ void AOTCore::RunDiff()
 
       const u32 num_instr = it->second;
 
+      // Look up AOT block function early (needed by validation skip and filter paths)
+      AOTBlockFunc aot_block_fn = self_diff ? nullptr : GALE01_lookup_block(block_pc);
+
       // Skip blocks that have already been validated enough times.
       // After a block passes comparison N times with different inputs,
       // we trust its codegen and just run the interpreter (no snapshot overhead).
       constexpr u32 VALIDATION_THRESHOLD = 100;
       auto& pass_count = m_block_pass_count[block_pc];
-      if (pass_count >= VALIDATION_THRESHOLD)
+      if (pass_count >= VALIDATION_THRESHOLD && aot_block_fn)
       {
-        RunInterpreterBlock(interp, block_pc, num_instr);
-        m_ppc_state.downcount -= static_cast<s32>(num_instr);
+        // Use AOT single-block for validated blocks — the interpreter's
+        // SingleStepInner can deadlock on certain memory reads.
+        s32 saved_dc = m_ppc_state.downcount;
+        m_ppc_state.downcount = static_cast<s32>(num_instr);
+        aot_single_block_mode = 1;
+        auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
+        aot_block_fn(aot_state);
+        aot_single_block_mode = 0;
+        m_ppc_state.downcount = saved_dc - static_cast<s32>(num_instr);
         if (m_ppc_state.Exceptions != 0)
         {
           m_ppc_state.npc = m_ppc_state.pc;
@@ -575,11 +585,24 @@ void AOTCore::RunDiff()
         continue;
       }
 
-      // Filter by address range
+      // Filter by address range — run AOT for filtered blocks (interpreter can deadlock)
       if (block_pc < filter_min || block_pc > filter_max)
       {
-        RunInterpreterBlock(interp, block_pc, num_instr);
-        m_ppc_state.downcount -= static_cast<s32>(num_instr);
+        if (aot_block_fn)
+        {
+          s32 saved_dc = m_ppc_state.downcount;
+          m_ppc_state.downcount = static_cast<s32>(num_instr);
+          aot_single_block_mode = 1;
+          auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
+          aot_block_fn(aot_state);
+          aot_single_block_mode = 0;
+          m_ppc_state.downcount = saved_dc - static_cast<s32>(num_instr);
+        }
+        else
+        {
+          RunInterpreterBlock(interp, block_pc, num_instr);
+          m_ppc_state.downcount -= static_cast<s32>(num_instr);
+        }
         if (m_ppc_state.Exceptions != 0)
         {
           m_ppc_state.npc = m_ppc_state.pc;
@@ -588,8 +611,6 @@ void AOTCore::RunDiff()
         continue;
       }
 
-      // Look up AOT block function (may be NULL if not in dispatch table)
-      AOTBlockFunc aot_block_fn = self_diff ? nullptr : GALE01_lookup_block(block_pc);
       if (!aot_block_fn && !self_diff)
       {
         // Block is in CFG but not in AOT table — run interpreter only
