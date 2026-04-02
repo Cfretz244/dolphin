@@ -117,6 +117,7 @@ int DiffCommand(const std::vector<std::string>& args)
   const bool self_diff = options.is_set("self_diff");
 
   // Initialize UICommon (config system, video backend)
+  UICommon::SetUserDirectory("");  // Use default user directory
   UICommon::Init();
 
   // Headless WSI — no window, null video backend

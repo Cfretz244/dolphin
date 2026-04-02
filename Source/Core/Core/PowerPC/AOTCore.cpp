@@ -12,6 +12,7 @@
 #include "Common/GekkoDisassembler.h"
 #include "Common/Logging/Log.h"
 #include "Core/Config/MainSettings.h"
+#include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "Core/HW/CPU.h"
 #include "Core/HW/Memmap.h"
@@ -559,6 +560,7 @@ void AOTCore::RunDiff()
           std::fflush(log);
           if (log != stdout)
             std::fclose(log);
+          Core::QueueHostJob([](Core::System& sys) { Core::Stop(sys); });
           cpu.Break();
           return;
         }
