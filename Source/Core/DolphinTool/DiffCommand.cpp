@@ -145,21 +145,21 @@ int DiffCommand(const std::vector<std::string>& args)
   });
 
   // Set config for AOT diff mode
-  Config::SetBaseOrCurrent(Config::MAIN_CPU_CORE, PowerPC::CPUCore::AOT);
-  Config::SetBaseOrCurrent(Config::MAIN_GFX_BACKEND, std::string("Null"));
-  Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_MODE, true);
-  Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_SELF_DIFF, self_diff);
-  Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_COMPARE_RAM,
+  Config::SetCurrent(Config::MAIN_CPU_CORE, PowerPC::CPUCore::AOT);
+  Config::SetCurrent(Config::MAIN_GFX_BACKEND, std::string("Null"));
+  Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_MODE, true);
+  Config::SetCurrent(Config::MAIN_DEBUG_AOT_SELF_DIFF, self_diff);
+  Config::SetCurrent(Config::MAIN_DEBUG_AOT_COMPARE_RAM,
                            static_cast<int>(options.get("compare_ram")) != 0);
-  Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_CFG_DB_PATH, cfg_path);
-  Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_MAX_BLOCKS, max_blocks_val);
-  Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_MAX_DIVERGENCES, max_div_val);
-  Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_FILTER_MIN, filter_min);
-  Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_FILTER_MAX, filter_max);
+  Config::SetCurrent(Config::MAIN_DEBUG_AOT_CFG_DB_PATH, cfg_path);
+  Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_MAX_BLOCKS, max_blocks_val);
+  Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_MAX_DIVERGENCES, max_div_val);
+  Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_FILTER_MIN, filter_min);
+  Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_FILTER_MAX, filter_max);
 
   const std::string log_path = options["log"];
   if (!log_path.empty())
-    Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_LOG_PATH, log_path);
+    Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_LOG_PATH, log_path);
 
   // Load block sizes from CFG database and pass to AOTCore
   {
