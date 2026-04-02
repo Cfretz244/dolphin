@@ -124,7 +124,7 @@ int DiffCommand(const std::vector<std::string>& args)
   const u32 filter_max = static_cast<u32>(std::stoul(filter_max_str, nullptr, 0));
   const u32 max_blocks_val = static_cast<u32>(std::stoul(std::string(options["max_blocks"])));
   const u32 max_div_val = static_cast<u32>(std::stoul(std::string(options["max_divergences"])));
-  const bool self_diff = options.is_set("self_diff");
+  const bool self_diff = static_cast<int>(options.get("self_diff")) != 0;
 
   // Initialize UICommon (config system, video backend)
   UICommon::SetUserDirectory("");  // Use default user directory
@@ -150,7 +150,7 @@ int DiffCommand(const std::vector<std::string>& args)
   Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_MODE, true);
   Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_SELF_DIFF, self_diff);
   Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_COMPARE_RAM,
-                           options.is_set("compare_ram"));
+                           static_cast<int>(options.get("compare_ram")) != 0);
   Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_CFG_DB_PATH, cfg_path);
   Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_MAX_BLOCKS, max_blocks_val);
   Config::SetBaseOrCurrent(Config::MAIN_DEBUG_AOT_DIFF_MAX_DIVERGENCES, max_div_val);
