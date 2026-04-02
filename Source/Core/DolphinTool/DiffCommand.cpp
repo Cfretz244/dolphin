@@ -7,6 +7,8 @@
 
 #include "DolphinTool/DiffCommand.h"
 
+#include <atomic>
+#include <csignal>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -35,6 +37,14 @@
 
 namespace DolphinTool
 {
+
+static std::atomic<bool> s_diff_shutdown_requested{false};
+
+static void DiffSignalHandler(int)
+{
+  s_diff_shutdown_requested.store(true);
+  AOTCore::s_shutdown_requested.store(true);
+}
 
 int DiffCommand(const std::vector<std::string>& args)
 {
@@ -199,6 +209,10 @@ int DiffCommand(const std::vector<std::string>& args)
   if (self_diff)
     fmt::println(std::cerr, "AOT Diff: Self-diff mode (interpreter vs interpreter)");
 
+  // Install signal handler so Ctrl+C works
+  std::signal(SIGINT, DiffSignalHandler);
+  std::signal(SIGTERM, DiffSignalHandler);
+
   if (!BootManager::BootCore(system, std::move(boot), wsi))
   {
     fmt::println(std::cerr, "Error: Failed to boot emulator");
@@ -210,6 +224,12 @@ int DiffCommand(const std::vector<std::string>& args)
   while (Core::IsRunningOrStarting(system))
   {
     Core::HostDispatchJobs(system);
+    if (s_diff_shutdown_requested.load())
+    {
+      fmt::println(std::cerr, "\nAOT Diff: Interrupted by signal, shutting down...");
+      Core::Stop(system);
+      break;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 

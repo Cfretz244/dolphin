@@ -3,6 +3,7 @@
 
 #include "Core/PowerPC/AOTCore.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
@@ -77,6 +78,7 @@ extern "C" void GALE01_dispatch(AOTState* s);
 
 // Static storage for diff block sizes (set by DiffCommand before boot)
 std::unordered_map<u32, u32> AOTCore::s_diff_block_sizes;
+std::atomic<bool> AOTCore::s_shutdown_requested{false};
 
 void AOTCore::SetDiffBlockSizes(std::unordered_map<u32, u32> sizes)
 {
@@ -455,7 +457,7 @@ void AOTCore::RunDiff()
   fmt::print(log, "RAM size: {} MB\n\n", ram_size / (1024 * 1024));
   std::fflush(log);
 
-  while (cpu.GetState() == CPU::State::Running)
+  while (cpu.GetState() == CPU::State::Running && !s_shutdown_requested.load())
   {
     m_ppc_state.npc = m_ppc_state.pc;
     core_timing.Advance();
@@ -465,7 +467,8 @@ void AOTCore::RunDiff()
     u32 pc_history[8] = {};
     u32 pc_idx = 0;
 
-    while (m_ppc_state.downcount > 0 && cpu.GetState() == CPU::State::Running)
+    while (m_ppc_state.downcount > 0 && cpu.GetState() == CPU::State::Running &&
+           !s_shutdown_requested.load())
     {
       const u32 block_pc = m_ppc_state.pc;
 
@@ -697,11 +700,12 @@ void AOTCore::RunDiff()
       }
 
       // Progress reporting
-      if (blocks_compared % 10000 == 0)
+      if (blocks_compared % 1000 == 0)
       {
         fmt::print(stderr,
-                   "AOTDiff: {} blocks compared, {} divergences, {} skipped, {} MMIO skipped\n",
-                   blocks_compared, divergence_count, blocks_skipped_unknown, blocks_skipped_mmio);
+                   "AOTDiff: {} blocks compared, {} divergences, {} skipped, {} MMIO | pc={:#010x}\n",
+                   blocks_compared, divergence_count, blocks_skipped_unknown, blocks_skipped_mmio,
+                   m_ppc_state.pc);
       }
     }
     next_diff_slice:;

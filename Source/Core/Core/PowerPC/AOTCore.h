@@ -43,6 +43,9 @@ public:
   static void SetDiffBlockSizes(std::unordered_map<u32, u32> sizes);
   static std::unordered_map<u32, u32> s_diff_block_sizes;
 
+  // Shutdown flag — set by signal handler, checked by diff loop
+  static std::atomic<bool> s_shutdown_requested;
+
 private:
   void RunDiff();
 
