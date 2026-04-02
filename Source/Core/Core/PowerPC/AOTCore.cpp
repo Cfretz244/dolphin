@@ -655,19 +655,12 @@ void AOTCore::RunDiff()
         continue;
       }
 
-      // REGISTER-ONLY COMPARISON: interpreter runs first as oracle,
-      // then AOT runs from same register pre-state. No RAM copies.
+      // FULL COMPARISON: snapshot CPU+RAM, run AOT, restore, run interpreter, compare.
 
-      // 2. Run interpreter (oracle) — drives execution, memory stays correct
-      RunInterpreterBlock(interp, block_pc, num_instr);
-      m_ppc_state.downcount -= static_cast<s32>(num_instr);
+      // 2. Save RAM
+      std::memcpy(m_ram_shadow, memory.GetRAM(), ram_size);
 
-      PPCSnapshot interp_result;
-      CaptureSnapshot(interp_result);
-
-      // 3. Restore registers, run AOT from same pre-state
-      //    (memory has interpreter's writes — correct for AOT if codegen matches)
-      RestoreSnapshot(pre_snap);
+      // 3. Run AOT single-block
       {
         s32 saved_dc = m_ppc_state.downcount;
         m_ppc_state.downcount = static_cast<s32>(num_instr);
@@ -681,8 +674,15 @@ void AOTCore::RunDiff()
       PPCSnapshot aot_result;
       CaptureSnapshot(aot_result);
 
-      // 4. Restore interpreter result — interpreter is always authoritative
-      RestoreSnapshot(interp_result);
+      // 4. Restore CPU + RAM, run interpreter
+      RestoreSnapshot(pre_snap);
+      std::memcpy(memory.GetRAM(), m_ram_shadow, ram_size);
+
+      RunInterpreterBlock(interp, block_pc, num_instr);
+      m_ppc_state.downcount -= static_cast<s32>(num_instr);
+
+      PPCSnapshot interp_result;
+      CaptureSnapshot(interp_result);
 
       // 5. Compare (skip if either path hit an exception)
       if (aot_result.exceptions != 0 || interp_result.exceptions != 0)
@@ -758,11 +758,13 @@ void AOTCore::RunDiff()
         return;
       }
 
-      // Progress reporting — every iteration
-      fmt::print(stderr,
-                 "AOTDiff: #{} pc={:#010x} div={} skip={} mmio={}\n",
-                 blocks_compared, m_ppc_state.pc, divergence_count,
-                 blocks_skipped_unknown, blocks_skipped_mmio);
+      if (blocks_compared % 1000 == 0)
+      {
+        fmt::print(stderr,
+                   "AOTDiff: #{} pc={:#010x} div={} skip={} mmio={}\n",
+                   blocks_compared, m_ppc_state.pc, divergence_count,
+                   blocks_skipped_unknown, blocks_skipped_mmio);
+      }
     }
   }
 
