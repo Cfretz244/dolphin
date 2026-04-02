@@ -405,21 +405,64 @@ int AOTCore::RunInterpreterBlock(Interpreter& interp, u32 block_addr, u32 num_in
 {
   int total_cycles = 0;
   const u32 block_end = block_addr + num_instructions * 4;
-  // Safety limit: allow self-looping blocks (e.g. memset loops that branch back to
-  // their own start) to complete, but cap at a generous maximum to prevent infinite loops.
   const u32 max_steps = num_instructions * 4096;
 
   for (u32 i = 0; i < max_steps; i++)
   {
     total_cycles += interp.SingleStepInner();
 
-    // Stop when PC exits the block's address range or exception fires
     if (m_ppc_state.pc < block_addr || m_ppc_state.pc >= block_end)
       break;
     if (m_ppc_state.Exceptions != 0)
       break;
   }
   return total_cycles;
+}
+
+// Simulate the AOT dispatch: run interpreter through a chain of known blocks,
+// stopping when PC reaches an unknown block (where AOT dispatch would return
+// to its caller) or downcount is exhausted. This matches the AOT dispatch
+// granularity where tail calls chain between known blocks.
+void AOTCore::RunInterpreterDispatch(Interpreter& interp)
+{
+  constexpr u32 MAX_CHAIN = 100000;  // safety limit on chain length
+
+  for (u32 chain = 0; chain < MAX_CHAIN; chain++)
+  {
+    u32 pc = m_ppc_state.pc;
+
+    // Look up block at current PC
+    auto it = m_block_sizes.find(pc);
+    if (it == m_block_sizes.end())
+    {
+      // Unknown block — AOT dispatch would call aot_interpreter_single_step and return.
+      // Do the same: one instruction, then stop.
+      m_ppc_state.npc = m_ppc_state.pc + 4;
+      int cycles = interp.SingleStepInner();
+      m_ppc_state.pc = m_ppc_state.npc;
+      m_ppc_state.downcount -= cycles;
+      break;
+    }
+
+    u32 num_instr = it->second;
+    RunInterpreterBlock(interp, pc, num_instr);
+
+    // Decrement downcount by block cycle count (matching what AOT does)
+    m_ppc_state.downcount -= static_cast<s32>(num_instr);
+
+    if (m_ppc_state.Exceptions != 0)
+      break;
+
+    // Check if the new PC is a known block — if so, the AOT would tail-call it.
+    // If unknown, the AOT block would have set s->pc and returned to dispatcher.
+    u32 next_pc = m_ppc_state.pc;
+    if (m_block_sizes.find(next_pc) == m_block_sizes.end())
+      break;  // AOT would return to dispatcher here
+
+    // Check downcount — AOT blocks check `if(s->downcount<=0) { s->pc=X; return; }`
+    if (m_ppc_state.downcount <= 0)
+      break;
+  }
 }
 
 void AOTCore::RunDiff()
@@ -468,41 +511,14 @@ void AOTCore::RunDiff()
     while (m_ppc_state.downcount > 0 && cpu.GetState() == CPU::State::Running &&
            !s_shutdown_requested.load())
     {
-      const u32 block_pc = m_ppc_state.pc;
-
-      // Look up block size from CFG database
-      auto it = m_block_sizes.find(block_pc);
-      if (it == m_block_sizes.end())
-      {
-        // Unknown block — run through AOT/interpreter without comparison
-        blocks_skipped_unknown++;
-        if (self_diff)
-        {
-          interp.SingleStepInner();
-          m_ppc_state.downcount -= 1;
-        }
-        else
-        {
-          auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
-          m_dispatch(aot_state);
-        }
-        if (m_ppc_state.Exceptions != 0)
-        {
-          m_ppc_state.npc = m_ppc_state.pc;
-          power_pc.CheckExceptions();
-        }
-        continue;
-      }
-
-      const u32 num_instr = it->second;
+      const u32 dispatch_pc = m_ppc_state.pc;
 
       // Filter by address range
-      if (block_pc < filter_min || block_pc > filter_max)
+      if (dispatch_pc < filter_min || dispatch_pc > filter_max)
       {
         if (self_diff)
         {
-          RunInterpreterBlock(interp, block_pc, num_instr);
-          m_ppc_state.downcount -= static_cast<s32>(num_instr);
+          RunInterpreterDispatch(interp);
         }
         else
         {
@@ -517,22 +533,21 @@ void AOTCore::RunDiff()
         continue;
       }
 
-      // === COMPARISON BLOCK ===
+      // === COMPARISON AT DISPATCH GRANULARITY ===
+      // The AOT dispatch tail-calls between known blocks, executing a chain
+      // before returning. The interpreter must do the same for fair comparison.
 
       // 1. Snapshot CPU + RAM
       PPCSnapshot pre_snap;
       CaptureSnapshot(pre_snap);
 
-      // Check if this block accesses MMIO — if so, skip comparison
-      // (MMIO reads return hardware state that isn't part of our RAM snapshot)
-      if (BlockAccessesMMIO(pre_snap, block_pc, num_instr))
+      // Check if the starting block accesses MMIO
+      auto it = m_block_sizes.find(dispatch_pc);
+      if (it != m_block_sizes.end() && BlockAccessesMMIO(pre_snap, dispatch_pc, it->second))
       {
         blocks_skipped_mmio++;
         if (self_diff)
-        {
-          RunInterpreterBlock(interp, block_pc, num_instr);
-          m_ppc_state.downcount -= static_cast<s32>(num_instr);
-        }
+          RunInterpreterDispatch(interp);
         else
         {
           auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
@@ -548,11 +563,10 @@ void AOTCore::RunDiff()
 
       std::memcpy(m_ram_shadow, memory.GetRAM(), ram_size);
 
-      // 2. Run path A (AOT or interpreter for self-diff)
+      // 2. Run path A (AOT dispatch or interpreter dispatch for self-diff)
       if (self_diff)
       {
-        RunInterpreterBlock(interp, block_pc, num_instr);
-        m_ppc_state.downcount -= static_cast<s32>(num_instr);
+        RunInterpreterDispatch(interp);
       }
       else
       {
@@ -563,20 +577,16 @@ void AOTCore::RunDiff()
       PPCSnapshot path_a_result;
       CaptureSnapshot(path_a_result);
 
-      // Save RAM after path A (needed to restore if we continue from path A after divergence)
-      u8* ram_after_a = memory.GetRAM();  // pointer — RAM is live
-
       // Optionally save a copy for RAM comparison
       if (compare_ram && m_ram_shadow_aot)
-        std::memcpy(m_ram_shadow_aot, ram_after_a, ram_size);
+        std::memcpy(m_ram_shadow_aot, memory.GetRAM(), ram_size);
 
       // 3. Restore CPU + RAM for path B
       RestoreSnapshot(pre_snap);
       std::memcpy(memory.GetRAM(), m_ram_shadow, ram_size);
 
-      // 4. Run path B (interpreter)
-      RunInterpreterBlock(interp, block_pc, num_instr);
-      m_ppc_state.downcount -= static_cast<s32>(num_instr);
+      // 4. Run path B (interpreter dispatch — follows same chain of blocks)
+      RunInterpreterDispatch(interp);
 
       PPCSnapshot path_b_result;
       CaptureSnapshot(path_b_result);
@@ -598,12 +608,16 @@ void AOTCore::RunDiff()
         continue;
       }
 
-      bool diverged = !CompareSnapshots(path_a_result, path_b_result, block_pc, log);
+      bool diverged = !CompareSnapshots(path_a_result, path_b_result, dispatch_pc, log);
 
       if (diverged)
       {
         divergence_count++;
-        LogDivergence(block_pc, num_instr, pre_snap, path_a_result, path_b_result, log);
+        u32 num_instr_for_log = 0;
+        auto log_it = m_block_sizes.find(dispatch_pc);
+        if (log_it != m_block_sizes.end())
+          num_instr_for_log = log_it->second;
+        LogDivergence(dispatch_pc, num_instr_for_log, pre_snap, path_a_result, path_b_result, log);
 
         // Optional RAM comparison
         if (compare_ram && m_ram_shadow_aot)
@@ -725,6 +739,7 @@ void AOTCore::LogDivergence(u32, u32, const PPCSnapshot&, const PPCSnapshot&, co
                             FILE*) {}
 bool AOTCore::BlockAccessesMMIO(const PPCSnapshot&, u32, u32) { return false; }
 int AOTCore::RunInterpreterBlock(Interpreter&, u32, u32) { return 0; }
+void AOTCore::RunInterpreterDispatch(Interpreter&) {}
 std::unordered_map<u32, u32> AOTCore::s_diff_block_sizes;
 void AOTCore::SetDiffBlockSizes(std::unordered_map<u32, u32>) {}
 

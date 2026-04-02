@@ -70,6 +70,7 @@ private:
                      const PPCSnapshot& aot_result, const PPCSnapshot& interp_result, FILE* log);
   bool BlockAccessesMMIO(const PPCSnapshot& pre, u32 block_addr, u32 num_instructions);
   int RunInterpreterBlock(Interpreter& interp, u32 block_addr, u32 num_instructions);
+  void RunInterpreterDispatch(Interpreter& interp);
 
   Core::System& m_system;
   PowerPC::PowerPCState& m_ppc_state;
