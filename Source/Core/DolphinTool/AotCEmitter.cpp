@@ -433,14 +433,14 @@ bool AOTCEmitter::EmitTable19(std::string& out, UGeckoInstruction inst, u32 pc)
   case 528: EmitBcctrx(out, inst, pc); return true;
   case 16:  EmitBclrx(out, inst, pc); return true;
   case 0:   EmitMcrf(out, inst); return true;
-  case 257: EmitCrLogical(out, inst, "^"); return true;  // crxor
-  case 449: EmitCrLogical(out, inst, "|"); return true;  // cror
-  case 289: EmitCrLogical(out, inst, "~^"); return true; // creqv (XNOR)
-  case 225: EmitCrLogical(out, inst, "&"); return true;  // crand
+  case 33:  EmitCrLogical(out, inst, "~|"); return true; // crnor
   case 129: EmitCrLogical(out, inst, "&~"); return true; // crandc
+  case 225: EmitCrLogical(out, inst, "~&"); return true; // crnand
+  case 257: EmitCrLogical(out, inst, "&"); return true;  // crand
+  case 289: EmitCrLogical(out, inst, "~^"); return true; // creqv (XNOR)
+  case 385: EmitCrLogical(out, inst, "^"); return true;  // crxor
   case 417: EmitCrLogical(out, inst, "|~"); return true; // crorc
-  case 33:  EmitCrLogical(out, inst, "~&"); return true; // crnand
-  case 193: EmitCrLogical(out, inst, "~|"); return true; // crnor
+  case 449: EmitCrLogical(out, inst, "|"); return true;  // cror
   case 150: return true; // isync (no-op)
   case 50:  out += "    aot_rfi(s); return;\n"; return true; // rfi
   default:  return false;

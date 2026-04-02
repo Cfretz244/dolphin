@@ -404,6 +404,20 @@ bool AOTCore::BlockAccessesMMIO(const PPCSnapshot& pre, u32 block_addr, u32 num_
           return true;
       }
     }
+
+    // mftb (opcode 31, subop 371) — timebase reads are non-deterministic
+    if (primary == 31)
+    {
+      u32 subop = (opcode >> 1) & 0x3FF;
+      if (subop == 371)  // mftb
+        return true;
+      if (subop == 339)  // mfspr — check for TL/TU/DEC
+      {
+        u32 spr = ((opcode >> 16) & 0x1F) | ((opcode >> 6) & 0x3E0);
+        if (spr == 268 || spr == 269 || spr == 22)  // TL, TU, DEC
+          return true;
+      }
+    }
   }
   return false;
 }
