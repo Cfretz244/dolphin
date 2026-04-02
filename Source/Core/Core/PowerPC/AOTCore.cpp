@@ -758,12 +758,13 @@ void AOTCore::RunDiff()
         return;
       }
 
-      if (blocks_compared % 1000 == 0)
+      u32 total_visits = blocks_compared + blocks_skipped_unknown + blocks_skipped_mmio;
+      if (total_visits % 10000 == 0)
       {
         fmt::print(stderr,
-                   "AOTDiff: #{} pc={:#010x} div={} skip={} mmio={}\n",
-                   blocks_compared, m_ppc_state.pc, divergence_count,
-                   blocks_skipped_unknown, blocks_skipped_mmio);
+                   "AOTDiff: cmp={} visit={} div={} skip={} mmio={} | pc={:#010x}\n",
+                   blocks_compared, total_visits, divergence_count,
+                   blocks_skipped_unknown, blocks_skipped_mmio, m_ppc_state.pc);
       }
     }
   }
