@@ -689,8 +689,12 @@ void AOTCore::RunDiff()
       CaptureSnapshot(path_b_result);
 
       // 5. Compare
-      // Skip comparison if either path hit an exception
-      if (path_a_result.exceptions != 0 || path_b_result.exceptions != 0)
+      // Skip comparison if either path hit an exception, or if the interpreter
+      // jumped to an exception vector (0x000-0xFFF range — e.g. FPU unavailable
+      // at 0x800 when MSR.FP=0). AOT doesn't check MSR.FP before FP ops.
+      bool interp_hit_exception = (path_b_result.pc < 0x1000 && path_b_result.pc >= 0x100) ||
+                                  (path_a_result.msr != path_b_result.msr);
+      if (path_a_result.exceptions != 0 || path_b_result.exceptions != 0 || interp_hit_exception)
       {
         // Continue from path A result (consistent with hardware state from first run)
         RestoreSnapshot(path_a_result);
