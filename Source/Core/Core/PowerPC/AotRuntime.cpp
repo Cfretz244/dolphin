@@ -206,6 +206,20 @@ void aot_sc(AOTState* s)
   GetSystem().GetPowerPC().CheckExceptions();
 }
 
+// Returns 1 if FPU is available (MSR.FP=1), 0 if not.
+// When FPU is unavailable, triggers EXCEPTION_FPU_UNAVAILABLE and sets PC.
+int aot_check_fpu(AOTState* s, uint32_t pc)
+{
+  auto& ppc_state = GetPPCState(s);
+  if (ppc_state.msr.FP)
+    return 1;
+  ppc_state.pc = pc;
+  ppc_state.npc = pc;
+  ppc_state.Exceptions |= EXCEPTION_FPU_UNAVAILABLE;
+  GetSystem().GetPowerPC().CheckExceptions();
+  return 0;
+}
+
 void aot_rfi(AOTState* s)
 {
   auto& ppc_state = GetPPCState(s);

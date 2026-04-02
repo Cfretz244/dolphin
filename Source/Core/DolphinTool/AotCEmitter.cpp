@@ -108,30 +108,40 @@ bool AOTCEmitter::EmitInstruction(std::string& out, UGeckoInstruction inst, u32 
   // Load/store multiple
   case 46: EmitLmw(out, inst); return true;
   case 47: EmitStmw(out, inst); return true;
-  // Load FP
-  case 48: EmitLfs(out, inst, false, false); return true; // lfs
-  case 49: EmitLfs(out, inst, true, false); return true;  // lfsu
-  case 50: EmitLfd(out, inst, false, false); return true; // lfd
-  case 51: EmitLfd(out, inst, true, false); return true;  // lfdu
-  // Store FP
-  case 52: EmitStfs(out, inst, false, false); return true; // stfs
-  case 53: EmitStfs(out, inst, true, false); return true;  // stfsu
-  case 54: EmitStfd(out, inst, false, false); return true; // stfd
-  case 55: EmitStfd(out, inst, true, false); return true;  // stfdu
+  // FP/PS instructions — check MSR.FP first (FPU unavailable exception if FP=0)
+  case 48: case 49: case 50: case 51:  // lfs, lfsu, lfd, lfdu
+  case 52: case 53: case 54: case 55:  // stfs, stfsu, stfd, stfdu
+  case 56: case 57: case 60: case 61:  // psq_l, psq_lu, psq_st, psq_stu
+  case 59: case 63: case 4:            // FP arith, PS arith
+  {
+    out += fmt::format("    if(!aot_check_fpu(s,{:#010x}u)) {{ s->downcount-={}; return; }}\n",
+                       pc, m_block_cycle_count);
+    switch (I(inst.OPCD))
+    {
+    case 48: EmitLfs(out, inst, false, false); return true;
+    case 49: EmitLfs(out, inst, true, false); return true;
+    case 50: EmitLfd(out, inst, false, false); return true;
+    case 51: EmitLfd(out, inst, true, false); return true;
+    case 52: EmitStfs(out, inst, false, false); return true;
+    case 53: EmitStfs(out, inst, true, false); return true;
+    case 54: EmitStfd(out, inst, false, false); return true;
+    case 55: EmitStfd(out, inst, true, false); return true;
+    case 56: out += fmt::format("    aot_psq_l(s,{},{},{});\n", I(inst.RD), I(inst.RA), inst.hex); return true;
+    case 57: out += fmt::format("    aot_psq_lu(s,{},{},{});\n", I(inst.RD), I(inst.RA), inst.hex); return true;
+    case 60: out += fmt::format("    aot_psq_st(s,{},{},{});\n", I(inst.RS), I(inst.RA), inst.hex); return true;
+    case 61: out += fmt::format("    aot_psq_stu(s,{},{},{});\n", I(inst.RS), I(inst.RA), inst.hex); return true;
+    case 59: return EmitTable59(out, inst, pc);
+    case 63: return EmitTable63(out, inst, pc);
+    case 4:  return EmitTable4(out, inst, pc);
+    default: return false;
+    }
+  }
   // Sync/isync (no-ops)
   case 17: out += "    aot_sc(s); return;\n"; return true; // sc
   case 46 + 128: return true; // placeholder
 
   case 31: return EmitTable31(out, inst, pc);
   case 19: return EmitTable19(out, inst, pc);
-  case 59: return EmitTable59(out, inst, pc);
-  case 63: return EmitTable63(out, inst, pc);
-  // Paired single loads/stores (OPCD 4 subtable, but psq_l/psq_st use OPCD 56-61)
-  case 56: out += fmt::format("    aot_psq_l(s,{},{},{});\n", I(inst.RD), I(inst.RA), inst.hex); return true;
-  case 57: out += fmt::format("    aot_psq_lu(s,{},{},{});\n", I(inst.RD), I(inst.RA), inst.hex); return true;
-  case 60: out += fmt::format("    aot_psq_st(s,{},{},{});\n", I(inst.RS), I(inst.RA), inst.hex); return true;
-  case 61: out += fmt::format("    aot_psq_stu(s,{},{},{});\n", I(inst.RS), I(inst.RA), inst.hex); return true;
-  case 4:  return EmitTable4(out, inst, pc);  // Paired singles
   default: return false;
   }
 }

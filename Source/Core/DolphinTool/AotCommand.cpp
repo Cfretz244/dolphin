@@ -85,6 +85,7 @@ extern void aot_write_u32(AOTState* s, uint32_t val, uint32_t addr);
 extern void aot_write_u64(AOTState* s, uint64_t val, uint32_t addr);
 extern void aot_interpreter_single_step(AOTState* s);
 extern void aot_sc(AOTState* s);
+extern int aot_check_fpu(AOTState* s, uint32_t pc);
 extern void aot_rfi(AOTState* s);
 
 // FP conversion helpers
