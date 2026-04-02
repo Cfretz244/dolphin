@@ -13,6 +13,7 @@
 #include "Core/HW/Memmap.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
+#include "Core/PowerPC/Interpreter/Interpreter_FPUtils.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
@@ -437,13 +438,8 @@ uint64_t aot_convert_to_double(uint32_t single_bits)
 uint32_t aot_convert_to_single(uint64_t double_bits)
 {
   // Double → single truncation (used by stfs)
-  float f;
-  double d;
-  std::memcpy(&d, &double_bits, sizeof(d));
-  f = static_cast<float>(d);
-  uint32_t result;
-  std::memcpy(&result, &f, sizeof(result));
-  return result;
+  // Must use Gekko-accurate bit manipulation, NOT IEEE rounding.
+  return ConvertToSingle(double_bits);
 }
 
 // ============================================================================

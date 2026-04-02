@@ -441,7 +441,8 @@ bool AOTCore::BlockAccessesMMIO(const PPCSnapshot& pre, u32 block_addr, u32 num_
   return false;
 }
 
-int AOTCore::RunInterpreterBlock(Interpreter& interp, u32 block_addr, u32 num_instructions)
+int AOTCore::RunInterpreterBlock(Interpreter& interp, u32 block_addr, u32 num_instructions,
+                                 bool ignore_exceptions)
 {
   int total_cycles = 0;
   const u32 block_end = block_addr + num_instructions * 4;
@@ -455,7 +456,7 @@ int AOTCore::RunInterpreterBlock(Interpreter& interp, u32 block_addr, u32 num_in
 
     if (m_ppc_state.pc < block_addr || m_ppc_state.pc >= block_end)
       break;
-    if (m_ppc_state.Exceptions != 0)
+    if (!ignore_exceptions && m_ppc_state.Exceptions != 0)
       break;
   }
   return total_cycles;
@@ -697,9 +698,11 @@ void AOTCore::RunDiff()
         }
 
         // Run interpreter with MMIO capture
+        // ignore_exceptions=true: AOT executes the full block atomically without
+        // mid-block exception checks, so the interpreter must do the same for comparison.
         MMIOCaptureReset();
         g_mmio_capture_active = true;
-        RunInterpreterBlock(interp, block_pc, num_instr);
+        RunInterpreterBlock(interp, block_pc, num_instr, /*ignore_exceptions=*/true);
         m_ppc_state.downcount -= static_cast<s32>(num_instr);
         g_mmio_capture_active = false;
         auto interp_mmio = g_mmio_capture_log;
@@ -939,7 +942,7 @@ bool AOTCore::CompareSnapshots(const PPCSnapshot&, const PPCSnapshot&, u32, FILE
 void AOTCore::LogDivergence(u32, u32, const PPCSnapshot&, const PPCSnapshot&, const PPCSnapshot&,
                             FILE*) {}
 bool AOTCore::BlockAccessesMMIO(const PPCSnapshot&, u32, u32) { return false; }
-int AOTCore::RunInterpreterBlock(Interpreter&, u32, u32) { return 0; }
+int AOTCore::RunInterpreterBlock(Interpreter&, u32, u32, bool) { return 0; }
 void AOTCore::RunInterpreterDispatch(Interpreter&) {}
 std::unordered_map<u32, u32> AOTCore::s_diff_block_sizes;
 std::atomic<bool> AOTCore::s_shutdown_requested{false};
