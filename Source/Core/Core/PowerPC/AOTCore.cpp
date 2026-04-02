@@ -430,7 +430,9 @@ int AOTCore::RunInterpreterBlock(Interpreter& interp, u32 block_addr, u32 num_in
 {
   int total_cycles = 0;
   const u32 block_end = block_addr + num_instructions * 4;
-  const u32 max_steps = num_instructions * 4096;
+  // Limit to one pass through the block — don't follow self-loops.
+  // Self-looping blocks (polling loops) must be handled by the caller.
+  const u32 max_steps = num_instructions;
 
   for (u32 i = 0; i < max_steps; i++)
   {
