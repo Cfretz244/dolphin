@@ -570,15 +570,12 @@ void AOTCore::RunDiff()
       auto& pass_count = m_block_pass_count[block_pc];
       if (pass_count >= VALIDATION_THRESHOLD && aot_block_fn)
       {
-        // Use AOT single-block for validated blocks — the interpreter's
-        // SingleStepInner can deadlock on certain memory reads.
-        s32 saved_dc = m_ppc_state.downcount;
-        m_ppc_state.downcount = static_cast<s32>(num_instr);
-        aot_single_block_mode = 1;
+        // Use full AOT dispatch for validated blocks — lets the AOT handle
+        // polling loops naturally (burning downcount in tight loops until
+        // Advance() fires hardware events). Single-block mode would force
+        // one iteration per Advance(), never making progress.
         auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
-        aot_block_fn(aot_state);
-        aot_single_block_mode = 0;
-        m_ppc_state.downcount = saved_dc - static_cast<s32>(num_instr);
+        m_dispatch(aot_state);
         if (m_ppc_state.Exceptions != 0)
         {
           m_ppc_state.npc = m_ppc_state.pc;
