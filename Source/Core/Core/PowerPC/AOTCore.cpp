@@ -20,8 +20,11 @@
 #include "Core/HW/CPU.h"
 #include "Core/HW/HW.h"
 #include "Core/HW/Memmap.h"
+#include "Core/HW/GPFifo.h"
+#include "Core/HW/ProcessorInterface.h"
 #include "Core/HW/VideoInterface.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
+#include "VideoCommon/CommandProcessor.h"
 #include "Core/PowerPC/MMIOCapture.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
@@ -540,6 +543,9 @@ void AOTCore::RunDiff()
   u32 blocks_skipped_unknown = 0;
   u32 blocks_skipped_mmio = 0;
   u32 divergence_count = 0;
+  u32 total_block_visits = 0;
+  u32 last_status_visits = 0;
+  constexpr u32 STATUS_INTERVAL = 5000;  // Print status every N block visits
 
   fmt::print(log, "AOT Diff Harness — {} mode\n", self_diff ? "self-diff" : "AOT-vs-interpreter");
   fmt::print(log, "Block boundaries loaded: {}\n", m_block_sizes.size());
@@ -554,6 +560,27 @@ void AOTCore::RunDiff()
     while (m_ppc_state.downcount > 0 && cpu.GetState() == CPU::State::Running &&
            !s_shutdown_requested.load())
     {
+      total_block_visits++;
+
+      // Periodic status with video activity indicators
+      if (total_block_visits - last_status_visits >= STATUS_INTERVAL)
+      {
+        last_status_visits = total_block_visits;
+        u32 xfb_top = m_system.GetVideoInterface().GetXFBAddressTop();
+        u32 xfb_bot = m_system.GetVideoInterface().GetXFBAddressBottom();
+        auto& cp_fifo = m_system.GetCommandProcessor().GetFifo();
+        u32 fifo_dist = cp_fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
+        u32 fifo_wptr = m_system.GetProcessorInterface().m_fifo_cpu_write_pointer;
+        u32 fifo_base = m_system.GetProcessorInterface().m_fifo_cpu_base;
+        fmt::print(stderr,
+          "[{:>8}] cmp={} mmio={} unk={} skip={} div={} | "
+          "XFB={:#010x}/{:#010x} FIFO base={:#010x} wptr={:#010x} dist={} PC={:#010x}\n",
+          total_block_visits, blocks_compared, blocks_skipped_mmio,
+          blocks_skipped_unknown, total_block_visits - blocks_compared - blocks_skipped_mmio - blocks_skipped_unknown,
+          divergence_count,
+          xfb_top, xfb_bot, fifo_base, fifo_wptr, fifo_dist, m_ppc_state.pc);
+      }
+
       const u32 block_pc = m_ppc_state.pc;
 
       // Look up block in CFG database
@@ -650,6 +677,20 @@ void AOTCore::RunDiff()
           {
             m_ppc_state.npc = m_ppc_state.pc;
             power_pc.CheckExceptions();
+          }
+
+          // Stuck loop escape: if the same block has been spinning for too long,
+          // the MMIO DoState save/restores likely corrupted the CoreTiming event
+          // queue so VI/SI events no longer fire. Force a VI interrupt to unstick
+          // the game — the polling loop is typically waiting for an interrupt-driven
+          // callback to set a flag in RAM.
+          if (compare_repeat_count == 10000)
+          {
+            fmt::print(stderr,
+              "STUCK at {:#010x} after {} repeats — forcing VI interrupt\n",
+              block_pc, compare_repeat_count);
+            m_system.GetProcessorInterface().SetInterrupt(
+              ProcessorInterface::INT_CAUSE_VI);
           }
           continue;
         }
@@ -780,12 +821,16 @@ void AOTCore::RunDiff()
           RestoreSnapshot(aot_result);
         }
 
-        fmt::print(stderr, "AOTDiff: block {:#010x} ({} instr, MMIO) — {}{}{}{}\n",
-                   block_pc, num_instr,
-                   timing_skip ? "timing-skip" : (diverged ? "DIVERGED" : "ok"),
-                   !reg_match && !timing_skip ? " [regs]" : "",
-                   !mmio_match ? fmt::format(" [mmio: {} vs {}]", aot_mmio.size(), interp_mmio.size()) : "",
-                   timing_skip ? " [MMIO read timing]" : "");
+        // Only print MMIO blocks on divergence or timing-skip (not every "ok")
+        if (diverged || timing_skip)
+        {
+          fmt::print(stderr, "AOTDiff: block {:#010x} ({} instr, MMIO) — {}{}{}{}\n",
+                     block_pc, num_instr,
+                     timing_skip ? "timing-skip" : "DIVERGED",
+                     !reg_match && !timing_skip ? " [regs]" : "",
+                     !mmio_match ? fmt::format(" [mmio: {} vs {}]", aot_mmio.size(), interp_mmio.size()) : "",
+                     timing_skip ? " [MMIO read timing]" : "");
+        }
 
         if (diverged)
         {
@@ -893,9 +938,10 @@ void AOTCore::RunDiff()
 
       bool diverged = reg_diverged || ram_diverged;
 
-      // Print every block result
-      fmt::print(stderr, "AOTDiff: block {:#010x} ({} instr) — {}\n",
-                 block_pc, num_instr, diverged ? "DIVERGED" : "ok");
+      // Only print on divergence (periodic status handles progress)
+      if (diverged)
+        fmt::print(stderr, "AOTDiff: block {:#010x} ({} instr) — DIVERGED\n",
+                   block_pc, num_instr);
 
       if (diverged)
       {

@@ -158,6 +158,7 @@ public:
 
   // Directly accessed by the JIT.
   Globals& GetGlobals() { return m_globals; }
+  size_t GetEventQueueSize() const { return m_event_queue.size(); }
 
   // Throttle the CPU to the specified target cycle.
   void Throttle(const s64 target_cycle);
