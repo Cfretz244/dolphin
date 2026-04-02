@@ -460,9 +460,26 @@ void AOTCore::RunDiff()
     m_ppc_state.npc = m_ppc_state.pc;
     core_timing.Advance();
 
+    // Idle loop detection: same as normal Run() — if we see the same PC
+    // twice in a short window, skip the rest of the timeslice.
+    u32 pc_history[8] = {};
+    u32 pc_idx = 0;
+
     while (m_ppc_state.downcount > 0 && cpu.GetState() == CPU::State::Running)
     {
       const u32 block_pc = m_ppc_state.pc;
+
+      // Idle loop detection
+      for (u32 i = 0; i < 8; i++)
+      {
+        if (pc_history[i] == block_pc && block_pc != 0)
+        {
+          m_ppc_state.downcount = 0;
+          goto next_diff_slice;
+        }
+      }
+      pc_history[pc_idx & 7] = block_pc;
+      pc_idx++;
 
       // Look up block size from CFG database
       auto it = m_block_sizes.find(block_pc);
@@ -687,6 +704,7 @@ void AOTCore::RunDiff()
                    blocks_compared, divergence_count, blocks_skipped_unknown, blocks_skipped_mmio);
       }
     }
+    next_diff_slice:;
   }
 
   fmt::print(log, "\nEmulation stopped.\n");
