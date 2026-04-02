@@ -361,6 +361,44 @@ void AOTCore::LogDivergence(u32 block_pc, u32 num_instr, const PPCSnapshot& pre,
   std::fflush(log);
 }
 
+// Check if a block likely accesses MMIO (hardware registers at 0xCC000000-0xCD000000).
+// This is a heuristic: we check if any GPR in the pre-state points to the HW range,
+// or if the block contains `lis rN, 0xCC00` which sets up an MMIO base address.
+bool AOTCore::BlockAccessesMMIO(const PPCSnapshot& pre, u32 block_addr, u32 num_instructions)
+{
+  // Check pre-state GPRs for MMIO base addresses
+  for (int i = 0; i < 32; i++)
+  {
+    u32 v = pre.gpr[i];
+    if (v >= 0xCC000000 && v < 0xCD000000)
+      return true;
+  }
+
+  // Scan instructions for `lis rN, 0xCC00` (addis rD, r0, 0xCC00) or similar
+  // Also check for loads/stores with base in CC range
+  auto& mmu = m_system.GetMMU();
+  for (u32 i = 0; i < num_instructions; i++)
+  {
+    u32 opcode = mmu.Read_Opcode(block_addr + i * 4);
+    u32 primary = (opcode >> 26) & 0x3F;
+
+    // addis (lis is addis with rA=0): opcode 15
+    if (primary == 15)
+    {
+      u32 ra = (opcode >> 16) & 0x1F;
+      s16 imm = static_cast<s16>(opcode & 0xFFFF);
+      if (ra == 0)
+      {
+        // lis rD, imm — check if upper 16 bits point to HW range
+        u32 val = static_cast<u32>(imm) << 16;
+        if (val >= 0xCC000000 && val < 0xCD000000)
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
 int AOTCore::RunInterpreterBlock(Interpreter& interp, u32 block_addr, u32 num_instructions)
 {
   int total_cycles = 0;
@@ -478,6 +516,30 @@ void AOTCore::RunDiff()
       // 1. Snapshot CPU + RAM
       PPCSnapshot pre_snap;
       CaptureSnapshot(pre_snap);
+
+      // Check if this block accesses MMIO — if so, skip comparison
+      // (MMIO reads return hardware state that isn't part of our RAM snapshot)
+      if (BlockAccessesMMIO(pre_snap, block_pc, num_instr))
+      {
+        blocks_skipped_mmio++;
+        if (self_diff)
+        {
+          RunInterpreterBlock(interp, block_pc, num_instr);
+          m_ppc_state.downcount -= static_cast<s32>(num_instr);
+        }
+        else
+        {
+          auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
+          m_dispatch(aot_state);
+        }
+        if (m_ppc_state.Exceptions != 0)
+        {
+          m_ppc_state.npc = m_ppc_state.pc;
+          power_pc.CheckExceptions();
+        }
+        continue;
+      }
+
       std::memcpy(m_ram_shadow, memory.GetRAM(), ram_size);
 
       // 2. Run path A (AOT or interpreter for self-diff)
@@ -495,11 +557,14 @@ void AOTCore::RunDiff()
       PPCSnapshot path_a_result;
       CaptureSnapshot(path_a_result);
 
-      // Optionally save RAM state after path A for comparison
-      if (compare_ram && m_ram_shadow_aot)
-        std::memcpy(m_ram_shadow_aot, memory.GetRAM(), ram_size);
+      // Save RAM after path A (needed to restore if we continue from path A after divergence)
+      u8* ram_after_a = memory.GetRAM();  // pointer — RAM is live
 
-      // 3. Restore CPU + RAM
+      // Optionally save a copy for RAM comparison
+      if (compare_ram && m_ram_shadow_aot)
+        std::memcpy(m_ram_shadow_aot, ram_after_a, ram_size);
+
+      // 3. Restore CPU + RAM for path B
       RestoreSnapshot(pre_snap);
       std::memcpy(memory.GetRAM(), m_ram_shadow, ram_size);
 
@@ -511,10 +576,13 @@ void AOTCore::RunDiff()
       CaptureSnapshot(path_b_result);
 
       // 5. Compare
-      // Skip comparison if either path hit an exception (DSI during memory access, etc.)
+      // Skip comparison if either path hit an exception
       if (path_a_result.exceptions != 0 || path_b_result.exceptions != 0)
       {
-        // Continue from path B result (interpreter is authoritative)
+        // Continue from path A result (consistent with hardware state from first run)
+        RestoreSnapshot(path_a_result);
+        if (compare_ram && m_ram_shadow_aot)
+          std::memcpy(memory.GetRAM(), m_ram_shadow_aot, ram_size);
         if (m_ppc_state.Exceptions != 0)
         {
           m_ppc_state.npc = m_ppc_state.pc;
@@ -524,7 +592,9 @@ void AOTCore::RunDiff()
         continue;
       }
 
-      if (!CompareSnapshots(path_a_result, path_b_result, block_pc, log))
+      bool diverged = !CompareSnapshots(path_a_result, path_b_result, block_pc, log);
+
+      if (diverged)
       {
         divergence_count++;
         LogDivergence(block_pc, num_instr, pre_snap, path_a_result, path_b_result, log);
@@ -552,11 +622,22 @@ void AOTCore::RunDiff()
             fmt::print(log, "  Total RAM differences: {} words\n", ram_diffs);
         }
 
+        // After divergence, ALWAYS restore path A state + RAM.
+        // Path A ran first and is consistent with hardware state.
+        // Path B ran on restored RAM but with stale hardware state, so its
+        // results may be inconsistent (causing hangs if we continue from B).
+        RestoreSnapshot(path_a_result);
+        if (compare_ram && m_ram_shadow_aot)
+          std::memcpy(memory.GetRAM(), m_ram_shadow_aot, ram_size);
+
         if (divergence_count >= max_divergences)
         {
           fmt::print(log, "\nMax divergences ({}) reached. Stopping.\n", max_divergences);
-          fmt::print(log, "Blocks compared: {} | Skipped (unknown): {} | Divergences: {}\n",
-                     blocks_compared, blocks_skipped_unknown, divergence_count);
+          fmt::print(log,
+                     "Blocks compared: {} | Skipped (unknown): {} | Skipped (MMIO): {} | "
+                     "Divergences: {}\n",
+                     blocks_compared, blocks_skipped_unknown, blocks_skipped_mmio,
+                     divergence_count);
           std::fflush(log);
           if (log != stdout)
             std::fclose(log);
@@ -566,8 +647,17 @@ void AOTCore::RunDiff()
         }
       }
 
-      // Continue from interpreter result (path B is authoritative)
-      // State is already set from path B
+      // In non-divergent case for AOT-vs-interp mode: continue from path B (interpreter = oracle)
+      // In self-diff mode or after divergence: continue from path A (consistent with HW)
+      if (!diverged && !self_diff)
+      {
+        // path B result is already in m_ppc_state — continue from interpreter
+      }
+      else if (!diverged)
+      {
+        // Self-diff, no divergence — path A and B are equivalent, already on path B, that's fine
+      }
+      // diverged case already restored path A above
       if (m_ppc_state.Exceptions != 0)
       {
         m_ppc_state.npc = m_ppc_state.pc;
@@ -578,8 +668,10 @@ void AOTCore::RunDiff()
       if (max_blocks > 0 && blocks_compared >= max_blocks)
       {
         fmt::print(log, "\nMax blocks ({}) reached. Stopping.\n", max_blocks);
-        fmt::print(log, "Blocks compared: {} | Skipped (unknown): {} | Divergences: {}\n",
-                   blocks_compared, blocks_skipped_unknown, divergence_count);
+        fmt::print(log,
+                   "Blocks compared: {} | Skipped (unknown): {} | Skipped (MMIO): {} | "
+                   "Divergences: {}\n",
+                   blocks_compared, blocks_skipped_unknown, blocks_skipped_mmio, divergence_count);
         std::fflush(log);
         if (log != stdout)
           std::fclose(log);
@@ -590,15 +682,17 @@ void AOTCore::RunDiff()
       // Progress reporting
       if (blocks_compared % 10000 == 0)
       {
-        fmt::print(stderr, "AOTDiff: {} blocks compared, {} divergences, {} skipped\n",
-                   blocks_compared, divergence_count, blocks_skipped_unknown);
+        fmt::print(stderr,
+                   "AOTDiff: {} blocks compared, {} divergences, {} skipped, {} MMIO skipped\n",
+                   blocks_compared, divergence_count, blocks_skipped_unknown, blocks_skipped_mmio);
       }
     }
   }
 
   fmt::print(log, "\nEmulation stopped.\n");
-  fmt::print(log, "Blocks compared: {} | Skipped (unknown): {} | Divergences: {}\n",
-             blocks_compared, blocks_skipped_unknown, divergence_count);
+  fmt::print(log,
+             "Blocks compared: {} | Skipped (unknown): {} | Skipped (MMIO): {} | Divergences: {}\n",
+             blocks_compared, blocks_skipped_unknown, blocks_skipped_mmio, divergence_count);
   std::fflush(log);
   if (log != stdout)
     std::fclose(log);
@@ -622,6 +716,9 @@ void AOTCore::RestoreSnapshot(const PPCSnapshot&) {}
 bool AOTCore::CompareSnapshots(const PPCSnapshot&, const PPCSnapshot&, u32, FILE*) { return true; }
 void AOTCore::LogDivergence(u32, u32, const PPCSnapshot&, const PPCSnapshot&, const PPCSnapshot&,
                             FILE*) {}
+bool AOTCore::BlockAccessesMMIO(const PPCSnapshot&, u32, u32) { return false; }
 int AOTCore::RunInterpreterBlock(Interpreter&, u32, u32) { return 0; }
+std::unordered_map<u32, u32> AOTCore::s_diff_block_sizes;
+void AOTCore::SetDiffBlockSizes(std::unordered_map<u32, u32>) {}
 
 #endif  // DOLPHIN_HAS_AOT

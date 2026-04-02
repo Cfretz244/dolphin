@@ -65,6 +65,7 @@ private:
   bool CompareSnapshots(const PPCSnapshot& a, const PPCSnapshot& b, u32 block_pc, FILE* log);
   void LogDivergence(u32 block_pc, u32 num_instr, const PPCSnapshot& pre,
                      const PPCSnapshot& aot_result, const PPCSnapshot& interp_result, FILE* log);
+  bool BlockAccessesMMIO(const PPCSnapshot& pre, u32 block_addr, u32 num_instructions);
   int RunInterpreterBlock(Interpreter& interp, u32 block_addr, u32 num_instructions);
 
   Core::System& m_system;
