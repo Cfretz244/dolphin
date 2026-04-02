@@ -80,6 +80,9 @@ extern "C" void GALE01_dispatch(AOTState* s);
 typedef void (*AOTBlockFunc)(AOTState*);
 extern "C" AOTBlockFunc GALE01_lookup_block(uint32_t pc);
 
+// Single-block mode: when set, dispatch returns immediately without chaining.
+extern "C" int aot_single_block_mode;
+
 // Static storage for diff block sizes (set by DiffCommand before boot)
 std::unordered_map<u32, u32> AOTCore::s_diff_block_sizes;
 std::atomic<bool> AOTCore::s_shutdown_requested{false};
@@ -599,16 +602,17 @@ void AOTCore::RunDiff()
       }
       else
       {
-        // Force single-block execution: AOT blocks check
-        // `if(s->downcount<=0){ s->pc=TARGET; return; }` before tail-calling.
-        // Setting downcount to num_instr makes the block execute once then bail
-        // instead of chaining to the next block.
+        // Force single-block execution:
+        // 1. Set aot_single_block_mode so dispatch() returns immediately
+        //    (prevents indirect branches like blr/bctr from chaining)
+        // 2. Set downcount = num_instr so direct tail-calls bail out
+        //    (AOT blocks check downcount<=0 before tail-calling)
         s32 saved_downcount = m_ppc_state.downcount;
         m_ppc_state.downcount = static_cast<s32>(num_instr);
+        aot_single_block_mode = 1;
         auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
         aot_block_fn(aot_state);
-        // The block consumed its cycles from our artificial downcount.
-        // Apply the same decrement to the real downcount.
+        aot_single_block_mode = 0;
         m_ppc_state.downcount = saved_downcount - static_cast<s32>(num_instr);
       }
 

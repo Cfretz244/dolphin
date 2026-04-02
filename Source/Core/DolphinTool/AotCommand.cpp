@@ -466,8 +466,14 @@ int AotCommand(const std::vector<std::string>& args)
     }
     file << "};\n\n";
 
+    // Single-block mode flag for diff harness: when set, dispatch returns
+    // immediately without calling any block. This prevents indirect branches
+    // (blr/bctr) from chaining to the next block.
+    file << "int aot_single_block_mode = 0;\n\n";
+
     // Emit the fast dispatch function — O(1) array lookup
     file << fmt::format("void {}_dispatch(AOTState* s) {{\n", prefix);
+    file << "    if (aot_single_block_mode) return;\n";
     file << "    uint32_t pc = s->pc;\n";
     file << fmt::format("    uint32_t idx = (pc - {}_TABLE_BASE) >> 2;\n", prefix);
     file << fmt::format("    if (idx < {}_TABLE_SIZE) {{\n", prefix);

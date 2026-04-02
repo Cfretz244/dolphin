@@ -416,7 +416,7 @@ bool AOTCEmitter::EmitTable31(std::string& out, UGeckoInstruction inst, u32 pc)
   case 200: EmitAddzex(out, inst); return true;  // subfzex (reuses addzex logic pattern)
   // MSR
   case 83:  EmitMfmsr(out, inst); return true;
-  case 146: EmitMtmsr(out, inst); return true;
+  case 146: EmitMtmsr(out, inst, pc); return true;
   // Timebase
   case 371: out += fmt::format("    s->gpr[{}]=aot_mftb(s,{});\n", I(inst.RD), I(inst.SPR)); return true;
   // stfiwx
@@ -990,9 +990,13 @@ void AOTCEmitter::EmitMfmsr(std::string& out, UGeckoInstruction inst)
   out += fmt::format("    s->gpr[{}]=s->msr;\n", I(inst.RD));
 }
 
-void AOTCEmitter::EmitMtmsr(std::string& out, UGeckoInstruction inst)
+void AOTCEmitter::EmitMtmsr(std::string& out, UGeckoInstruction inst, u32 pc)
 {
-  out += fmt::format("    aot_mtmsr(s,s->gpr[{}]); return;\n", I(inst.RS));
+  // mtmsr ends the block (may enable exceptions). Set PC to fallthrough
+  // before calling aot_mtmsr which may change PC via CheckExceptions.
+  out += fmt::format("    s->downcount-={}; s->pc={:#010x}u; s->npc=s->pc; "
+                     "aot_mtmsr(s,s->gpr[{}]); return;\n",
+                     m_block_cycle_count, pc + 4, I(inst.RS));
 }
 
 void AOTCEmitter::EmitCrLogical(std::string& out, UGeckoInstruction inst, const char* op)
