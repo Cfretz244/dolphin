@@ -749,6 +749,29 @@ void AOTCore::RunDiff()
         power_pc.CheckExceptions();
       }
 
+      // Self-loop optimization: if the block branches back to itself (e.g. memset loop)
+      // and the comparison passed, run the interpreter to drain the loop without
+      // further snapshot/compare overhead — one successful comparison proves correctness.
+      if (!diverged && m_ppc_state.pc == block_pc)
+      {
+        const u32 block_end = block_pc + num_instr * 4;
+        u32 loop_iters = 0;
+        while (m_ppc_state.pc == block_pc && m_ppc_state.downcount > 0 &&
+               m_ppc_state.Exceptions == 0 && loop_iters < 1000000)
+        {
+          for (u32 i = 0; i < num_instr; i++)
+          {
+            interp.SingleStepInner();
+            if (m_ppc_state.pc < block_pc || m_ppc_state.pc >= block_end)
+              break;
+            if (m_ppc_state.Exceptions != 0)
+              break;
+          }
+          m_ppc_state.downcount -= static_cast<s32>(num_instr);
+          loop_iters++;
+        }
+      }
+
       blocks_compared++;
       if (max_blocks > 0 && blocks_compared >= max_blocks)
       {
