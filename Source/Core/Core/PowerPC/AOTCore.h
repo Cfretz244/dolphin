@@ -81,6 +81,9 @@ private:
   // Block boundary map: ppc_addr -> num_instructions (loaded from CFG DB for diff mode)
   std::unordered_map<u32, u32> m_block_sizes;
 
+  // Track how many times each block has passed comparison (for skipping validated blocks)
+  std::unordered_map<u32, u32> m_block_pass_count;
+
   // RAM shadow buffer for diff mode (24 MB)
   u8* m_ram_shadow = nullptr;
   u8* m_ram_shadow_aot = nullptr;  // For optional RAM comparison

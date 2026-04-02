@@ -554,6 +554,23 @@ void AOTCore::RunDiff()
 
       const u32 num_instr = it->second;
 
+      // Skip blocks that have already been validated enough times.
+      // After a block passes comparison N times with different inputs,
+      // we trust its codegen and just run the interpreter (no snapshot overhead).
+      constexpr u32 VALIDATION_THRESHOLD = 100;
+      auto& pass_count = m_block_pass_count[block_pc];
+      if (pass_count >= VALIDATION_THRESHOLD)
+      {
+        RunInterpreterBlock(interp, block_pc, num_instr);
+        m_ppc_state.downcount -= static_cast<s32>(num_instr);
+        if (m_ppc_state.Exceptions != 0)
+        {
+          m_ppc_state.npc = m_ppc_state.pc;
+          power_pc.CheckExceptions();
+        }
+        continue;
+      }
+
       // Filter by address range
       if (block_pc < filter_min || block_pc > filter_max)
       {
@@ -748,6 +765,10 @@ void AOTCore::RunDiff()
         m_ppc_state.npc = m_ppc_state.pc;
         power_pc.CheckExceptions();
       }
+
+      // Track successful comparisons for the validation-skip optimization
+      if (!diverged)
+        pass_count++;
 
       // Self-loop optimization: if the block branches back to itself (e.g. memset loop)
       // and the comparison passed, run the interpreter to drain the loop without
