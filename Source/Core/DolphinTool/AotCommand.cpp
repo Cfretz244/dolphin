@@ -475,6 +475,15 @@ int AotCommand(const std::vector<std::string>& args)
     file << "        if (fn) { fn(s); return; }\n";
     file << "    }\n";
     file << "    aot_interpreter_single_step(s);\n";
+    file << "}\n\n";
+
+    // Emit a block lookup function for the diff harness — returns a single
+    // block's function pointer without executing it or tail-calling.
+    file << fmt::format("AOTBlockFunc {}_lookup_block(uint32_t pc) {{\n", prefix);
+    file << fmt::format("    uint32_t idx = (pc - {}_TABLE_BASE) >> 2;\n", prefix);
+    file << fmt::format("    if (idx < {}_TABLE_SIZE) return {}_fast_table[idx];\n", prefix,
+                        prefix);
+    file << "    return 0;\n";
     file << "}\n";
   }
 

@@ -76,6 +76,10 @@ static_assert(offsetof(PowerPC::PowerPCState, spr) == offsetof(AOTState, spr),
 // This symbol is resolved at link time.
 extern "C" void GALE01_dispatch(AOTState* s);
 
+// Block lookup — returns a single block's function pointer without executing.
+typedef void (*AOTBlockFunc)(AOTState*);
+extern "C" AOTBlockFunc GALE01_lookup_block(uint32_t pc);
+
 // Static storage for diff block sizes (set by DiffCommand before boot)
 std::unordered_map<u32, u32> AOTCore::s_diff_block_sizes;
 std::atomic<bool> AOTCore::s_shutdown_requested{false};
@@ -511,20 +515,18 @@ void AOTCore::RunDiff()
     while (m_ppc_state.downcount > 0 && cpu.GetState() == CPU::State::Running &&
            !s_shutdown_requested.load())
     {
-      const u32 dispatch_pc = m_ppc_state.pc;
+      const u32 block_pc = m_ppc_state.pc;
 
-      // Filter by address range
-      if (dispatch_pc < filter_min || dispatch_pc > filter_max)
+      // Look up block in CFG database
+      auto it = m_block_sizes.find(block_pc);
+      if (it == m_block_sizes.end())
       {
-        if (self_diff)
-        {
-          RunInterpreterDispatch(interp);
-        }
-        else
-        {
-          auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
-          m_dispatch(aot_state);
-        }
+        // Unknown block — run interpreter single step (same as AOT fallback)
+        m_ppc_state.npc = m_ppc_state.pc + 4;
+        int cycles = interp.SingleStepInner();
+        m_ppc_state.pc = m_ppc_state.npc;
+        m_ppc_state.downcount -= cycles;
+        blocks_skipped_unknown++;
         if (m_ppc_state.Exceptions != 0)
         {
           m_ppc_state.npc = m_ppc_state.pc;
@@ -533,26 +535,49 @@ void AOTCore::RunDiff()
         continue;
       }
 
-      // === COMPARISON AT DISPATCH GRANULARITY ===
-      // The AOT dispatch tail-calls between known blocks, executing a chain
-      // before returning. The interpreter must do the same for fair comparison.
+      const u32 num_instr = it->second;
+
+      // Filter by address range
+      if (block_pc < filter_min || block_pc > filter_max)
+      {
+        RunInterpreterBlock(interp, block_pc, num_instr);
+        m_ppc_state.downcount -= static_cast<s32>(num_instr);
+        if (m_ppc_state.Exceptions != 0)
+        {
+          m_ppc_state.npc = m_ppc_state.pc;
+          power_pc.CheckExceptions();
+        }
+        continue;
+      }
+
+      // Look up AOT block function (may be NULL if not in dispatch table)
+      AOTBlockFunc aot_block_fn = self_diff ? nullptr : GALE01_lookup_block(block_pc);
+      if (!aot_block_fn && !self_diff)
+      {
+        // Block is in CFG but not in AOT table — run interpreter only
+        RunInterpreterBlock(interp, block_pc, num_instr);
+        m_ppc_state.downcount -= static_cast<s32>(num_instr);
+        blocks_skipped_unknown++;
+        if (m_ppc_state.Exceptions != 0)
+        {
+          m_ppc_state.npc = m_ppc_state.pc;
+          power_pc.CheckExceptions();
+        }
+        continue;
+      }
+
+      // === SINGLE-BLOCK COMPARISON ===
 
       // 1. Snapshot CPU + RAM
       PPCSnapshot pre_snap;
       CaptureSnapshot(pre_snap);
 
-      // Check if the starting block accesses MMIO
-      auto it = m_block_sizes.find(dispatch_pc);
-      if (it != m_block_sizes.end() && BlockAccessesMMIO(pre_snap, dispatch_pc, it->second))
+      // Check MMIO access
+      if (BlockAccessesMMIO(pre_snap, block_pc, num_instr))
       {
         blocks_skipped_mmio++;
-        if (self_diff)
-          RunInterpreterDispatch(interp);
-        else
-        {
-          auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
-          m_dispatch(aot_state);
-        }
+        RunInterpreterBlock(interp, block_pc, num_instr);
+        m_ppc_state.downcount -= static_cast<s32>(num_instr);
         if (m_ppc_state.Exceptions != 0)
         {
           m_ppc_state.npc = m_ppc_state.pc;
@@ -563,30 +588,52 @@ void AOTCore::RunDiff()
 
       std::memcpy(m_ram_shadow, memory.GetRAM(), ram_size);
 
-      // 2. Run path A (AOT dispatch or interpreter dispatch for self-diff)
+      // 2. Run path A: call the SINGLE AOT block function directly.
+      //    Set downcount=0 to prevent tail-call chaining — AOT blocks check
+      //    `if(s->downcount<=0){ s->pc=TARGET; return; }` before tail-calling,
+      //    so this forces them to set pc and return instead.
       if (self_diff)
       {
-        RunInterpreterDispatch(interp);
+        RunInterpreterBlock(interp, block_pc, num_instr);
+        m_ppc_state.downcount -= static_cast<s32>(num_instr);
       }
       else
       {
+        // Force single-block execution: AOT blocks check
+        // `if(s->downcount<=0){ s->pc=TARGET; return; }` before tail-calling.
+        // Setting downcount to num_instr makes the block execute once then bail
+        // instead of chaining to the next block.
+        s32 saved_downcount = m_ppc_state.downcount;
+        m_ppc_state.downcount = static_cast<s32>(num_instr);
         auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
-        m_dispatch(aot_state);
+        aot_block_fn(aot_state);
+        // The block consumed its cycles from our artificial downcount.
+        // Apply the same decrement to the real downcount.
+        m_ppc_state.downcount = saved_downcount - static_cast<s32>(num_instr);
       }
 
       PPCSnapshot path_a_result;
       CaptureSnapshot(path_a_result);
 
-      // Optionally save a copy for RAM comparison
-      if (compare_ram && m_ram_shadow_aot)
-        std::memcpy(m_ram_shadow_aot, memory.GetRAM(), ram_size);
-
       // 3. Restore CPU + RAM for path B
       RestoreSnapshot(pre_snap);
       std::memcpy(memory.GetRAM(), m_ram_shadow, ram_size);
 
-      // 4. Run path B (interpreter dispatch — follows same chain of blocks)
-      RunInterpreterDispatch(interp);
+      // 4. Run path B: interpreter for same block (one iteration only —
+      //    matching the AOT path which also runs one iteration due to downcount trick)
+      {
+        int total_cycles = 0;
+        const u32 block_end = block_pc + num_instr * 4;
+        for (u32 i = 0; i < num_instr; i++)
+        {
+          total_cycles += interp.SingleStepInner();
+          if (m_ppc_state.pc < block_pc || m_ppc_state.pc >= block_end)
+            break;
+          if (m_ppc_state.Exceptions != 0)
+            break;
+        }
+        m_ppc_state.downcount -= static_cast<s32>(num_instr);
+      }
 
       PPCSnapshot path_b_result;
       CaptureSnapshot(path_b_result);
@@ -608,16 +655,16 @@ void AOTCore::RunDiff()
         continue;
       }
 
-      bool diverged = !CompareSnapshots(path_a_result, path_b_result, dispatch_pc, log);
+      bool diverged = !CompareSnapshots(path_a_result, path_b_result, block_pc, log);
 
       if (diverged)
       {
         divergence_count++;
         u32 num_instr_for_log = 0;
-        auto log_it = m_block_sizes.find(dispatch_pc);
+        auto log_it = m_block_sizes.find(block_pc);
         if (log_it != m_block_sizes.end())
           num_instr_for_log = log_it->second;
-        LogDivergence(dispatch_pc, num_instr_for_log, pre_snap, path_a_result, path_b_result, log);
+        LogDivergence(block_pc, num_instr_for_log, pre_snap, path_a_result, path_b_result, log);
 
         // Optional RAM comparison
         if (compare_ram && m_ram_shadow_aot)
@@ -741,6 +788,7 @@ bool AOTCore::BlockAccessesMMIO(const PPCSnapshot&, u32, u32) { return false; }
 int AOTCore::RunInterpreterBlock(Interpreter&, u32, u32) { return 0; }
 void AOTCore::RunInterpreterDispatch(Interpreter&) {}
 std::unordered_map<u32, u32> AOTCore::s_diff_block_sizes;
+std::atomic<bool> AOTCore::s_shutdown_requested{false};
 void AOTCore::SetDiffBlockSizes(std::unordered_map<u32, u32>) {}
 
 #endif  // DOLPHIN_HAS_AOT
