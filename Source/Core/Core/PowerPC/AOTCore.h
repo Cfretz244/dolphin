@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "Common/CommonTypes.h"
 #include "Core/PowerPC/CPUCoreBase.h"
@@ -68,6 +69,7 @@ private:
   bool CompareSnapshots(const PPCSnapshot& a, const PPCSnapshot& b, u32 block_pc, FILE* log);
   void LogDivergence(u32 block_pc, u32 num_instr, const PPCSnapshot& pre,
                      const PPCSnapshot& aot_result, const PPCSnapshot& interp_result, FILE* log);
+  bool BlockReadsTimebase(u32 block_addr, u32 num_instructions);
   bool BlockAccessesMMIO(const PPCSnapshot& pre, u32 block_addr, u32 num_instructions);
   int RunInterpreterBlock(Interpreter& interp, u32 block_addr, u32 num_instructions);
   void RunInterpreterDispatch(Interpreter& interp);
@@ -77,6 +79,7 @@ private:
 
   using DispatchFunc = void (*)(AOTState*);
   DispatchFunc m_dispatch = nullptr;
+  DispatchFunc m_interp_dispatch = nullptr;
 
   // Block boundary map: ppc_addr -> num_instructions (loaded from CFG DB for diff mode)
   std::unordered_map<u32, u32> m_block_sizes;
@@ -86,5 +89,8 @@ private:
 
   // RAM shadow buffer for diff mode (24 MB)
   u8* m_ram_shadow = nullptr;
-  u8* m_ram_shadow_aot = nullptr;  // For optional RAM comparison
+  u8* m_ram_shadow_aot = nullptr;  // For RAM comparison
+
+  // Full emulator state buffer for diff mode (saves all HW registers too)
+  std::vector<u8> m_state_buffer;
 };

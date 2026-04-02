@@ -137,7 +137,10 @@ bool AOTCEmitter::EmitInstruction(std::string& out, UGeckoInstruction inst, u32 
     }
   }
   // Sync/isync (no-ops)
-  case 17: out += "    aot_sc(s); return;\n"; return true; // sc
+  case 17:
+    out += fmt::format("    s->downcount-={}; s->pc={:#010x}u; s->npc=s->pc; aot_sc(s); return;\n",
+                       m_block_cycle_count, pc + 4);
+    return true; // sc
   case 46 + 128: return true; // placeholder
 
   case 31: return EmitTable31(out, inst, pc);

@@ -9,6 +9,7 @@
 
 #include <fmt/format.h>
 
+#include "Common/ChunkFile.h"
 #include "Common/CommonTypes.h"
 #include "Common/GekkoDisassembler.h"
 #include "Common/Swap.h"
@@ -17,8 +18,11 @@
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "Core/HW/CPU.h"
+#include "Core/HW/HW.h"
 #include "Core/HW/Memmap.h"
+#include "Core/HW/VideoInterface.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
+#include "Core/PowerPC/MMIOCapture.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -64,6 +68,11 @@ struct AOTState
 // If any of these fail, the AOT code will silently corrupt state.
 static_assert(offsetof(PowerPC::PowerPCState, pc) == offsetof(AOTState, pc),
               "pc offset mismatch");
+static_assert(offsetof(PowerPC::PowerPCState, gather_pipe_ptr) == offsetof(AOTState, gather_pipe_ptr),
+              "gather_pipe_ptr offset mismatch");
+static_assert(offsetof(PowerPC::PowerPCState, gather_pipe_base_ptr) ==
+                  offsetof(AOTState, gather_pipe_base_ptr),
+              "gather_pipe_base_ptr offset mismatch");
 static_assert(offsetof(PowerPC::PowerPCState, gpr) == offsetof(AOTState, gpr),
               "gpr offset mismatch");
 static_assert(offsetof(PowerPC::PowerPCState, downcount) == offsetof(AOTState, downcount),
@@ -104,9 +113,17 @@ AOTCore::~AOTCore()
   std::free(m_ram_shadow_aot);
 }
 
+extern "C" void aot_interpreter_single_step(AOTState* s);
+
+static void interp_only_dispatch(AOTState* s)
+{
+  aot_interpreter_single_step(s);
+}
+
 void AOTCore::Init()
 {
   m_dispatch = &GALE01_dispatch;
+  m_interp_dispatch = &interp_only_dispatch;
   INFO_LOG_FMT(POWERPC, "AOTCore: Initialized with GALE01 dispatch table");
 
   // Load diff mode settings
@@ -123,11 +140,14 @@ void AOTCore::Init()
     INFO_LOG_FMT(POWERPC, "AOTDiff: Loaded {} block boundaries from CFG DB",
                  m_block_sizes.size());
 
-    // Allocate RAM shadow buffers
+    // Allocate RAM shadow buffers for RAM comparison
     const u32 ram_size = m_system.GetMemory().GetRamSizeReal();
     m_ram_shadow = static_cast<u8*>(std::malloc(ram_size));
-    if (Config::Get(Config::MAIN_DEBUG_AOT_COMPARE_RAM))
-      m_ram_shadow_aot = static_cast<u8*>(std::malloc(ram_size));
+    m_ram_shadow_aot = static_cast<u8*>(std::malloc(ram_size));
+
+    // Allocate full state buffer for HW state save/restore (used for MMIO blocks)
+    // Initial size estimate — will grow if needed
+    m_state_buffer.resize(64 * 1024 * 1024);  // 64 MB should be plenty
   }
 }
 
@@ -153,46 +173,25 @@ void AOTCore::Run()
   auto& cpu = m_system.GetCPU();
   auto& power_pc = m_system.GetPowerPC();
 
+  // AOT_INTERP_ONLY=1 bypasses all AOT blocks (for testing)
+  auto* active_dispatch = std::getenv("AOT_INTERP_ONLY") ? m_interp_dispatch : m_dispatch;
+
   while (cpu.GetState() == CPU::State::Running)
   {
-    // Sync npc before Advance() — CheckExternalExceptions() saves npc into SRR0
-    // as the interrupt return address. Without this, rfi returns to a stale address.
     m_ppc_state.npc = m_ppc_state.pc;
     core_timing.Advance();
 
-    // Idle loop detection: track recent PCs. If we see the same PC
-    // appear twice within a short window, we're in a spin loop.
-    u32 pc_history[8] = {};
-    u32 pc_idx = 0;
-
-    while (m_ppc_state.downcount > 0 && cpu.GetState() == CPU::State::Running)
+    do
     {
-      u32 pc = m_ppc_state.pc;
-
-      // Check if this PC appeared recently in history
-      for (u32 i = 0; i < 8; i++)
-      {
-        if (pc_history[i] == pc && pc != 0)
-        {
-          // Idle loop detected — skip remaining timeslice
-          m_ppc_state.downcount = 0;
-          goto next_slice;
-        }
-      }
-      pc_history[pc_idx & 7] = pc;
-      pc_idx++;
-
       auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
-      m_dispatch(aot_state);
+      active_dispatch(aot_state);
 
-      // Check for exceptions raised during block execution (DSI, PROGRAM, etc.)
       if (m_ppc_state.Exceptions != 0)
       {
         m_ppc_state.npc = m_ppc_state.pc;
         power_pc.CheckExceptions();
       }
-    }
-    next_slice:;
+    } while (m_ppc_state.downcount > 0 && cpu.GetState() == CPU::State::Running);
   }
 }
 
@@ -285,6 +284,8 @@ bool AOTCore::CompareSnapshots(const PPCSnapshot& a, const PPCSnapshot& b, u32 b
     match = false;
   if (a.msr != b.msr)
     match = false;
+  if (a.exceptions != b.exceptions)
+    match = false;
 
   return match;
 }
@@ -350,12 +351,15 @@ void AOTCore::LogDivergence(u32 block_pc, u32 num_instr, const PPCSnapshot& pre,
                  interp_result.ps[i][1]);
   }
 
-  // Diff MSR, FPSCR
+  // Diff MSR, FPSCR, Exceptions
   if (aot_result.msr != interp_result.msr)
     fmt::print(log, "  MSR: AOT={:#010x}  INTERP={:#010x}\n", aot_result.msr, interp_result.msr);
   if (aot_result.fpscr != interp_result.fpscr)
     fmt::print(log, "  FPSCR: AOT={:#010x}  INTERP={:#010x}\n", aot_result.fpscr,
                interp_result.fpscr);
+  if (aot_result.exceptions != interp_result.exceptions)
+    fmt::print(log, "  EXCEPTIONS: AOT={:#010x}  INTERP={:#010x}\n", aot_result.exceptions,
+               interp_result.exceptions);
 
   // Disassembly
   fmt::print(log, "\nDISASSEMBLY:\n");
@@ -374,6 +378,34 @@ void AOTCore::LogDivergence(u32 block_pc, u32 num_instr, const PPCSnapshot& pre,
 // Check if a block likely accesses MMIO (hardware registers at 0xCC000000-0xCD000000).
 // This is a heuristic: we check if any GPR in the pre-state points to the HW range,
 // or if the block contains `lis rN, 0xCC00` which sets up an MMIO base address.
+// Check if block reads timebase/decrementer (non-deterministic between AOT and interpreter
+// because GetFakeTimeBase depends on downcount which is consumed at different rates).
+bool AOTCore::BlockReadsTimebase(u32 block_addr, u32 num_instructions)
+{
+  u8* ram = m_system.GetMemory().GetRAM();
+  for (u32 i = 0; i < num_instructions; i++)
+  {
+    u32 phys = (block_addr + i * 4) & 0x3FFFFFFF;
+    u32 opcode;
+    std::memcpy(&opcode, &ram[phys], sizeof(u32));
+    opcode = Common::swap32(opcode);
+    u32 primary = (opcode >> 26) & 0x3F;
+    if (primary == 31)
+    {
+      u32 subop = (opcode >> 1) & 0x3FF;
+      if (subop == 371)  // mftb
+        return true;
+      if (subop == 339)  // mfspr
+      {
+        u32 spr = ((opcode >> 16) & 0x1F) | ((opcode >> 6) & 0x3E0);
+        if (spr == 268 || spr == 269 || spr == 22)  // TL, TU, DEC
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
 bool AOTCore::BlockAccessesMMIO(const PPCSnapshot& pre, u32 block_addr, u32 num_instructions)
 {
   // Check pre-state GPRs for MMIO base addresses
@@ -384,41 +416,24 @@ bool AOTCore::BlockAccessesMMIO(const PPCSnapshot& pre, u32 block_addr, u32 num_
       return true;
   }
 
-  // Scan instructions for `lis rN, 0xCC00` (addis rD, r0, 0xCC00) or similar
-  // Read directly from RAM (not through iCache/MMU which may return stale data)
+  // Scan instructions for `lis rN, 0xCC00`
   u8* ram = m_system.GetMemory().GetRAM();
   for (u32 i = 0; i < num_instructions; i++)
   {
     u32 phys = (block_addr + i * 4) & 0x3FFFFFFF;
     u32 opcode;
     std::memcpy(&opcode, &ram[phys], sizeof(u32));
-    opcode = Common::swap32(opcode);  // PPC is big-endian
+    opcode = Common::swap32(opcode);
     u32 primary = (opcode >> 26) & 0x3F;
 
-    // addis (lis is addis with rA=0): opcode 15
     if (primary == 15)
     {
       u32 ra = (opcode >> 16) & 0x1F;
       s16 imm = static_cast<s16>(opcode & 0xFFFF);
       if (ra == 0)
       {
-        // lis rD, imm — check if upper 16 bits point to HW range
         u32 val = static_cast<u32>(imm) << 16;
         if (val >= 0xCC000000 && val < 0xCD000000)
-          return true;
-      }
-    }
-
-    // mftb (opcode 31, subop 371) — timebase reads are non-deterministic
-    if (primary == 31)
-    {
-      u32 subop = (opcode >> 1) & 0x3FF;
-      if (subop == 371)  // mftb
-        return true;
-      if (subop == 339)  // mfspr — check for TL/TU/DEC
-      {
-        u32 spr = ((opcode >> 16) & 0x1F) | ((opcode >> 6) & 0x3E0);
-        if (spr == 268 || spr == 269 || spr == 22)  // TL, TU, DEC
           return true;
       }
     }
@@ -563,26 +578,7 @@ void AOTCore::RunDiff()
       // Look up AOT block function early (needed by validation skip and filter paths)
       AOTBlockFunc aot_block_fn = self_diff ? nullptr : GALE01_lookup_block(block_pc);
 
-      // Skip blocks that have already been validated enough times.
-      // After a block passes comparison N times with different inputs,
-      // we trust its codegen and just run the interpreter (no snapshot overhead).
-      constexpr u32 VALIDATION_THRESHOLD = 100;
-      auto& pass_count = m_block_pass_count[block_pc];
-      if (pass_count >= VALIDATION_THRESHOLD && aot_block_fn)
-      {
-        // Use full AOT dispatch for validated blocks — lets the AOT handle
-        // polling loops naturally (burning downcount in tight loops until
-        // Advance() fires hardware events). Single-block mode would force
-        // one iteration per Advance(), never making progress.
-        auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
-        m_dispatch(aot_state);
-        if (m_ppc_state.Exceptions != 0)
-        {
-          m_ppc_state.npc = m_ppc_state.pc;
-          power_pc.CheckExceptions();
-        }
-        continue;
-      }
+      // No validation skip — compare every single block every time
 
       // Filter by address range — run AOT for filtered blocks (interpreter can deadlock)
       if (block_pc < filter_min || block_pc > filter_max)
@@ -630,14 +626,53 @@ void AOTCore::RunDiff()
       PPCSnapshot pre_snap;
       CaptureSnapshot(pre_snap);
 
-      // Check MMIO access
+      // Timebase-reading blocks: can't compare (GetFakeTimeBase depends on downcount
+      // consumed at different rates by AOT vs interpreter). Run interpreter only.
+      if (BlockReadsTimebase(block_pc, num_instr))
+      {
+        RunInterpreterBlock(interp, block_pc, num_instr);
+        m_ppc_state.downcount -= static_cast<s32>(num_instr);
+        if (m_ppc_state.Exceptions != 0)
+        {
+          m_ppc_state.npc = m_ppc_state.pc;
+          power_pc.CheckExceptions();
+        }
+        continue;
+      }
+
+      // MMIO blocks: save/restore FULL hardware state (not just CPU+RAM) so that
+      // MMIO reads return identical values for both AOT and interpreter.
       bool is_mmio = BlockAccessesMMIO(pre_snap, block_pc, num_instr);
-      if (is_mmio)
+      if (is_mmio && aot_block_fn)
       {
         blocks_skipped_mmio++;
-        // Run single AOT block for MMIO blocks (NOT interpreter — it deadlocks on MMIO reads,
-        // and NOT full dispatch — it chains and may hit other deadlocking blocks)
-        if (aot_block_fn)
+
+        // Save full emulator state (CPU + RAM + all HW registers)
+        {
+          u8* ptr = m_state_buffer.data();
+          PointerWrap pw(&ptr, m_state_buffer.size(), PointerWrap::Mode::Write);
+          HW::DoState(m_system, pw);
+          m_system.GetPowerPC().DoState(pw);
+          m_system.GetCoreTiming().DoState(pw);
+          if (!pw.IsWriteMode())
+          {
+            // Buffer too small — grow and retry
+            auto needed = pw.GetOffsetFromPreviousPosition(m_state_buffer.data());
+            m_state_buffer.resize(needed);
+            ptr = m_state_buffer.data();
+            PointerWrap pw2(&ptr, m_state_buffer.size(), PointerWrap::Mode::Write);
+            HW::DoState(m_system, pw2);
+            m_system.GetPowerPC().DoState(pw2);
+            m_system.GetCoreTiming().DoState(pw2);
+          }
+        }
+
+        // Also save RAM separately for comparison
+        std::memcpy(m_ram_shadow, memory.GetRAM(), ram_size);
+
+        // Run AOT single-block with MMIO capture
+        MMIOCaptureReset();
+        g_mmio_capture_active = true;
         {
           s32 saved_dc = m_ppc_state.downcount;
           m_ppc_state.downcount = static_cast<s32>(num_instr);
@@ -647,6 +682,75 @@ void AOTCore::RunDiff()
           aot_single_block_mode = 0;
           m_ppc_state.downcount = saved_dc - static_cast<s32>(num_instr);
         }
+        g_mmio_capture_active = false;
+        auto aot_mmio = g_mmio_capture_log;
+        PPCSnapshot aot_result;
+        CaptureSnapshot(aot_result);
+
+        // Restore FULL state (CPU + RAM + HW)
+        {
+          u8* ptr = m_state_buffer.data();
+          PointerWrap pw(&ptr, m_state_buffer.size(), PointerWrap::Mode::Read);
+          HW::DoState(m_system, pw);
+          m_system.GetPowerPC().DoState(pw);
+          m_system.GetCoreTiming().DoState(pw);
+        }
+
+        // Run interpreter with MMIO capture
+        MMIOCaptureReset();
+        g_mmio_capture_active = true;
+        RunInterpreterBlock(interp, block_pc, num_instr);
+        m_ppc_state.downcount -= static_cast<s32>(num_instr);
+        g_mmio_capture_active = false;
+        auto interp_mmio = g_mmio_capture_log;
+        PPCSnapshot interp_result;
+        CaptureSnapshot(interp_result);
+
+        // Compare registers + MMIO writes + RAM
+        bool reg_match = CompareSnapshots(aot_result, interp_result, block_pc, log);
+        bool mmio_match = (aot_mmio.size() == interp_mmio.size());
+        if (mmio_match)
+        {
+          for (size_t i = 0; i < aot_mmio.size(); i++)
+          {
+            if (aot_mmio[i].address != interp_mmio[i].address ||
+                aot_mmio[i].value != interp_mmio[i].value ||
+                aot_mmio[i].size != interp_mmio[i].size)
+            { mmio_match = false; break; }
+          }
+        }
+
+        bool diverged = !reg_match || !mmio_match;
+        fmt::print(stderr, "AOTDiff: block {:#010x} ({} instr, MMIO) — {}{}{}\n",
+                   block_pc, num_instr,
+                   diverged ? "DIVERGED" : "ok",
+                   !reg_match ? " [regs]" : "",
+                   !mmio_match ? fmt::format(" [mmio: {} vs {}]", aot_mmio.size(), interp_mmio.size()) : "");
+
+        if (diverged)
+        {
+          divergence_count++;
+          if (!reg_match)
+            LogDivergence(block_pc, num_instr, pre_snap, aot_result, interp_result, log);
+          if (!mmio_match)
+          {
+            fmt::print(log, "\n=== MMIO DIVERGENCE at block {:#010x} ===\n", block_pc);
+            fmt::print(log, "AOT MMIO writes ({}):\n", aot_mmio.size());
+            for (auto& w : aot_mmio)
+              fmt::print(log, "  [{:#010x}] = {:#010x} (size {})\n", w.address, w.value, w.size);
+            fmt::print(log, "INTERP MMIO writes ({}):\n", interp_mmio.size());
+            for (auto& w : interp_mmio)
+              fmt::print(log, "  [{:#010x}] = {:#010x} (size {})\n", w.address, w.value, w.size);
+          }
+          std::fflush(log);
+          if (divergence_count >= max_divergences)
+          {
+            Core::QueueHostJob([](Core::System& sys) { Core::Stop(sys); });
+            cpu.Break();
+            return;
+          }
+        }
+
         if (m_ppc_state.Exceptions != 0)
         {
           m_ppc_state.npc = m_ppc_state.pc;
@@ -655,9 +759,9 @@ void AOTCore::RunDiff()
         continue;
       }
 
-      // FULL COMPARISON: snapshot CPU+RAM, run AOT, restore, run interpreter, compare.
+      // FULL COMPARISON: snapshot CPU+RAM, run AOT, save AOT RAM, restore, run interpreter, compare.
 
-      // 2. Save RAM
+      // 2. Save pre-RAM
       std::memcpy(m_ram_shadow, memory.GetRAM(), ram_size);
 
       // 3. Run AOT single-block
@@ -673,6 +777,10 @@ void AOTCore::RunDiff()
 
       PPCSnapshot aot_result;
       CaptureSnapshot(aot_result);
+
+      // 3b. Save AOT's RAM result for comparison
+      if (m_ram_shadow_aot)
+        std::memcpy(m_ram_shadow_aot, memory.GetRAM(), ram_size);
 
       // 4. Restore CPU + RAM, run interpreter
       RestoreSnapshot(pre_snap);
@@ -696,23 +804,47 @@ void AOTCore::RunDiff()
         continue;
       }
 
-      bool diverged = !CompareSnapshots(aot_result, interp_result, block_pc, log);
+      bool reg_diverged = !CompareSnapshots(aot_result, interp_result, block_pc, log);
+
+      // Compare RAM: AOT result is in m_ram_shadow_aot, interpreter result is in current RAM
+      bool ram_diverged = false;
+      if (m_ram_shadow_aot)
+      {
+        u8* interp_ram = memory.GetRAM();
+        int ram_diff_printed = 0;
+        for (u32 i = 0; i < ram_size && ram_diff_printed < 10; i += 4)
+        {
+          u32 aot_val, interp_val;
+          std::memcpy(&aot_val, &m_ram_shadow_aot[i], 4);
+          std::memcpy(&interp_val, &interp_ram[i], 4);
+          if (aot_val != interp_val)
+          {
+            if (!ram_diverged)
+              fmt::print(log, "  RAM DIVERGENCES for block {:#010x}:\n", block_pc);
+            ram_diverged = true;
+            ram_diff_printed++;
+            fmt::print(log, "    {:#010x}: AOT={:#010x} INTERP={:#010x}\n",
+                       0x80000000 | i, Common::swap32(aot_val), Common::swap32(interp_val));
+          }
+        }
+        if (ram_diff_printed >= 10)
+          fmt::print(log, "    ... (truncated)\n");
+      }
+
+      bool diverged = reg_diverged || ram_diverged;
+
+      // Print every block result
+      fmt::print(stderr, "AOTDiff: block {:#010x} ({} instr) — {}\n",
+                 block_pc, num_instr, diverged ? "DIVERGED" : "ok");
 
       if (diverged)
       {
         divergence_count++;
         LogDivergence(block_pc, num_instr, pre_snap, aot_result, interp_result, log);
 
-        // Interpreter result already restored above — continue from oracle
-
         if (divergence_count >= max_divergences)
         {
           fmt::print(log, "\nMax divergences ({}) reached. Stopping.\n", max_divergences);
-          fmt::print(log,
-                     "Blocks compared: {} | Skipped (unknown): {} | Skipped (MMIO): {} | "
-                     "Divergences: {}\n",
-                     blocks_compared, blocks_skipped_unknown, blocks_skipped_mmio,
-                     divergence_count);
           std::fflush(log);
           if (log != stdout)
             std::fclose(log);
@@ -729,18 +861,22 @@ void AOTCore::RunDiff()
         power_pc.CheckExceptions();
       }
 
-      // Track successful comparisons for the validation-skip optimization
-      if (!diverged)
-        pass_count++;
-
-      // Self-loop: if PC == block start, force end of timeslice so
-      // core_timing.Advance() runs. Also mark the block as fully validated
-      // to skip the 48MB snapshot/restore on every future iteration —
-      // one successful comparison proves the codegen is correct.
+      // Self-loop optimization: if block branches back to itself and passed comparison,
+      // run the interpreter until the loop exits (PC changes). No need to compare every
+      // iteration — one successful comparison proves the codegen for this block.
       if (!diverged && m_ppc_state.pc == block_pc)
       {
-        pass_count = VALIDATION_THRESHOLD;
-        m_ppc_state.downcount = 0;
+        u32 loop_iters = 0;
+        while (m_ppc_state.pc == block_pc && m_ppc_state.downcount > 0 &&
+               m_ppc_state.Exceptions == 0)
+        {
+          RunInterpreterBlock(interp, block_pc, num_instr);
+          m_ppc_state.downcount -= static_cast<s32>(num_instr);
+          loop_iters++;
+        }
+        if (loop_iters > 0)
+          fmt::print(stderr, "AOTDiff: self-loop {:#010x} ran {} extra iterations via interp\n",
+                     block_pc, loop_iters);
       }
 
       blocks_compared++;
@@ -761,10 +897,16 @@ void AOTCore::RunDiff()
       u32 total_visits = blocks_compared + blocks_skipped_unknown + blocks_skipped_mmio;
       if (total_visits % 10000 == 0)
       {
+        // Check VI XFB state for progress monitoring
+        auto& vi = m_system.GetVideoInterface();
+        u32 xfb_top = vi.GetXFBAddressTop();
+        u32 xfb_bot = vi.GetXFBAddressBottom();
         fmt::print(stderr,
-                   "AOTDiff: cmp={} visit={} div={} skip={} mmio={} | pc={:#010x}\n",
+                   "AOTDiff: cmp={} visit={} div={} skip={} mmio={} | pc={:#010x} | "
+                   "xfb_top={:#010x} xfb_bot={:#010x}\n",
                    blocks_compared, total_visits, divergence_count,
-                   blocks_skipped_unknown, blocks_skipped_mmio, m_ppc_state.pc);
+                   blocks_skipped_unknown, blocks_skipped_mmio, m_ppc_state.pc,
+                   xfb_top, xfb_bot);
       }
     }
   }

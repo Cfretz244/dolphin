@@ -9,9 +9,11 @@
 
 #include "Common/CommonTypes.h"
 #include "Core/CoreTiming.h"
+#include "Core/HW/GPFifo.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
+#include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -187,6 +189,7 @@ void aot_interpreter_single_step(AOTState* s)
 {
   auto& ppc_state = GetPPCState(s);
   auto& system = GetSystem();
+
   auto& interpreter = system.GetInterpreter();
 
   ppc_state.npc = ppc_state.pc + 4;
@@ -286,20 +289,44 @@ uint32_t aot_mfspr_special(AOTState* s, uint32_t spr_index)
 void aot_mtspr_special(AOTState* s, uint32_t spr_index, uint32_t val)
 {
   auto& ppc_state = GetPPCState(s);
+  u32 old_value = ppc_state.spr[spr_index];
   ppc_state.spr[spr_index] = val;
 
   switch (spr_index)
   {
   case SPR_DEC:
-  {
     GetSystem().GetSystemTimers().DecrementerSet();
     break;
-  }
+
   case SPR_HID0:
-  case SPR_HID2:
-  case SPR_HID4:
-    // These can trigger mode changes; for now just store
+  {
+    UReg_HID0 old_hid0;
+    old_hid0.Hex = old_value;
+    if (HID0(ppc_state).ICFI)
+    {
+      HID0(ppc_state).ICFI = 0;
+      ppc_state.iCache.Reset(GetSystem().GetJitInterface());
+    }
     break;
+  }
+
+  case SPR_HID2:
+    // Only lower half is modifiable, except DMAQL field
+    ppc_state.spr[spr_index] = (ppc_state.spr[spr_index] & 0xF0FF0000) | (old_value & 0x0F000000);
+    break;
+
+  case SPR_HID4:
+    if (old_value != ppc_state.spr[spr_index])
+    {
+      GetSystem().GetMMU().IBATUpdated();
+      GetSystem().GetMMU().DBATUpdated();
+    }
+    break;
+
+  case SPR_WPAR:
+    GetSystem().GetGPFifo().ResetGatherPipe();
+    break;
+
   default:
     break;
   }
@@ -307,7 +334,10 @@ void aot_mtspr_special(AOTState* s, uint32_t spr_index, uint32_t val)
 
 uint32_t aot_mftb(AOTState* s, uint32_t spr_encoded)
 {
-  return aot_mfspr_special(s, SPR_TL);  // mftb uses TBL/TBU
+  // spr_encoded is the raw TBR field with upper/lower 5-bit halves swapped.
+  // Decode to actual SPR number: 268=TBL, 269=TBU
+  u32 spr = ((spr_encoded & 0x1F) << 5) | ((spr_encoded >> 5) & 0x1F);
+  return aot_mfspr_special(s, spr);
 }
 
 // ============================================================================

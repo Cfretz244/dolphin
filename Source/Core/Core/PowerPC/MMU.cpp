@@ -51,6 +51,7 @@
 #include "Core/HW/Memmap.h"
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/PowerPC/GDBStub.h"
+#include "Core/PowerPC/MMIOCapture.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -348,6 +349,10 @@ void MMU::WriteToHardware(u32 em_address, const u32 data, const u32 size)
     wi = translated_addr.wi;
   }
 
+  // Capture MMIO writes for diff harness comparison
+  if (flag == XCheckTLBFlag::Write && (em_address & 0xF8000000) == 0x08000000)
+    MMIOCaptureRecord(em_address, data, size);
+
   // Check for a gather pipe write (which are not implemented through the MMIO system).
   //
   // Note that we must mask the address to correctly emulate certain games; Pac-Man World 3
@@ -361,6 +366,7 @@ void MMU::WriteToHardware(u32 em_address, const u32 data, const u32 size)
   if (flag == XCheckTLBFlag::Write &&
       (em_address & 0xFFFFF000) == GPFifo::GATHER_PIPE_PHYSICAL_ADDRESS)
   {
+    MMIOCaptureRecord(em_address, data, size);  // Capture GP FIFO writes too
     switch (size)
     {
     case 1:
