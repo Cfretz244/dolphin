@@ -573,14 +573,12 @@ FP_IMPL_4(aot_ps_sel, ps_sel)
 FP_IMPL_2(aot_ps_res, ps_res)
 FP_IMPL_2(aot_ps_rsqrte, ps_rsqrte)
 
-// PS moves
+// PS moves — must operate on BOTH ps0 AND ps1 (unlike scalar fneg/fabs/fnabs)
 void aot_ps_neg(AOTState* s, int fd, int fb)
 {
   auto& ppc_state = GetPPCState(s);
-  u64 v0 = ppc_state.ps[fb].PS0AsU64();
-  u64 v1 = ppc_state.ps[fb].PS1AsU64();
-  ppc_state.ps[fd].SetPS0(v0 ^ (1ULL << 63));
-  ppc_state.ps[fd].SetPS1(v1);
+  ppc_state.ps[fd].SetBoth(ppc_state.ps[fb].PS0AsU64() ^ (UINT64_C(1) << 63),
+                            ppc_state.ps[fb].PS1AsU64() ^ (UINT64_C(1) << 63));
 }
 
 void aot_ps_mr(AOTState* s, int fd, int fb)
@@ -592,19 +590,15 @@ void aot_ps_mr(AOTState* s, int fd, int fb)
 void aot_ps_abs(AOTState* s, int fd, int fb)
 {
   auto& ppc_state = GetPPCState(s);
-  u64 v0 = ppc_state.ps[fb].PS0AsU64();
-  u64 v1 = ppc_state.ps[fb].PS1AsU64();
-  ppc_state.ps[fd].SetPS0(v0 & ~(1ULL << 63));
-  ppc_state.ps[fd].SetPS1(v1);
+  ppc_state.ps[fd].SetBoth(ppc_state.ps[fb].PS0AsU64() & ~(UINT64_C(1) << 63),
+                            ppc_state.ps[fb].PS1AsU64() & ~(UINT64_C(1) << 63));
 }
 
 void aot_ps_nabs(AOTState* s, int fd, int fb)
 {
   auto& ppc_state = GetPPCState(s);
-  u64 v0 = ppc_state.ps[fb].PS0AsU64();
-  u64 v1 = ppc_state.ps[fb].PS1AsU64();
-  ppc_state.ps[fd].SetPS0(v0 | (1ULL << 63));
-  ppc_state.ps[fd].SetPS1(v1);
+  ppc_state.ps[fd].SetBoth(ppc_state.ps[fb].PS0AsU64() | (UINT64_C(1) << 63),
+                            ppc_state.ps[fb].PS1AsU64() | (UINT64_C(1) << 63));
 }
 
 // PS merge
