@@ -293,10 +293,12 @@ void AOTCore::Run()
   auto& memory = m_system.GetMemory();
   const u32 ram_size = memory.GetRamSizeReal();
   u8* compare_ram_shadow = nullptr;
+  u8* compare_ram_aot = nullptr;
   if (compare_mode)
   {
     compare_ram_shadow = static_cast<u8*>(std::malloc(ram_size));
-    fmt::print(stderr, "AOT_COMPARE: Active, {} block sizes loaded, {}MB RAM shadow\n",
+    compare_ram_aot = static_cast<u8*>(std::malloc(ram_size));
+    fmt::print(stderr, "AOT_COMPARE: Active, {} block sizes loaded, {}MB RAM shadow x2\n",
                m_block_sizes.size(), ram_size / (1024 * 1024));
   }
 
@@ -365,7 +367,7 @@ void AOTCore::Run()
           PPCSnapshot pre, aot_result, interp_result;
           pre = pre_check;
           u8* ram = memory.GetRAM();
-          std::memcpy(compare_ram_shadow, ram, ram_size);
+          std::memcpy(compare_ram_shadow, ram, ram_size);  // pre-RAM saved
 
           // Run AOT single block
           s32 saved_dc = m_ppc_state.downcount;
@@ -375,28 +377,54 @@ void AOTCore::Run()
           aot_single_block_mode = 0;
           CaptureSnapshot(aot_result);
 
-          // Restore pre-state (registers AND RAM)
+          // Save AOT's RAM, then restore pre-state
+          std::memcpy(compare_ram_aot, ram, ram_size);  // AOT-RAM saved
           RestoreSnapshot(pre);
-          std::memcpy(ram, compare_ram_shadow, ram_size);
+          std::memcpy(ram, compare_ram_shadow, ram_size);  // pre-RAM restored
 
-          // Run interpreter for the same block (ignore exceptions to match AOT's
-          // behavior of executing the full block before checking exceptions)
+          // Run interpreter for the same block
           m_ppc_state.downcount = static_cast<s32>(num_instr);
           RunInterpreterBlock(interp, block_pc, num_instr, /*ignore_exceptions=*/true);
           CaptureSnapshot(interp_result);
+          // Now live RAM = interpreter's result
 
-          // Compare register results
-          if (!CompareSnapshots(aot_result, interp_result, block_pc, stderr))
+          // Compare registers
+          bool regs_match = CompareSnapshots(aot_result, interp_result, block_pc, nullptr);
+
+          // Compare RAM (AOT result vs interpreter result)
+          bool ram_match = true;
+          for (u32 j = 0; j < ram_size; j++)
+          {
+            if (compare_ram_aot[j] != ram[j])
+            {
+              ram_match = false;
+              break;
+            }
+          }
+
+          if (!regs_match || !ram_match)
           {
             found_divergence = true;
             fmt::print(stderr, "\n=== AOT_COMPARE: First divergence at block {:#010x} "
-                       "(after {} comparisons) ===\n", block_pc, compare_count);
+                       "(after {} comparisons, regs={} ram={}) ===\n",
+                       block_pc, compare_count,
+                       regs_match ? "match" : "DIFFER", ram_match ? "match" : "DIFFER");
             LogDivergence(block_pc, num_instr, pre, aot_result, interp_result, stderr);
+            if (!ram_match)
+            {
+              fmt::print(stderr, "\nRAM differences (first 20):\n");
+              int ram_diffs = 0;
+              for (u32 j = 0; j < ram_size && ram_diffs < 20; j++)
+              {
+                if (compare_ram_aot[j] != ram[j])
+                {
+                  fmt::print(stderr, "  0x{:08x}: AOT=0x{:02x} INTERP=0x{:02x}\n",
+                             0x80000000 + j, compare_ram_aot[j], ram[j]);
+                  ram_diffs++;
+                }
+              }
+            }
             fmt::print(stderr, "=== Continuing with interpreter result ===\n\n");
-          }
-          else
-          {
-            // Both agree — continue with interpreter result state
           }
 
           m_ppc_state.downcount = saved_dc - static_cast<s32>(num_instr);
@@ -450,6 +478,7 @@ void AOTCore::Run()
   }
 
   std::free(compare_ram_shadow);
+  std::free(compare_ram_aot);
 }
 
 void AOTCore::SingleStep()
