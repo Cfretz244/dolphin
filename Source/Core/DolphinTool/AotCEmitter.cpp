@@ -420,7 +420,12 @@ bool AOTCEmitter::EmitTable31(std::string& out, UGeckoInstruction inst, u32 pc)
   // Cache
   case 278: out += fmt::format("    aot_dcbt(s,0);\n"); return true; // dcbt (no-op)
   case 246: out += fmt::format("    aot_dcbt(s,0);\n"); return true; // dcbtst (no-op)
-  case 1014: out += fmt::format("    aot_dcbz(s,s->gpr[{}]+s->gpr[{}]);\n", I(inst.RA), I(inst.RB)); return true;
+  case 1014:
+    if (I(inst.RA))
+      out += fmt::format("    aot_dcbz(s,s->gpr[{}]+s->gpr[{}]);\n", I(inst.RA), I(inst.RB));
+    else
+      out += fmt::format("    aot_dcbz(s,s->gpr[{}]);\n", I(inst.RB));
+    return true;
   case 86:  return true; // dcbf (no-op for AOT)
   case 54:  return true; // dcbst (no-op for AOT)
   case 470: return true; // dcbi (no-op for AOT)
@@ -1146,7 +1151,12 @@ bool AOTCEmitter::EmitTable4(std::string& out, UGeckoInstruction inst, u32 pc)
   case 7:   out += fmt::format("    aot_psq_stx(s,{});\n", inst.hex); return true;
   case 38:  out += fmt::format("    aot_psq_lux(s,{});\n", inst.hex); return true;
   case 39:  out += fmt::format("    aot_psq_stux(s,{});\n", inst.hex); return true;
-  case 1014: out += fmt::format("    aot_dcbz_l(s,s->gpr[{}]+s->gpr[{}]);\n", I(inst.RA), I(inst.RB)); return true;
+  case 1014:
+    if (I(inst.RA))
+      out += fmt::format("    aot_dcbz_l(s,s->gpr[{}]+s->gpr[{}]);\n", I(inst.RA), I(inst.RB));
+    else
+      out += fmt::format("    aot_dcbz_l(s,s->gpr[{}]);\n", I(inst.RB));
+    return true;
   default: break;
   }
 

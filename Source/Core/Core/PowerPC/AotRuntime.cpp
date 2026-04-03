@@ -12,6 +12,7 @@
 #include "Core/HW/GPFifo.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/SystemTimers.h"
+#include "Core/PowerPC/Interpreter/ExceptionUtils.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
 #include "Core/PowerPC/Interpreter/Interpreter_FPUtils.h"
 #include "Core/PowerPC/JitInterface.h"
@@ -280,8 +281,15 @@ uint32_t aot_mfspr_special(AOTState* s, uint32_t spr_index)
     return ppc_state.spr[SPR_DEC];
   }
   case SPR_WPAR:
-    // Gather pipe status
-    return 0x40000000;  // BNE set when gather pipe not empty
+  {
+    // BNE (buffer not empty) is in bit 0, matching the interpreter's behavior.
+    u32 val = ppc_state.spr[spr_index];
+    if (GetSystem().GetGPFifo().IsBNE())
+      val |= 1;
+    else
+      val &= ~1;
+    return val;
+  }
   default:
     return ppc_state.spr[spr_index];
   }
@@ -327,6 +335,44 @@ void aot_mtspr_special(AOTState* s, uint32_t spr_index, uint32_t val)
   case SPR_WPAR:
     GetSystem().GetGPFifo().ResetGatherPipe();
     break;
+
+  // DBAT registers — must rebuild BAT lookup table when changed
+  case SPR_DBAT0U: case SPR_DBAT0L: case SPR_DBAT1U: case SPR_DBAT1L:
+  case SPR_DBAT2U: case SPR_DBAT2L: case SPR_DBAT3U: case SPR_DBAT3L:
+  case SPR_DBAT4U: case SPR_DBAT4L: case SPR_DBAT5U: case SPR_DBAT5L:
+  case SPR_DBAT6U: case SPR_DBAT6L: case SPR_DBAT7U: case SPR_DBAT7L:
+    if (old_value != ppc_state.spr[spr_index])
+      GetSystem().GetMMU().DBATUpdated();
+    break;
+
+  // IBAT registers — must rebuild BAT lookup table when changed
+  case SPR_IBAT0U: case SPR_IBAT0L: case SPR_IBAT1U: case SPR_IBAT1L:
+  case SPR_IBAT2U: case SPR_IBAT2L: case SPR_IBAT3U: case SPR_IBAT3L:
+  case SPR_IBAT4U: case SPR_IBAT4L: case SPR_IBAT5U: case SPR_IBAT5L:
+  case SPR_IBAT6U: case SPR_IBAT6L: case SPR_IBAT7U: case SPR_IBAT7L:
+    if (old_value != ppc_state.spr[spr_index])
+      GetSystem().GetMMU().IBATUpdated();
+    break;
+
+  // Locked cache DMA — write to DMAL with DMA_T set triggers transfer
+  case SPR_DMAL:
+  {
+    if (DMAL(ppc_state).DMA_T)
+    {
+      auto& mmu = GetMMU();
+      const u32 mem_address = DMAU(ppc_state).MEM_ADDR << 5;
+      const u32 cache_address = DMAL(ppc_state).LC_ADDR << 5;
+      u32 length = ((DMAU(ppc_state).DMA_LEN_U << 2) | DMAL(ppc_state).DMA_LEN_L);
+      if (length == 0)
+        length = 128;
+      if (DMAL(ppc_state).DMA_LD)
+        mmu.DMA_MemoryToLC(cache_address, mem_address, length);
+      else
+        mmu.DMA_LCToMemory(mem_address, cache_address, length);
+    }
+    DMAL(ppc_state).DMA_T = 0;
+    break;
+  }
 
   default:
     break;
@@ -677,16 +723,23 @@ void aot_psq_stux(AOTState* s, uint32_t inst_hex)
 
 void aot_dcbz(AOTState* s, uint32_t addr)
 {
-  auto& mmu = GetMMU();
-  // Zero 32 bytes at the cache-line-aligned address
-  u32 aligned = addr & ~31u;
-  for (u32 i = 0; i < 32; i += 4)
-    PowerPC::WriteFromJit<u32>(mmu, 0, aligned + i);
+  PowerPC::ClearDCacheLineFromJit(GetMMU(), addr & ~31u);
 }
 
 void aot_dcbz_l(AOTState* s, uint32_t addr)
 {
-  aot_dcbz(s, addr);
+  auto& ppc_state = GetPPCState(s);
+  if (!HID2(ppc_state).LCE)
+  {
+    GenerateProgramException(ppc_state, ProgramExceptionCause::IllegalInstruction);
+    return;
+  }
+  if (!HID0(ppc_state).DCE)
+  {
+    GenerateAlignmentException(ppc_state, addr);
+    return;
+  }
+  PowerPC::ClearDCacheLineFromJit(GetMMU(), addr & ~31u);
 }
 
 void aot_dcbt(AOTState* s, uint32_t addr)
