@@ -558,6 +558,8 @@ add_library(core
   PowerPC/PPCCache.h
   PowerPC/AOTCore.cpp
   PowerPC/AOTCore.h
+  PowerPC/AotRegistry.cpp
+  PowerPC/AotRegistry.h
   PowerPC/AotRuntime.cpp
   PowerPC/TraceCollector.cpp
   PowerPC/TraceCollector.h
@@ -849,14 +851,32 @@ if(USE_RETRO_ACHIEVEMENTS)
   endif()
 endif()
 
-set(AOT_STATIC_LIB "" CACHE FILEPATH "Path to precompiled AOT static library for AOT CPU core")
+set(AOT_STATIC_LIB "" CACHE FILEPATH "Path to precompiled AOT static library (single game)")
+set(AOT_STATIC_LIBS "" CACHE STRING "Semicolon-separated list of AOT static libraries (multi-game)")
+
+# Merge single and multi into one list
+set(ALL_AOT_LIBS "")
 if(AOT_STATIC_LIB)
-  if(NOT EXISTS "${AOT_STATIC_LIB}")
-    message(FATAL_ERROR "AOT_STATIC_LIB points to non-existent file: ${AOT_STATIC_LIB}")
-  endif()
+  list(APPEND ALL_AOT_LIBS "${AOT_STATIC_LIB}")
+endif()
+if(AOT_STATIC_LIBS)
+  foreach(lib IN LISTS AOT_STATIC_LIBS)
+    list(APPEND ALL_AOT_LIBS "${lib}")
+  endforeach()
+endif()
+
+if(ALL_AOT_LIBS)
   target_compile_definitions(core PUBLIC DOLPHIN_HAS_AOT)
-  target_link_libraries(core PRIVATE "${AOT_STATIC_LIB}")
-  message(STATUS "AOT support enabled with library: ${AOT_STATIC_LIB}")
+  foreach(lib IN LISTS ALL_AOT_LIBS)
+    if(NOT EXISTS "${lib}")
+      message(FATAL_ERROR "AOT library not found: ${lib}")
+    endif()
+    # Whole-archive link: ensures __attribute__((constructor)) registration runs
+    # even though Dolphin no longer references game-specific symbols directly.
+    target_link_libraries(core PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,${lib}>")
+  endforeach()
+  list(LENGTH ALL_AOT_LIBS _aot_lib_count)
+  message(STATUS "AOT support enabled with ${_aot_lib_count} library(ies): ${ALL_AOT_LIBS}")
   if(ENABLE_LTO)
     message(STATUS "  LTO enabled: cross-boundary optimization between AOT code and runtime")
     message(STATUS "  (Ensure AOT .c files were compiled with -flto for full benefit)")

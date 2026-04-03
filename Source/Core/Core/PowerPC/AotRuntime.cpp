@@ -20,6 +20,12 @@
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
+// Single-block mode flag for diff harness: when set, dispatch returns
+// immediately without calling any block. Defined here as the single
+// authoritative definition — AOT libraries declare it as extern.
+extern "C" int aot_single_block_mode;
+int aot_single_block_mode = 0;
+
 // The AOTState struct is layout-compatible with PowerPCState.
 // At runtime, we cast between them.
 struct AOTState;

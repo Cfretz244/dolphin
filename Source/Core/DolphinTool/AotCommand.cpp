@@ -468,10 +468,9 @@ int AotCommand(const std::vector<std::string>& args)
     }
     file << "};\n\n";
 
-    // Single-block mode flag for diff harness: when set, dispatch returns
-    // immediately without calling any block. This prevents indirect branches
-    // (blr/bctr) from chaining to the next block.
-    file << "int aot_single_block_mode = 0;\n\n";
+    // Single-block mode flag — defined in Dolphin's AotRuntime.cpp.
+    // Declared extern here to avoid multiple-definition errors with multi-game builds.
+    file << "extern int aot_single_block_mode;\n\n";
 
     // Emit the fast dispatch function — O(1) array lookup
     file << fmt::format("void {}_dispatch(AOTState* s) {{\n", prefix);
@@ -492,6 +491,16 @@ int AotCommand(const std::vector<std::string>& args)
     file << fmt::format("    if (idx < {}_TABLE_SIZE) return {}_fast_table[idx];\n", prefix,
                         prefix);
     file << "    return 0;\n";
+    file << "}\n\n";
+
+    // Emit self-registration constructor — runs before main() to register
+    // this game's dispatch/lookup with Dolphin's AotRegistry.
+    file << "__attribute__((constructor))\n";
+    file << fmt::format("static void aot_register_{}(void) {{\n", prefix);
+    file << "    extern void aot_register_game(const char*,"
+            " void (*)(AOTState*), AOTBlockFunc (*)(uint32_t));\n";
+    file << fmt::format("    aot_register_game(\"{}\", {}_dispatch, {}_lookup_block);\n", prefix,
+                        prefix, prefix);
     file << "}\n";
   }
 
@@ -512,9 +521,12 @@ int AotCommand(const std::vector<std::string>& args)
     script << "echo \"Creating static library...\"\n";
     script << "ar rcs lib${PREFIX}_aot.a ${PREFIX}_*.o\n\n";
     script << "echo \"Done: lib${PREFIX}_aot.a\"\n";
-    script << "echo \"Rebuild Dolphin with LTO:\"\n";
+    script << "echo \"Rebuild Dolphin with LTO (single game):\"\n";
     script << "echo \"  cmake .. -DENABLE_LTO=ON"
               " -DAOT_STATIC_LIB=$(pwd)/lib${PREFIX}_aot.a\"\n";
+    script << "echo \"Or add to multi-game build (semicolon-separated):\"\n";
+    script << "echo \"  cmake .. -DENABLE_LTO=ON"
+              " -DAOT_STATIC_LIBS=\\\"/path/to/lib1.a;$(pwd)/lib${PREFIX}_aot.a\\\"\"\n";
     script.close();
     chmod(build_script.c_str(), 0755);
     fmt::println(std::cerr, "  Build script: {}", build_script);

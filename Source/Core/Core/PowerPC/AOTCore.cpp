@@ -27,6 +27,8 @@
 #include "Core/PowerPC/Interpreter/Interpreter.h"
 #include "Core/State.h"
 #include "VideoCommon/CommandProcessor.h"
+#include "Core/ConfigManager.h"
+#include "Core/PowerPC/AotRegistry.h"
 #include "Core/PowerPC/MMIOCapture.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
@@ -97,15 +99,8 @@ static_assert(offsetof(PowerPC::PowerPCState, Exceptions) == offsetof(AOTState, 
 static_assert(offsetof(PowerPC::PowerPCState, fpscr) == offsetof(AOTState, fpscr),
               "fpscr offset mismatch");
 
-// The AOT dispatch function — defined in the pre-compiled AOT static library.
-// This symbol is resolved at link time.
-extern "C" void GALE01_dispatch(AOTState* s);
-
-// Block lookup — returns a single block's function pointer without executing.
-typedef void (*AOTBlockFunc)(AOTState*);
-extern "C" AOTBlockFunc GALE01_lookup_block(uint32_t pc);
-
 // Single-block mode: when set, dispatch returns immediately without chaining.
+// Defined in AotRuntime.cpp; declared here for diff/compare mode usage.
 extern "C" int aot_single_block_mode;
 
 // Static storage for diff block sizes (set by DiffCommand before boot)
@@ -137,9 +132,34 @@ static void interp_only_dispatch(AOTState* s)
 
 void AOTCore::Init()
 {
-  m_dispatch = &GALE01_dispatch;
   m_interp_dispatch = &interp_only_dispatch;
-  INFO_LOG_FMT(POWERPC, "AOTCore: Initialized with GALE01 dispatch table");
+
+  // Look up the AOT library for the currently loaded game.
+  const std::string game_id = SConfig::GetInstance().GetGameID();
+  auto entry = AotRegistry::Instance().Find(game_id);
+  if (entry)
+  {
+    m_dispatch = entry->dispatch;
+    m_lookup_block = entry->lookup_block;
+    INFO_LOG_FMT(POWERPC, "AOTCore: Found AOT library for game {}", game_id);
+  }
+  else
+  {
+    m_dispatch = m_interp_dispatch;
+    m_lookup_block = nullptr;
+    const auto registered = AotRegistry::Instance().GetRegisteredGameIDs();
+    std::string available;
+    for (size_t i = 0; i < registered.size(); i++)
+    {
+      if (i > 0)
+        available += ", ";
+      available += registered[i];
+    }
+    WARN_LOG_FMT(POWERPC,
+                 "AOTCore: No AOT library for game {}. Available: [{}]. "
+                 "Falling back to interpreter.",
+                 game_id, available);
+  }
 
   // Load block sizes if available (needed for both diff mode and compare mode)
   if (!s_diff_block_sizes.empty())
@@ -336,7 +356,7 @@ void AOTCore::Run()
       if (compare_mode && !found_divergence)
       {
         // Try to compare this block: AOT vs interpreter
-        AOTBlockFunc aot_fn = GALE01_lookup_block(m_ppc_state.pc);
+        AOTBlockFunc aot_fn = m_lookup_block ? m_lookup_block(m_ppc_state.pc) : nullptr;
         u32 block_pc = m_ppc_state.pc;
 
         if (aot_fn && m_block_sizes.count(block_pc))
@@ -899,7 +919,8 @@ void AOTCore::RunDiff()
       const u32 num_instr = it->second;
 
       // Look up AOT block function early (needed by validation skip and filter paths)
-      AOTBlockFunc aot_block_fn = self_diff ? nullptr : GALE01_lookup_block(block_pc);
+      AOTBlockFunc aot_block_fn =
+          (self_diff || !m_lookup_block) ? nullptr : m_lookup_block(block_pc);
 
       // No validation skip — compare every single block every time
 

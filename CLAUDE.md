@@ -22,8 +22,13 @@ make -j$(sysctl -n hw.ncpu) dolphin-emu dolphin-nogui dolphin-tool
 cd build && make -j$(sysctl -n hw.ncpu) dolphin-emu
 
 # Build with AOT library linked in (with LTO for cross-boundary optimization)
+# Single game:
 cmake .. -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/qt \
   -DENABLE_LTO=ON -DAOT_STATIC_LIB=/path/to/libGALE01_aot.a
+# Multiple games (semicolon-separated):
+cmake .. -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/qt \
+  -DENABLE_LTO=ON \
+  -DAOT_STATIC_LIBS="/path/to/libGALE01_aot.a;/path/to/libGZLE01_aot.a"
 make -j$(sysctl -n hw.ncpu) dolphin-emu
 
 # Run tests
@@ -51,7 +56,7 @@ The pipeline has four phases, each producing artifacts consumed by the next:
 ./Binaries/dolphin-tool translate --cfg cfg.db --iso game.iso --output aot_output/
 ```
 
-**Phase 4 — Compile + Link:** Compile C to .a with ThinLTO, rebuild Dolphin with `-DAOT_STATIC_LIB=` and `-DENABLE_LTO=ON`.
+**Phase 4 — Compile + Link:** Compile C to .a with ThinLTO, rebuild Dolphin with `-DAOT_STATIC_LIB=` (or `-DAOT_STATIC_LIBS=` for multiple games) and `-DENABLE_LTO=ON`.
 ```bash
 cd aot_output
 # Option A: use the generated build script (includes -flto=thin)
@@ -63,6 +68,23 @@ ar rcs libGALE01_aot.a GALE01_*.o
 ```
 
 **Run with AOT core:** `-C Dolphin.Core.CPUCore=6`
+
+### Multi-Game AOT
+
+Multiple AOT libraries can be linked into a single Dolphin binary. Each library self-registers via `__attribute__((constructor))` at startup. At runtime, `AOTCore::Init()` reads `SConfig::GetGameID()` and selects the matching dispatch table from the `AotRegistry`. If no AOT library exists for the loaded game, it falls back to the interpreter.
+
+```bash
+# Build AOT libraries for each game independently (phases 1-4)
+# Then link them all together:
+cmake .. -DENABLE_LTO=ON \
+  -DAOT_STATIC_LIBS="/path/to/libGALE01_aot.a;/path/to/libGZLE01_aot.a;/path/to/libGMPE01_aot.a"
+make -j$(sysctl -n hw.ncpu) dolphin-emu
+
+# Dolphin auto-selects the right AOT backend per game:
+./dolphin-emu -e ssbm.iso -C Dolphin.Core.CPUCore=6   # uses GALE01 AOT
+./dolphin-emu -e zelda.iso -C Dolphin.Core.CPUCore=6   # uses GZLE01 AOT
+./dolphin-emu -e other.iso -C Dolphin.Core.CPUCore=6   # no AOT → interpreter fallback
+```
 
 ## Code Formatting
 
@@ -81,6 +103,7 @@ ar rcs libGALE01_aot.a GALE01_*.o
 Source/Core/Core/PowerPC/
   TraceCollector.{h,cpp}     — Phase 1: hooks into JitArm64, records blocks/edges/SMC
   AOTCore.{h,cpp}            — CPUCoreBase impl (CPUCore::AOT=6), dispatch loop, diff harness
+  AotRegistry.{h,cpp}        — Multi-game registry: maps game_id → dispatch/lookup function pointers
   AotRuntime.cpp             — extern "C" helpers called by generated C (memory, FP, SPR, cache)
   MMIOCapture.h              — MMIO write tracking for diff harness
 
@@ -102,10 +125,12 @@ Source/Core/Core/PowerPC/PowerPC.{h,cpp} — CPUCore enum (AOT=6), InitializeCPU
 
 ### Dispatch
 
-- O(1) flat lookup: `GALE01_fast_table[(pc - TABLE_BASE) >> 2]`
+- O(1) flat lookup: `{PREFIX}_fast_table[(pc - TABLE_BASE) >> 2]`
 - NULL entries fall back to `aot_interpreter_single_step()` (one PPC instruction via interpreter)
 - Known static targets use direct C tail calls between blocks
 - Downcount check before chaining: `if (s->downcount <= 0) { s->pc = TARGET; return; }`
+- Each game's dispatch.c includes an `__attribute__((constructor))` that registers with `AotRegistry` at startup
+- `AOTCore::Init()` queries the registry by game ID to select the correct dispatch table
 
 ### Memory Access in Runtime Helpers
 

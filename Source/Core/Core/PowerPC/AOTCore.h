@@ -25,6 +25,8 @@ struct PowerPCState;
 class Interpreter;
 struct AOTState;
 
+using AOTBlockFunc = void (*)(AOTState*);
+
 // AOT CPU core backend: executes pre-compiled C functions for translated PPC blocks.
 // Falls back to the interpreter for untranslated addresses.
 class AOTCore : public CPUCoreBase
@@ -79,8 +81,10 @@ private:
   PowerPC::PowerPCState& m_ppc_state;
 
   using DispatchFunc = void (*)(AOTState*);
+  using LookupFunc = AOTBlockFunc (*)(uint32_t);
   DispatchFunc m_dispatch = nullptr;
   DispatchFunc m_interp_dispatch = nullptr;
+  LookupFunc m_lookup_block = nullptr;
 
   // Block boundary map: ppc_addr -> num_instructions (loaded from CFG DB for diff mode)
   std::unordered_map<u32, u32> m_block_sizes;
