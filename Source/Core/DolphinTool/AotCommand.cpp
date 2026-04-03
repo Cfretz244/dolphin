@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <sys/stat.h>
 #include <iostream>
 #include <map>
 #include <set>
@@ -494,7 +495,32 @@ int AotCommand(const std::vector<std::string>& args)
     file << "}\n";
   }
 
-  // 6. Report results
+  // 6. Emit build script with LTO support
+  {
+    std::string build_script = fmt::format("{}/build.sh", output_dir);
+    std::ofstream script(build_script);
+    script << "#!/bin/bash\n";
+    script << "set -e\n";
+    script << "cd \"$(dirname \"$0\")\"\n";
+    script << fmt::format("PREFIX=\"{}\"\n", prefix);
+    script << "CFLAGS=\"-O2 -flto=thin -arch arm64\"\n\n";
+    script << "echo \"Compiling AOT blocks with LTO...\"\n";
+    script << "for f in ${PREFIX}_*.c; do\n";
+    script << "    clang -c $CFLAGS -I. \"$f\" -o \"${f%.c}.o\" &\n";
+    script << "done\n";
+    script << "wait\n\n";
+    script << "echo \"Creating static library...\"\n";
+    script << "ar rcs lib${PREFIX}_aot.a ${PREFIX}_*.o\n\n";
+    script << "echo \"Done: lib${PREFIX}_aot.a\"\n";
+    script << "echo \"Rebuild Dolphin with LTO:\"\n";
+    script << "echo \"  cmake .. -DENABLE_LTO=ON"
+              " -DAOT_STATIC_LIB=$(pwd)/lib${PREFIX}_aot.a\"\n";
+    script.close();
+    chmod(build_script.c_str(), 0755);
+    fmt::println(std::cerr, "  Build script: {}", build_script);
+  }
+
+  // 7. Report results
   fmt::println(std::cerr, "Results:");
   fmt::println(std::cerr, "  Translated: {} blocks", translated);
   fmt::println(std::cerr, "  Skipped (SMC): {} blocks", skipped);
