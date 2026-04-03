@@ -373,6 +373,7 @@ extern const Info<u32> MAIN_DEBUG_AOT_DIFF_MAX_BLOCKS;
 extern const Info<u32> MAIN_DEBUG_AOT_DIFF_MAX_DIVERGENCES;
 extern const Info<u32> MAIN_DEBUG_AOT_DIFF_FILTER_MIN;
 extern const Info<u32> MAIN_DEBUG_AOT_DIFF_FILTER_MAX;
+extern const Info<std::string> MAIN_DEBUG_AOT_DIFF_SAVESTATE_PATH;
 
 // Main.BluetoothPassthrough
 

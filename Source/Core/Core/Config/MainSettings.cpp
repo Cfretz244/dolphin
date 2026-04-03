@@ -586,6 +586,8 @@ const Info<u32> MAIN_DEBUG_AOT_DIFF_MAX_DIVERGENCES{{System::Main, "Debug", "AOT
 const Info<u32> MAIN_DEBUG_AOT_DIFF_FILTER_MIN{{System::Main, "Debug", "AOTDiffFilterMin"}, 0};
 const Info<u32> MAIN_DEBUG_AOT_DIFF_FILTER_MAX{{System::Main, "Debug", "AOTDiffFilterMax"},
                                                0xFFFFFFFF};
+const Info<std::string> MAIN_DEBUG_AOT_DIFF_SAVESTATE_PATH{
+    {System::Main, "Debug", "AOTDiffSavestatePath"}, ""};
 
 // Main.BluetoothPassthrough
 

@@ -437,48 +437,8 @@ void aot_cr_logical(AOTState* s, int crbD, int crbA, int crbB, const char* op)
 
 uint64_t aot_convert_to_double(uint32_t single_bits)
 {
-  // Use Dolphin's ConvertToDouble from PairedSingle
-  double result;
-  // IEEE 754 single → double conversion via bit manipulation
-  u32 sign = (single_bits >> 31) & 1;
-  u32 exp = (single_bits >> 23) & 0xFF;
-  u32 frac = single_bits & 0x7FFFFF;
-
-  u64 double_bits;
-  if (exp == 0 && frac == 0)
-  {
-    // Zero
-    double_bits = static_cast<u64>(sign) << 63;
-  }
-  else if (exp == 0)
-  {
-    // Denormal — normalize it
-    u32 e = 0;
-    while (!(frac & 0x800000))
-    {
-      frac <<= 1;
-      e++;
-    }
-    frac &= 0x7FFFFF;
-    double_bits = (static_cast<u64>(sign) << 63) |
-                  (static_cast<u64>(0x3FF - 0x7F - e + 1) << 52) |
-                  (static_cast<u64>(frac) << 29);
-  }
-  else if (exp == 0xFF)
-  {
-    // Inf or NaN
-    double_bits = (static_cast<u64>(sign) << 63) | (0x7FFULL << 52) |
-                  (static_cast<u64>(frac) << 29);
-  }
-  else
-  {
-    // Normal
-    double_bits = (static_cast<u64>(sign) << 63) |
-                  (static_cast<u64>(exp - 0x7F + 0x3FF) << 52) |
-                  (static_cast<u64>(frac) << 29);
-  }
-
-  return double_bits;
+  // Use Dolphin's exact ConvertToDouble implementation (Gekko-accurate bit manipulation)
+  return ConvertToDouble(single_bits);
 }
 
 uint32_t aot_convert_to_single(uint64_t double_bits)

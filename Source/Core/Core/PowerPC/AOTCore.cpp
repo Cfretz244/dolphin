@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include <fmt/format.h>
+#include <sqlite3.h>
 
 #include "Common/ChunkFile.h"
 #include "Common/CommonTypes.h"
@@ -24,6 +25,7 @@
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/HW/VideoInterface.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
+#include "Core/State.h"
 #include "VideoCommon/CommandProcessor.h"
 #include "Core/PowerPC/MMIOCapture.h"
 #include "Core/PowerPC/MMU.h"
@@ -84,6 +86,16 @@ static_assert(offsetof(PowerPC::PowerPCState, xer_ca) == offsetof(AOTState, xer_
               "xer_ca offset mismatch");
 static_assert(offsetof(PowerPC::PowerPCState, spr) == offsetof(AOTState, spr),
               "spr offset mismatch");
+static_assert(offsetof(PowerPC::PowerPCState, ps) == offsetof(AOTState, ps),
+              "ps offset mismatch");
+static_assert(offsetof(PowerPC::PowerPCState, cr) == offsetof(AOTState, cr_fields),
+              "cr offset mismatch");
+static_assert(offsetof(PowerPC::PowerPCState, msr) == offsetof(AOTState, msr),
+              "msr offset mismatch");
+static_assert(offsetof(PowerPC::PowerPCState, Exceptions) == offsetof(AOTState, exceptions),
+              "exceptions offset mismatch");
+static_assert(offsetof(PowerPC::PowerPCState, fpscr) == offsetof(AOTState, fpscr),
+              "fpscr offset mismatch");
 
 // The AOT dispatch function — defined in the pre-compiled AOT static library.
 // This symbol is resolved at link time.
@@ -129,19 +141,21 @@ void AOTCore::Init()
   m_interp_dispatch = &interp_only_dispatch;
   INFO_LOG_FMT(POWERPC, "AOTCore: Initialized with GALE01 dispatch table");
 
+  // Load block sizes if available (needed for both diff mode and compare mode)
+  if (!s_diff_block_sizes.empty())
+  {
+    m_block_sizes = s_diff_block_sizes;  // copy, not move — may be reused
+    INFO_LOG_FMT(POWERPC, "AOTCore: Loaded {} block boundaries", m_block_sizes.size());
+  }
+
   // Load diff mode settings
   if (Config::Get(Config::MAIN_DEBUG_AOT_DIFF_MODE))
   {
-    // Block sizes are loaded by DiffCommand before boot via SetDiffBlockSizes()
-    m_block_sizes = std::move(s_diff_block_sizes);
     if (m_block_sizes.empty())
     {
       ERROR_LOG_FMT(POWERPC, "AOTDiff: No block sizes loaded — call SetDiffBlockSizes() before boot");
       return;
     }
-
-    INFO_LOG_FMT(POWERPC, "AOTDiff: Loaded {} block boundaries from CFG DB",
-                 m_block_sizes.size());
 
     // Allocate RAM shadow buffers for RAM comparison
     const u32 ram_size = m_system.GetMemory().GetRamSizeReal();
@@ -151,6 +165,38 @@ void AOTCore::Init()
     // Allocate full state buffer for HW state save/restore (used for MMIO blocks)
     // Initial size estimate — will grow if needed
     m_state_buffer.resize(64 * 1024 * 1024);  // 64 MB should be plenty
+  }
+
+  // AOT_COMPARE mode: load block sizes from CFG DB if not already loaded
+  if (m_block_sizes.empty() && std::getenv("AOT_COMPARE"))
+  {
+    const std::string cfg_path = Config::Get(Config::MAIN_DEBUG_AOT_CFG_DB_PATH);
+    if (!cfg_path.empty())
+    {
+      sqlite3* db = nullptr;
+      if (sqlite3_open_v2(cfg_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK)
+      {
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql = "SELECT ppc_addr, num_instructions FROM blocks WHERE is_translatable = 1";
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK)
+        {
+          while (sqlite3_step(stmt) == SQLITE_ROW)
+          {
+            u32 addr = static_cast<u32>(sqlite3_column_int64(stmt, 0));
+            u32 num_instr = static_cast<u32>(sqlite3_column_int64(stmt, 1));
+            m_block_sizes[addr] = num_instr;
+          }
+          sqlite3_finalize(stmt);
+        }
+        sqlite3_close(db);
+        INFO_LOG_FMT(POWERPC, "AOT_COMPARE: Loaded {} block boundaries from {}",
+                     m_block_sizes.size(), cfg_path);
+      }
+    }
+    else
+    {
+      WARN_LOG_FMT(POWERPC, "AOT_COMPARE: Set -C Dolphin.Debug.AOTCfgDbPath=<path> for block sizes");
+    }
   }
 }
 
@@ -175,27 +221,235 @@ void AOTCore::Run()
   auto& core_timing = m_system.GetCoreTiming();
   auto& cpu = m_system.GetCPU();
   auto& power_pc = m_system.GetPowerPC();
+  auto& interp = m_system.GetInterpreter();
 
   // AOT_INTERP_ONLY=1 bypasses all AOT blocks (for testing)
-  auto* active_dispatch = std::getenv("AOT_INTERP_ONLY") ? m_interp_dispatch : m_dispatch;
+  const bool interp_only = std::getenv("AOT_INTERP_ONLY") != nullptr;
+  auto* active_dispatch = interp_only ? m_interp_dispatch : m_dispatch;
+
+  // AOT_LOAD_STATE=/path/to/save.sav loads a savestate after boot, before main loop.
+  const char* load_state_path = std::getenv("AOT_LOAD_STATE");
+  if (load_state_path)
+  {
+    // Wait for boot to complete (a few frames) before loading
+    for (int warmup = 0; warmup < 10 && cpu.GetState() == CPU::State::Running; warmup++)
+    {
+      m_ppc_state.npc = m_ppc_state.pc;
+      core_timing.Advance();
+      do {
+        auto* ast = reinterpret_cast<AOTState*>(&m_ppc_state);
+        m_interp_dispatch(ast);
+        if (m_ppc_state.Exceptions != 0) { m_ppc_state.npc = m_ppc_state.pc; power_pc.CheckExceptions(); }
+      } while (m_ppc_state.downcount > 0 && cpu.GetState() == CPU::State::Running);
+    }
+    fmt::print(stderr, "AOT_LOAD_STATE: Loading {}...\n", load_state_path);
+    State::LoadAs(m_system, std::string(load_state_path));
+    fmt::print(stderr, "AOT_LOAD_STATE: Loaded, PC={:#010x}\n", m_ppc_state.pc);
+  }
+
+  // AOT_SWITCH_AT=N runs interpreter for first N dispatches, then switches to AOT.
+  // Use with savestates to binary-search for the block that causes camera issues.
+  const char* switch_at_str = std::getenv("AOT_SWITCH_AT");
+  const u64 switch_at = switch_at_str ? std::strtoull(switch_at_str, nullptr, 10) : 0;
+  u64 dispatch_count = 0;
+  bool switched = false;
+  if (switch_at > 0)
+  {
+    active_dispatch = m_interp_dispatch;
+    fmt::print(stderr, "AOT_SWITCH_AT={}: starting with interpreter, switching to AOT after {} dispatches\n",
+               switch_at, switch_at);
+  }
+
+  // AOT_DUMP_FRAME=<file> dumps 24MB RAM after the first complete frame, then exits.
+  // Use with AOT_LOAD_STATE to compare one frame of AOT vs INTERP_ONLY.
+  const char* dump_frame_path = std::getenv("AOT_DUMP_FRAME");
+  bool dump_waiting = (dump_frame_path != nullptr);
+  u32 last_vi_count = 0;
+  if (dump_waiting)
+  {
+    last_vi_count = m_system.GetVideoInterface().GetXFBAddressTop();  // just a proxy for "frame changed"
+    fmt::print(stderr, "AOT_DUMP_FRAME: Will dump RAM after first VI frame to {}\n", dump_frame_path);
+  }
+
+  // AOT_LOG_PC=<file> logs every dispatch PC to a file for diffing between modes.
+  // Run once with AOT, once with AOT_INTERP_ONLY=1, diff the files.
+  const char* log_pc_path = std::getenv("AOT_LOG_PC");
+  FILE* pc_log = nullptr;
+  u64 pc_log_count = 0;
+  constexpr u64 PC_LOG_MAX = 5000000;  // Cap at 5M entries (~40MB file)
+  if (log_pc_path)
+  {
+    pc_log = std::fopen(log_pc_path, "w");
+    if (pc_log)
+      fmt::print(stderr, "AOT_LOG_PC: Logging dispatch PCs to {} (max {})\n", log_pc_path, PC_LOG_MAX);
+  }
+
+  // AOT_COMPARE=1 enables inline per-block comparison in the live Run() loop.
+  // Uses the real video backend, so savestates and VI interrupts work normally.
+  // Reports the first divergence found, then continues with AOT execution.
+  const bool compare_mode = !interp_only && std::getenv("AOT_COMPARE") != nullptr;
+  bool found_divergence = false;
+  u64 compare_count = 0;
+  auto& memory = m_system.GetMemory();
+  const u32 ram_size = memory.GetRamSizeReal();
+  u8* compare_ram_shadow = nullptr;
+  if (compare_mode)
+  {
+    compare_ram_shadow = static_cast<u8*>(std::malloc(ram_size));
+    fmt::print(stderr, "AOT_COMPARE: Active, {} block sizes loaded, {}MB RAM shadow\n",
+               m_block_sizes.size(), ram_size / (1024 * 1024));
+  }
 
   while (cpu.GetState() == CPU::State::Running)
   {
     m_ppc_state.npc = m_ppc_state.pc;
     core_timing.Advance();
 
+    // Check if a VI frame just completed (for AOT_DUMP_FRAME)
+    if (dump_waiting)
+    {
+      u32 cur_vi = m_system.GetVideoInterface().GetXFBAddressTop();
+      if (cur_vi != last_vi_count && cur_vi != 0)
+      {
+        last_vi_count = cur_vi;
+        u8* ram = memory.GetRAM();
+        FILE* df = std::fopen(dump_frame_path, "wb");
+        if (df)
+        {
+          std::fwrite(ram, 1, ram_size, df);
+          std::fclose(df);
+          fmt::print(stderr, "AOT_DUMP_FRAME: Dumped {} bytes to {}, PC={:#010x}\n",
+                     ram_size, dump_frame_path, m_ppc_state.pc);
+        }
+        dump_waiting = false;
+      }
+    }
+
     do
     {
       auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
-      active_dispatch(aot_state);
+
+      u32 pre_dispatch_pc = m_ppc_state.pc;
+
+      if (compare_mode && !found_divergence)
+      {
+        // Try to compare this block: AOT vs interpreter
+        AOTBlockFunc aot_fn = GALE01_lookup_block(m_ppc_state.pc);
+        u32 block_pc = m_ppc_state.pc;
+
+        if (aot_fn && m_block_sizes.count(block_pc))
+        {
+          u32 num_instr = m_block_sizes[block_pc];
+
+          // Skip MMIO/gather-pipe blocks — running both paths would
+          // double-send GPU commands and corrupt rendering
+          PPCSnapshot pre_check;
+          CaptureSnapshot(pre_check);
+          if (BlockAccessesMMIO(pre_check, block_pc, num_instr) ||
+              BlockReadsTimebase(block_pc, num_instr))
+          {
+            // Run normally through AOT, no comparison for MMIO/timebase blocks
+            s32 saved_dc2 = m_ppc_state.downcount;
+            m_ppc_state.downcount = static_cast<s32>(num_instr);
+            aot_single_block_mode = 1;
+            aot_fn(aot_state);
+            aot_single_block_mode = 0;
+            m_ppc_state.downcount = saved_dc2 - static_cast<s32>(num_instr);
+          }
+          else
+          {
+
+          compare_count++;
+
+          // Save pre-state (registers + RAM)
+          PPCSnapshot pre, aot_result, interp_result;
+          pre = pre_check;
+          u8* ram = memory.GetRAM();
+          std::memcpy(compare_ram_shadow, ram, ram_size);
+
+          // Run AOT single block
+          s32 saved_dc = m_ppc_state.downcount;
+          m_ppc_state.downcount = static_cast<s32>(num_instr);
+          aot_single_block_mode = 1;
+          aot_fn(aot_state);
+          aot_single_block_mode = 0;
+          CaptureSnapshot(aot_result);
+
+          // Restore pre-state (registers AND RAM)
+          RestoreSnapshot(pre);
+          std::memcpy(ram, compare_ram_shadow, ram_size);
+
+          // Run interpreter for the same block (ignore exceptions to match AOT's
+          // behavior of executing the full block before checking exceptions)
+          m_ppc_state.downcount = static_cast<s32>(num_instr);
+          RunInterpreterBlock(interp, block_pc, num_instr, /*ignore_exceptions=*/true);
+          CaptureSnapshot(interp_result);
+
+          // Compare register results
+          if (!CompareSnapshots(aot_result, interp_result, block_pc, stderr))
+          {
+            found_divergence = true;
+            fmt::print(stderr, "\n=== AOT_COMPARE: First divergence at block {:#010x} "
+                       "(after {} comparisons) ===\n", block_pc, compare_count);
+            LogDivergence(block_pc, num_instr, pre, aot_result, interp_result, stderr);
+            fmt::print(stderr, "=== Continuing with interpreter result ===\n\n");
+          }
+          else
+          {
+            // Both agree — continue with interpreter result state
+          }
+
+          m_ppc_state.downcount = saved_dc - static_cast<s32>(num_instr);
+
+          if (compare_count % 10000 == 0)
+            fmt::print(stderr, "AOT_COMPARE: {} blocks compared, 0 divergences, PC={:#010x}\n",
+                       compare_count, m_ppc_state.pc);
+          }  // end else (non-MMIO comparison)
+        }  // end if (aot_fn && block_sizes)
+        else
+        {
+          // No AOT block or no size info — run through normal dispatch
+          active_dispatch(aot_state);
+        }
+      }
+      else
+      {
+        active_dispatch(aot_state);
+      }
+
+      if (switch_at > 0 && !switched)
+      {
+        dispatch_count++;
+        if (dispatch_count >= switch_at)
+        {
+          switched = true;
+          active_dispatch = m_dispatch;
+          fmt::print(stderr, "AOT_SWITCH_AT: Switched to AOT at dispatch #{}, PC={:#010x}\n",
+                     dispatch_count, m_ppc_state.pc);
+        }
+      }
 
       if (m_ppc_state.Exceptions != 0)
       {
         m_ppc_state.npc = m_ppc_state.pc;
         power_pc.CheckExceptions();
       }
+
+      if (pc_log && pc_log_count < PC_LOG_MAX)
+      {
+        // Log: pre-dispatch PC → post-dispatch PC (shows block execution as one line)
+        fmt::print(pc_log, "{:08x} {:08x}\n", pre_dispatch_pc, m_ppc_state.pc);
+        pc_log_count++;
+        if (pc_log_count == PC_LOG_MAX)
+        {
+          std::fflush(pc_log); std::fclose(pc_log); pc_log = nullptr;
+          fmt::print(stderr, "AOT_LOG_PC: Reached {} entries, log closed\n", PC_LOG_MAX);
+        }
+      }
     } while (m_ppc_state.downcount > 0 && cpu.GetState() == CPU::State::Running);
   }
+
+  std::free(compare_ram_shadow);
 }
 
 void AOTCore::SingleStep()
@@ -551,6 +805,18 @@ void AOTCore::RunDiff()
   fmt::print(log, "Block boundaries loaded: {}\n", m_block_sizes.size());
   fmt::print(log, "RAM size: {} MB\n\n", ram_size / (1024 * 1024));
   std::fflush(log);
+
+  // Load savestate if specified — allows comparing battle code, not just boot code
+  const std::string savestate_path = Config::Get(Config::MAIN_DEBUG_AOT_DIFF_SAVESTATE_PATH);
+  if (!savestate_path.empty())
+  {
+    fmt::print(log, "Loading savestate: {}\n", savestate_path);
+    std::fflush(log);
+    // State::LoadAs auto-detects CPU thread and executes synchronously
+    State::LoadAs(m_system, savestate_path);
+    fmt::print(log, "Savestate loaded. PC = {:#010x}\n\n", m_ppc_state.pc);
+    std::fflush(log);
+  }
 
   while (cpu.GetState() == CPU::State::Running && !s_shutdown_requested.load())
   {

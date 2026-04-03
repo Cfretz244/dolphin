@@ -454,9 +454,9 @@ bool AOTCEmitter::EmitTable19(std::string& out, UGeckoInstruction inst, u32 pc)
   case 33:  EmitCrLogical(out, inst, "~|"); return true; // crnor
   case 129: EmitCrLogical(out, inst, "&~"); return true; // crandc
   case 225: EmitCrLogical(out, inst, "~&"); return true; // crnand
+  case 193: EmitCrLogical(out, inst, "^"); return true;  // crxor
   case 257: EmitCrLogical(out, inst, "&"); return true;  // crand
   case 289: EmitCrLogical(out, inst, "~^"); return true; // creqv (XNOR)
-  case 385: EmitCrLogical(out, inst, "^"); return true;  // crxor
   case 417: EmitCrLogical(out, inst, "|~"); return true; // crorc
   case 449: EmitCrLogical(out, inst, "|"); return true;  // cror
   case 150: return true; // isync (no-op)
@@ -1112,11 +1112,8 @@ bool AOTCEmitter::EmitTable63(std::string& out, UGeckoInstruction inst, u32 pc)
   case 64:  // mcrfs
     out += fmt::format("    aot_mcrfs(s,{},{});\n", I(inst.CRFD), I(inst.CRFS));
     return true;
-  case 26:  // frsqrtex
+  case 26:  // frsqrtex (also SUBOP5=26, caught here first)
     out += fmt::format("    aot_frsqrtex(s,{},{});\n", fd, fb);
-    return true;
-  case 846: // fselx
-    out += fmt::format("    aot_fselx(s,{},{},{},{});\n", fd, fa, fc, fb);
     return true;
   default:
     break;
@@ -1126,6 +1123,7 @@ bool AOTCEmitter::EmitTable63(std::string& out, UGeckoInstruction inst, u32 pc)
   switch (I(inst.SUBOP5))
   {
   case 18: out += fmt::format("    aot_fdivx(s,{},{},{});\n", fd, fa, fb); return true;
+  case 23: out += fmt::format("    aot_fselx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 20: out += fmt::format("    aot_fsubx(s,{},{},{});\n", fd, fa, fb); return true;
   case 21: out += fmt::format("    aot_faddx(s,{},{},{});\n", fd, fa, fb); return true;
   case 25: out += fmt::format("    aot_fmulx(s,{},{},{});\n", fd, fa, fc); return true;

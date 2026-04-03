@@ -99,6 +99,11 @@ int DiffCommand(const std::vector<std::string>& args)
       .set_default("0")
       .help("Also diff RAM contents after each block (3 copies of 24MB)");
 
+  parser.add_option("--savestate")
+      .action("store")
+      .metavar("<path>")
+      .help("Load a savestate after boot before starting comparison");
+
   const optparse::Values options = parser.parse_args(args);
 
   const std::string iso_path = options["iso"];
@@ -160,6 +165,10 @@ int DiffCommand(const std::vector<std::string>& args)
   const std::string log_path = options["log"];
   if (!log_path.empty())
     Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_LOG_PATH, log_path);
+
+  const std::string savestate_path = options["savestate"];
+  if (!savestate_path.empty())
+    Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_SAVESTATE_PATH, savestate_path);
 
   // Load block sizes from CFG database and pass to AOTCore
   {
