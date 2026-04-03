@@ -691,6 +691,7 @@ std::string GetBundleDirectory()
   //
   // The headers can be found under "Security" on opensource.apple.com:
   // Security/OSX/libsecurity_translocate/lib/SecTranslocate.h
+#if TARGET_OS_OSX
   if (!s_security_framework.IsOpen())
   {
     s_security_framework.Open("/System/Library/Frameworks/Security.framework/Security");
@@ -707,6 +708,7 @@ std::string GetBundleDirectory()
     CFRelease(bundle_ref);
     bundle_ref = untranslocated_ref;
   }
+#endif
 
   char app_bundle_path[MAXPATHLEN];
   CFStringRef bundle_path = CFURLCopyFileSystemPath(bundle_ref, kCFURLPOSIXPathStyle);
