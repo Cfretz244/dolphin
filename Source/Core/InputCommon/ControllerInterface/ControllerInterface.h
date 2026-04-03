@@ -99,6 +99,7 @@ public:
   // Without this, our devices list might end up in a mixed state.
   void PlatformPopulateDevices(std::function<void()> callback);
   bool IsInit() const { return m_is_init; }
+  void ForceSetInit() { m_is_init = true; }  // iOS: skip Initialize() which needs Quartz
   void UpdateInput();
 
   // Set adjustment from the full render window aspect-ratio to the drawn aspect-ratio.
