@@ -8,6 +8,7 @@
 
 #include "AudioCommon/AlsaSoundStream.h"
 #include "AudioCommon/CubebStream.h"
+#include "AudioCommon/DeltaSoundStream.h"
 #include "AudioCommon/Mixer.h"
 #include "AudioCommon/NullSoundStream.h"
 #include "AudioCommon/OpenALStream.h"
@@ -42,6 +43,8 @@ static std::unique_ptr<SoundStream> CreateSoundStreamForBackend(std::string_view
     return std::make_unique<OpenSLESStream>();
   else if (backend == BACKEND_WASAPI && WASAPIStream::IsValid())
     return std::make_unique<WASAPIStream>();
+  else if (backend == BACKEND_DELTA && DeltaSoundStream::IsValid())
+    return std::make_unique<DeltaSoundStream>();
   return {};
 }
 
@@ -96,6 +99,8 @@ std::string GetDefaultSoundBackend()
 {
 #if defined(ANDROID)
   return BACKEND_OPENSLES;
+#elif defined(HAVE_DELTA_AUDIO)
+  return BACKEND_DELTA;
 #else
   if (CubebStream::IsValid())
     return BACKEND_CUBEB;
@@ -131,6 +136,8 @@ std::vector<std::string> GetSoundBackends()
     backends.emplace_back(BACKEND_OPENSLES);
   if (WASAPIStream::IsValid())
     backends.emplace_back(BACKEND_WASAPI);
+  if (DeltaSoundStream::IsValid())
+    backends.emplace_back(BACKEND_DELTA);
 
   return backends;
 }

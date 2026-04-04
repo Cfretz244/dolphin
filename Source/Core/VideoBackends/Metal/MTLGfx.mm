@@ -18,6 +18,43 @@
 
 #include <fstream>
 
+static std::function<void(id<MTLTexture>)> s_frame_capture_callback;
+
+void Metal::Gfx::SetFrameCaptureCallback(std::function<void(id<MTLTexture>)> callback)
+{
+  s_frame_capture_callback = std::move(callback);
+}
+
+// C-linkage API for ARC-compiled callers (avoids MRCHelpers.h include)
+static uint8_t* s_capture_buffer = nullptr;
+static bool s_capture_frame_ready = false;
+
+extern "C" void Dolphin_SetFrameCaptureBuffer(uint8_t* buffer)
+{
+  s_capture_buffer = buffer;
+  if (buffer)
+  {
+    // Non-null sentinel — actual readback happens in PresentBackbuffer()
+    // via blit encoder + shared staging buffer.
+    s_frame_capture_callback = [](id<MTLTexture>) {};
+  }
+  else
+  {
+    s_frame_capture_callback = nullptr;
+    s_capture_frame_ready = false;
+  }
+}
+
+extern "C" bool Dolphin_IsFrameReady(void)
+{
+  return s_capture_frame_ready;
+}
+
+extern "C" void Dolphin_ClearFrameReady(void)
+{
+  s_capture_frame_ready = false;
+}
+
 Metal::Gfx::Gfx(MRCOwned<CAMetalLayer*> layer) : m_layer(std::move(layer))
 {
   UpdateActiveConfig();
@@ -472,19 +509,66 @@ void Metal::Gfx::PresentBackbuffer()
     g_state_tracker->EndRenderPass();
     if (m_drawable)
     {
-      // PresentDrawable refuses to allow Dolphin to present faster than the display's refresh rate
-      // when windowed (or fullscreen with vsync enabled, but that's more understandable).
-      // On the other hand, it helps Xcode's GPU captures start and stop on frame boundaries
-      // which is convenient.  Put it here as a default-off config, which we can override in Xcode.
-      // It also seems to improve frame pacing, so enable it by default with vsync
-      if (g_ActiveConfig.iUsePresentDrawable == TriState::On ||
-          (g_ActiveConfig.iUsePresentDrawable == TriState::Auto && g_ActiveConfig.bVSyncActive))
-        [g_state_tracker->GetRenderCmdBuf() presentDrawable:m_drawable];
+      if (s_frame_capture_callback)
+      {
+        // Offscreen capture path: blit drawable texture into a shared-memory staging
+        // buffer, commit + wait for GPU, then memcpy to the capture buffer.
+        // Previous approach called [texture getBytes:] before the command buffer was
+        // committed, which is undefined (texture data not yet rendered by GPU).
+        id<MTLTexture> tex = [m_drawable texture];
+        int w = (int)tex.width;
+        int h = (int)tex.height;
+        size_t bytes_per_row = w * 4;
+        size_t buffer_size = bytes_per_row * h;
+
+        // Lazy-allocate (or reallocate if size changed) the shared staging buffer
+        if (!m_capture_staging_buffer || [m_capture_staging_buffer length] < buffer_size)
+        {
+          m_capture_staging_buffer =
+              MRCTransfer([g_device newBufferWithLength:buffer_size
+                                               options:MTLResourceStorageModeShared]);
+        }
+
+        // Blit drawable texture → staging buffer (same pattern as StagingTexture::CopyFromTexture)
+        id<MTLBlitCommandEncoder> blit =
+            [g_state_tracker->GetRenderCmdBuf() blitCommandEncoder];
+        [blit copyFromTexture:tex
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(w, h, 1)
+                     toBuffer:m_capture_staging_buffer
+            destinationOffset:0
+       destinationBytesPerRow:bytes_per_row
+     destinationBytesPerImage:buffer_size];
+        [blit endEncoding];
+
+        m_backbuffer->UpdateBackbufferTexture(nullptr);
+        g_state_tracker->FlushEncoders();
+        g_state_tracker->WaitForFlushedEncoders();
+
+        // GPU is done — staging buffer now has the rendered frame
+        if (s_capture_buffer && w > 0 && h > 0)
+        {
+          memcpy(s_capture_buffer, [m_capture_staging_buffer contents], buffer_size);
+          s_capture_frame_ready = true;
+        }
+
+        m_drawable = nullptr;
+        return;
+      }
       else
-        [g_state_tracker->GetRenderCmdBuf()
-            addScheduledHandler:[drawable = std::move(m_drawable)](id) { [drawable present]; }];
-      m_backbuffer->UpdateBackbufferTexture(nullptr);
-      m_drawable = nullptr;
+      {
+        // Normal on-screen present path
+        if (g_ActiveConfig.iUsePresentDrawable == TriState::On ||
+            (g_ActiveConfig.iUsePresentDrawable == TriState::Auto && g_ActiveConfig.bVSyncActive))
+          [g_state_tracker->GetRenderCmdBuf() presentDrawable:m_drawable];
+        else
+          [g_state_tracker->GetRenderCmdBuf()
+              addScheduledHandler:[drawable = std::move(m_drawable)](id) { [drawable present]; }];
+        m_backbuffer->UpdateBackbufferTexture(nullptr);
+        m_drawable = nullptr;
+      }
     }
     g_state_tracker->FlushEncoders();
   }
