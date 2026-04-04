@@ -83,6 +83,15 @@ if(WIN32)
   )
 endif()
 
+if(DOLPHIN_IOS_BUILD)
+  message(STATUS "Delta audio backend enabled for iOS build")
+  target_sources(audiocommon PRIVATE
+    DeltaSoundStream.cpp
+    DeltaSoundStream.h
+  )
+  target_compile_definitions(audiocommon PRIVATE HAVE_DELTA_AUDIO=1)
+endif()
+
 target_link_libraries(audiocommon
 PUBLIC
   common
