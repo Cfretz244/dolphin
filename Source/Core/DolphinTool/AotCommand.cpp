@@ -613,18 +613,13 @@ int AotCommand(const std::vector<std::string>& args)
     header << AOT_RUNTIME_HEADER;
   }
 
-  // 4. Translate blocks, grouped by PPC function for I-cache locality
+  // 4. Translate blocks, split into files by address range (64KB granularity)
   AOTCEmitter emitter(memory, known_blocks, prefix);
 
-  // Group blocks by function address (blocks in the same PPC function are
-  // neighbors in the binary, improving spatial I-cache locality).
-  // Blocks without a function assignment fall back to address-based grouping.
+  // Group blocks by high 16 bits of address
   std::map<u32, std::vector<const CFGBlockInfo*>> groups;
   for (const auto& b : cfg_blocks)
-  {
-    u32 group_key = b.function_addr ? b.function_addr : (b.ppc_addr & 0xFFFF0000u);
-    groups[group_key].push_back(&b);
-  }
+    groups[b.ppc_addr >> 16].push_back(&b);
 
   // Write forward declarations header
   // Interior chain blocks have no standalone function — only chain heads get declarations.
@@ -648,7 +643,7 @@ int AotCommand(const std::vector<std::string>& args)
   for (const auto& [group_key, group_blocks] : groups)
   {
     std::string filename =
-        fmt::format("{}/{}_blocks_{:08x}.c", output_dir, prefix, group_key);
+        fmt::format("{}/{}_blocks_{:04x}.c", output_dir, prefix, group_key);
     std::ofstream file(filename);
     file << "#include \"aot_runtime.h\"\n";
     file << fmt::format("#include \"{}_forward_decls.h\"\n\n", prefix);
