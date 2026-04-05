@@ -24,7 +24,14 @@ public:
   AOTCEmitter(const PPCMemoryImage& memory, std::set<u32> known_blocks, std::string prefix);
 
   // Translate a single block. Returns the C function body as a string.
-  std::string TranslateBlock(u32 block_addr, u32 num_instructions);
+  // If from_trace is true, the block was observed during trace collection (hot).
+  std::string TranslateBlock(u32 block_addr, u32 num_instructions, bool from_trace = true);
+
+  // Translate a merged chain of blocks as a single C function.
+  // The function is named after the chain head. Interior blocks become
+  // inline fall-through code with no function call overhead.
+  std::string TranslateMergedChain(const std::vector<std::pair<u32, u32>>& blocks,
+                                   bool from_trace = true);
 
   // Get the set of unhandled opcodes encountered during translation.
   const std::map<std::string, u32>& GetUnhandledOpcodes() const { return m_unhandled_opcodes; }
@@ -132,13 +139,23 @@ private:
   void EmitUpdateCR0(std::string& out, const char* result_expr);
   void EmitSetCarry(std::string& out, const char* expr);
   void EmitOECheck(std::string& out, const char* a, const char* b, const char* result);
-  void EmitBranchTo(std::string& out, u32 target);
+  void EmitBranchTo(std::string& out, u32 target, u32 current_pc);
   void EmitIndirectDispatch(std::string& out);
+
+  // Merge context: active when translating a merged chain.
+  // Branch emitters check this to emit fall-through instead of function calls.
+  struct MergeContext
+  {
+    bool active = false;
+    u32 next_block_in_chain = 0;  // the block that follows the current one in the chain
+    u32 cumulative_cycles = 0;    // accumulated cycle count for downcount at exit
+  };
 
   const PPCMemoryImage& m_memory;
   std::set<u32> m_known_blocks;
   std::string m_prefix;
   u32 m_block_cycle_count = 0;
+  MergeContext m_merge_ctx;
   std::map<std::string, u32> m_unhandled_opcodes;
 };
 

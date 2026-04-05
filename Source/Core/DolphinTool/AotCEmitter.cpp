@@ -23,11 +23,14 @@ AOTCEmitter::AOTCEmitter(const PPCMemoryImage& memory, std::set<u32> known_block
 {
 }
 
-std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions)
+std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bool from_trace)
 {
   std::string out;
   m_block_cycle_count = 0;
-  out += fmt::format("void {}_block_{:08x}(AOTState* s) {{\n", m_prefix, block_addr);
+  const char* section = from_trace ? "__TEXT,__aot_hot" : "__TEXT,__aot_cold";
+  out += fmt::format("__attribute__((noinline, section(\"{}\")))"
+                     " void {}_block_{:08x}(AOTState* s) {{\n",
+                     section, m_prefix, block_addr);
 
   for (u32 i = 0; i < num_instructions; i++)
   {
@@ -62,6 +65,82 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions)
   }
 
   out += "}\n";
+  return out;
+}
+
+std::string AOTCEmitter::TranslateMergedChain(const std::vector<std::pair<u32, u32>>& blocks,
+                                              bool from_trace)
+{
+  std::string out;
+  u32 head_addr = blocks[0].first;
+  const char* section = from_trace ? "__TEXT,__aot_hot" : "__TEXT,__aot_cold";
+
+  out += fmt::format("__attribute__((noinline, section(\"{}\")))"
+                     " void {}_block_{:08x}(AOTState* s) {{\n",
+                     section, m_prefix, head_addr);
+
+  m_merge_ctx.active = true;
+  m_merge_ctx.cumulative_cycles = 0;
+
+  for (size_t bi = 0; bi < blocks.size(); bi++)
+  {
+    auto [block_addr, num_instructions] = blocks[bi];
+    bool is_last_block = (bi == blocks.size() - 1);
+
+    m_block_cycle_count = 0;
+    m_merge_ctx.next_block_in_chain = is_last_block ? 0 : blocks[bi + 1].first;
+
+    for (u32 i = 0; i < num_instructions; i++)
+    {
+      u32 pc = block_addr + i * 4;
+      auto inst_word = m_memory.ReadInstruction(pc);
+      if (!inst_word)
+        break;
+
+      UGeckoInstruction inst(*inst_word);
+      const GekkoOPInfo* info = PPCTables::GetOpInfo(inst, pc);
+      if (info)
+        m_block_cycle_count += info->num_cycles;
+
+      bool is_last = (i == num_instructions - 1);
+      if (!EmitInstruction(out, inst, pc, is_last))
+      {
+        std::string opname = info ? info->opname : "unknown";
+        m_unhandled_opcodes[opname]++;
+        out += fmt::format("    s->pc = {:#010x}u; aot_interpreter_single_step(s);\n", pc);
+      }
+    }
+
+    m_merge_ctx.cumulative_cycles += m_block_cycle_count;
+
+    // Fallthrough exit for this block within the chain
+    if (!is_last_block)
+    {
+      // Periodic downcount check to prevent interrupt starvation on long chains
+      if (m_merge_ctx.cumulative_cycles >= 100)
+      {
+        u32 next_addr = blocks[bi + 1].first;
+        out += fmt::format("    s->downcount -= {};\n", m_merge_ctx.cumulative_cycles);
+        out += fmt::format("    if(s->downcount<=0){{ s->pc={:#010x}u; return; }}\n", next_addr);
+        m_merge_ctx.cumulative_cycles = 0;
+      }
+      // Otherwise just fall through to next block — no call, no downcount check
+    }
+    else
+    {
+      // Last block in chain — emit final fallthrough exit
+      u32 next_pc = block_addr + num_instructions * 4;
+      out += fmt::format("    s->downcount -= {};\n", m_merge_ctx.cumulative_cycles);
+      out += fmt::format("    s->pc = {:#010x}u;\n", next_pc);
+    }
+  }
+
+  out += "}\n";
+
+  m_merge_ctx.active = false;
+  m_merge_ctx.next_block_in_chain = 0;
+  m_merge_ctx.cumulative_cycles = 0;
+
   return out;
 }
 
@@ -659,10 +738,7 @@ void AOTCEmitter::EmitBx(std::string& out, UGeckoInstruction inst, u32 pc)
   u32 target = u32(SignExt26(inst.LI << 2));
   if (!inst.AA) target += pc;
   if (inst.LK) out += fmt::format("    s->spr[8]={:#010x}u;\n", pc + 4);
-  out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
-  out += "    if(s->downcount<=0){";
-  out += fmt::format(" s->pc={:#010x}u; return; }}\n", target);
-  EmitBranchTo(out, target);
+  EmitBranchTo(out, target, pc);
 }
 
 void AOTCEmitter::EmitBcx(std::string& out, UGeckoInstruction inst, u32 pc)
@@ -691,9 +767,7 @@ void AOTCEmitter::EmitBcx(std::string& out, UGeckoInstruction inst, u32 pc)
   }
 
   if (inst.LK) out += fmt::format("    s->spr[8]={:#010x}u;\n", pc + 4);
-  out += fmt::format("    s->downcount-={}; if(s->downcount<=0){{ s->pc={:#010x}u; return; }}\n",
-                     m_block_cycle_count, target);
-  EmitBranchTo(out, target);
+  EmitBranchTo(out, target, pc);
 
   if (!always) out += "    }\n";
   out += "    }\n";
@@ -709,7 +783,11 @@ void AOTCEmitter::EmitBcctrx(std::string& out, UGeckoInstruction inst, u32 pc)
     out += fmt::format("    if(aot_cr_get_bit(s,{})=={}) {{\n", I(inst.BI_2), (bo2>>3)&1);
   }
   if (inst.LK_3) out += fmt::format("    s->spr[8]={:#010x}u;\n", pc + 4);
-  out += fmt::format("    s->downcount-={}; s->pc=s->spr[9]&~3u;\n", m_block_cycle_count);
+  {
+    u32 cycles = m_merge_ctx.active ? m_merge_ctx.cumulative_cycles + m_block_cycle_count
+                                    : m_block_cycle_count;
+    out += fmt::format("    s->downcount-={}; s->pc=s->spr[9]&~3u;\n", cycles);
+  }
   EmitIndirectDispatch(out);
   if (!always) out += "    }\n";
   out += "    }\n";
@@ -734,7 +812,11 @@ void AOTCEmitter::EmitBclrx(std::string& out, UGeckoInstruction inst, u32 pc)
 
   out += "    uint32_t dest=s->spr[8]&~3u;\n";
   if (inst.LK_3) out += fmt::format("    s->spr[8]={:#010x}u;\n", pc + 4);
-  out += fmt::format("    s->downcount-={}; s->pc=dest;\n", m_block_cycle_count);
+  {
+    u32 cycles = m_merge_ctx.active ? m_merge_ctx.cumulative_cycles + m_block_cycle_count
+                                    : m_block_cycle_count;
+    out += fmt::format("    s->downcount-={}; s->pc=dest;\n", cycles);
+  }
   EmitIndirectDispatch(out);
 
   if (!always) out += "    }\n";
@@ -763,17 +845,50 @@ void AOTCEmitter::EmitOECheck(std::string& out, const char* a, const char* b, co
     "s->xer_so_ov=(s->xer_so_ov&0xfe)|ov; if(ov) s->xer_so_ov|=2; }}\n", a, b, result);
 }
 
-void AOTCEmitter::EmitBranchTo(std::string& out, u32 target)
+void AOTCEmitter::EmitBranchTo(std::string& out, u32 target, u32 current_pc)
 {
+  // Inside a merged chain: if the target is the next block, just fall through
+  if (m_merge_ctx.active && target == m_merge_ctx.next_block_in_chain)
+  {
+    // No function call, no downcount check — cycles are accumulated by the chain
+    return;
+  }
+
+  // Exiting a merged chain or standalone block — use accumulated cycles if in chain
+  u32 cycles = m_merge_ctx.active ? m_merge_ctx.cumulative_cycles + m_block_cycle_count
+                                  : m_block_cycle_count;
+
   if (m_known_blocks.contains(target))
-    out += fmt::format("    {}_block_{:08x}(s); return;\n", m_prefix, target);
+  {
+    if (target <= current_pc)
+    {
+      // Backward edge — must check downcount to prevent infinite loops
+      out += fmt::format("    s->downcount-={};\n", cycles);
+      out += fmt::format("    if(s->downcount<=0){{ s->pc={:#010x}u; return; }}\n", target);
+    }
+    else
+    {
+      // Forward edge — just decrement, skip the check
+      out += fmt::format("    s->downcount-={};\n", cycles);
+    }
+    out += fmt::format("    [[clang::musttail]] return {}_block_{:08x}(s);\n", m_prefix, target);
+  }
   else
-    out += fmt::format("    s->pc={:#010x}u; {}_dispatch(s); return;\n", target, m_prefix);
+  {
+    // Unknown target — always check
+    out += fmt::format("    s->downcount-={};\n", cycles);
+    out += fmt::format("    s->pc={:#010x}u; [[clang::musttail]] return {}_dispatch(s);\n", target,
+                       m_prefix);
+  }
+
+  // Reset cumulative cycles if we exit the chain via a branch
+  if (m_merge_ctx.active)
+    m_merge_ctx.cumulative_cycles = 0;
 }
 
 void AOTCEmitter::EmitIndirectDispatch(std::string& out)
 {
-  out += fmt::format("    {}_dispatch(s); return;\n", m_prefix);
+  out += fmt::format("    [[clang::musttail]] return {}_dispatch(s);\n", m_prefix);
 }
 
 // ============================================================================
@@ -1054,10 +1169,10 @@ bool AOTCEmitter::EmitTable59(std::string& out, UGeckoInstruction inst, u32 pc)
   switch (I(inst.SUBOP5))
   {
   case 18: out += fmt::format("    aot_fdivsx(s,{},{},{});\n", fd, fa, fb); return true;
-  case 20: out += fmt::format("    aot_fsubsx(s,{},{},{});\n", fd, fa, fb); return true;
-  case 21: out += fmt::format("    aot_faddsx(s,{},{},{});\n", fd, fa, fb); return true;
+  case 20: out += fmt::format("    aot_fast_fsubsx(s,{},{},{});\n", fd, fa, fb); return true;
+  case 21: out += fmt::format("    aot_fast_faddsx(s,{},{},{});\n", fd, fa, fb); return true;
   case 24: out += fmt::format("    aot_fresx(s,{},{});\n", fd, fb); return true;
-  case 25: out += fmt::format("    aot_fmulsx(s,{},{},{});\n", fd, fa, fc); return true;
+  case 25: out += fmt::format("    aot_fast_fmulsx(s,{},{},{});\n", fd, fa, fc); return true;
   case 28: out += fmt::format("    aot_fmsubsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 29: out += fmt::format("    aot_fmaddsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 30: out += fmt::format("    aot_fnmsubsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
@@ -1168,14 +1283,14 @@ bool AOTCEmitter::EmitTable4(std::string& out, UGeckoInstruction inst, u32 pc)
   case 14: out += fmt::format("    aot_ps_madds0(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 15: out += fmt::format("    aot_ps_madds1(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 18: out += fmt::format("    aot_ps_div(s,{},{},{});\n", fd, fa, fb); return true;
-  case 20: out += fmt::format("    aot_ps_sub(s,{},{},{});\n", fd, fa, fb); return true;
-  case 21: out += fmt::format("    aot_ps_add(s,{},{},{});\n", fd, fa, fb); return true;
+  case 20: out += fmt::format("    aot_fast_ps_sub(s,{},{},{});\n", fd, fa, fb); return true;
+  case 21: out += fmt::format("    aot_fast_ps_add(s,{},{},{});\n", fd, fa, fb); return true;
   case 23: out += fmt::format("    aot_ps_sel(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 24: out += fmt::format("    aot_ps_res(s,{},{});\n", fd, fb); return true;
-  case 25: out += fmt::format("    aot_ps_mul(s,{},{},{});\n", fd, fa, fc); return true;
+  case 25: out += fmt::format("    aot_fast_ps_mul(s,{},{},{});\n", fd, fa, fc); return true;
   case 26: out += fmt::format("    aot_ps_rsqrte(s,{},{});\n", fd, fb); return true;
-  case 28: out += fmt::format("    aot_ps_msub(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 29: out += fmt::format("    aot_ps_madd(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 28: out += fmt::format("    aot_fast_ps_msub(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 29: out += fmt::format("    aot_fast_ps_madd(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 30: out += fmt::format("    aot_ps_nmsub(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 31: out += fmt::format("    aot_ps_nmadd(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   default: break;
