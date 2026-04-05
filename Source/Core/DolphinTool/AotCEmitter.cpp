@@ -1164,10 +1164,10 @@ bool AOTCEmitter::EmitTable59(std::string& out, UGeckoInstruction inst, u32 pc)
   switch (I(inst.SUBOP5))
   {
   case 18: out += fmt::format("    aot_fdivsx(s,{},{},{});\n", fd, fa, fb); return true;
-  case 20: out += fmt::format("    aot_fsubsx(s,{},{},{});\n", fd, fa, fb); return true;
-  case 21: out += fmt::format("    aot_faddsx(s,{},{},{});\n", fd, fa, fb); return true;
+  case 20: out += fmt::format("    aot_fast_fsubsx(s,{},{},{});\n", fd, fa, fb); return true;
+  case 21: out += fmt::format("    aot_fast_faddsx(s,{},{},{});\n", fd, fa, fb); return true;
   case 24: out += fmt::format("    aot_fresx(s,{},{});\n", fd, fb); return true;
-  case 25: out += fmt::format("    aot_fmulsx(s,{},{},{});\n", fd, fa, fc); return true;
+  case 25: out += fmt::format("    aot_fast_fmulsx(s,{},{},{});\n", fd, fa, fc); return true;
   case 28: out += fmt::format("    aot_fmsubsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 29: out += fmt::format("    aot_fmaddsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 30: out += fmt::format("    aot_fnmsubsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
@@ -1278,14 +1278,14 @@ bool AOTCEmitter::EmitTable4(std::string& out, UGeckoInstruction inst, u32 pc)
   case 14: out += fmt::format("    aot_ps_madds0(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 15: out += fmt::format("    aot_ps_madds1(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 18: out += fmt::format("    aot_ps_div(s,{},{},{});\n", fd, fa, fb); return true;
-  case 20: out += fmt::format("    aot_ps_sub(s,{},{},{});\n", fd, fa, fb); return true;
-  case 21: out += fmt::format("    aot_ps_add(s,{},{},{});\n", fd, fa, fb); return true;
+  case 20: out += fmt::format("    aot_fast_ps_sub(s,{},{},{});\n", fd, fa, fb); return true;
+  case 21: out += fmt::format("    aot_fast_ps_add(s,{},{},{});\n", fd, fa, fb); return true;
   case 23: out += fmt::format("    aot_ps_sel(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 24: out += fmt::format("    aot_ps_res(s,{},{});\n", fd, fb); return true;
-  case 25: out += fmt::format("    aot_ps_mul(s,{},{},{});\n", fd, fa, fc); return true;
+  case 25: out += fmt::format("    aot_fast_ps_mul(s,{},{},{});\n", fd, fa, fc); return true;
   case 26: out += fmt::format("    aot_ps_rsqrte(s,{},{});\n", fd, fb); return true;
-  case 28: out += fmt::format("    aot_ps_msub(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 29: out += fmt::format("    aot_ps_madd(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 28: out += fmt::format("    aot_fast_ps_msub(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 29: out += fmt::format("    aot_fast_ps_madd(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 30: out += fmt::format("    aot_ps_nmsub(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 31: out += fmt::format("    aot_ps_nmadd(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   default: break;

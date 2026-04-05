@@ -238,6 +238,108 @@ static inline uint32_t aot_rotation_mask(int mb, int me) {
     return (me >= mb) ? mask : ~mask;
 }
 
+// ============================================================================
+// FP fast-path inlines: common-case arithmetic without interpreter dispatch.
+// Falls back to runtime helpers for NaN/Inf edge cases.
+// The ps[] fields store raw uint64_t bit patterns of doubles.
+// Single-precision ops round to float then "fill" both PS0 and PS1.
+// ============================================================================
+
+// Helper: reinterpret uint64_t <-> double without aliasing issues
+static inline double aot_u64_to_f64(uint64_t u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
+static inline uint64_t aot_f64_to_u64(double d) { uint64_t u; __builtin_memcpy(&u, &d, 8); return u; }
+
+// Single-precision fast paths (fadds, fsubs, fmuls)
+// Fast path: result is not NaN -> store rounded float as double into both PS slots.
+// Slow path: NaN/Inf -> full interpreter path for exact FPSCR handling.
+
+static inline void aot_fast_faddsx(AOTState* s, int fd, int fa, int fb) {
+    double a = aot_u64_to_f64(s->ps[fa].ps0);
+    double b = aot_u64_to_f64(s->ps[fb].ps0);
+    double sum = a + b;
+    if (__builtin_expect(sum == sum, 1)) {
+        uint64_t r = aot_f64_to_u64((double)(float)sum);
+        s->ps[fd].ps0 = r; s->ps[fd].ps1 = r;
+    } else { aot_faddsx(s, fd, fa, fb); }
+}
+
+static inline void aot_fast_fsubsx(AOTState* s, int fd, int fa, int fb) {
+    double a = aot_u64_to_f64(s->ps[fa].ps0);
+    double b = aot_u64_to_f64(s->ps[fb].ps0);
+    double diff = a - b;
+    if (__builtin_expect(diff == diff, 1)) {
+        uint64_t r = aot_f64_to_u64((double)(float)diff);
+        s->ps[fd].ps0 = r; s->ps[fd].ps1 = r;
+    } else { aot_fsubsx(s, fd, fa, fb); }
+}
+
+static inline void aot_fast_fmulsx(AOTState* s, int fd, int fa, int fc) {
+    double a = aot_u64_to_f64(s->ps[fa].ps0);
+    double c = aot_u64_to_f64(s->ps[fc].ps0);
+    double prod = a * c;
+    if (__builtin_expect(prod == prod, 1)) {
+        uint64_t r = aot_f64_to_u64((double)(float)prod);
+        s->ps[fd].ps0 = r; s->ps[fd].ps1 = r;
+    } else { aot_fmulsx(s, fd, fa, fc); }
+}
+
+// Paired-singles fast paths (ps_add, ps_sub, ps_mul)
+// Operate on both PS0 and PS1 independently.
+
+static inline void aot_fast_ps_add(AOTState* s, int fd, int fa, int fb) {
+    double a0 = aot_u64_to_f64(s->ps[fa].ps0), a1 = aot_u64_to_f64(s->ps[fa].ps1);
+    double b0 = aot_u64_to_f64(s->ps[fb].ps0), b1 = aot_u64_to_f64(s->ps[fb].ps1);
+    double r0 = a0 + b0, r1 = a1 + b1;
+    if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
+        s->ps[fd].ps0 = aot_f64_to_u64((double)(float)r0);
+        s->ps[fd].ps1 = aot_f64_to_u64((double)(float)r1);
+    } else { aot_ps_add(s, fd, fa, fb); }
+}
+
+static inline void aot_fast_ps_sub(AOTState* s, int fd, int fa, int fb) {
+    double a0 = aot_u64_to_f64(s->ps[fa].ps0), a1 = aot_u64_to_f64(s->ps[fa].ps1);
+    double b0 = aot_u64_to_f64(s->ps[fb].ps0), b1 = aot_u64_to_f64(s->ps[fb].ps1);
+    double r0 = a0 - b0, r1 = a1 - b1;
+    if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
+        s->ps[fd].ps0 = aot_f64_to_u64((double)(float)r0);
+        s->ps[fd].ps1 = aot_f64_to_u64((double)(float)r1);
+    } else { aot_ps_sub(s, fd, fa, fb); }
+}
+
+static inline void aot_fast_ps_mul(AOTState* s, int fd, int fa, int fc) {
+    double a0 = aot_u64_to_f64(s->ps[fa].ps0), a1 = aot_u64_to_f64(s->ps[fa].ps1);
+    double c0 = aot_u64_to_f64(s->ps[fc].ps0), c1 = aot_u64_to_f64(s->ps[fc].ps1);
+    double r0 = a0 * c0, r1 = a1 * c1;
+    if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
+        s->ps[fd].ps0 = aot_f64_to_u64((double)(float)r0);
+        s->ps[fd].ps1 = aot_f64_to_u64((double)(float)r1);
+    } else { aot_ps_mul(s, fd, fa, fc); }
+}
+
+// ps_madd: fd = fa * fc + fb (both slots, single-precision result)
+static inline void aot_fast_ps_madd(AOTState* s, int fd, int fa, int fc, int fb) {
+    double a0 = aot_u64_to_f64(s->ps[fa].ps0), a1 = aot_u64_to_f64(s->ps[fa].ps1);
+    double c0 = aot_u64_to_f64(s->ps[fc].ps0), c1 = aot_u64_to_f64(s->ps[fc].ps1);
+    double b0 = aot_u64_to_f64(s->ps[fb].ps0), b1 = aot_u64_to_f64(s->ps[fb].ps1);
+    double r0 = a0 * c0 + b0, r1 = a1 * c1 + b1;
+    if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
+        s->ps[fd].ps0 = aot_f64_to_u64((double)(float)r0);
+        s->ps[fd].ps1 = aot_f64_to_u64((double)(float)r1);
+    } else { aot_ps_madd(s, fd, fa, fc, fb); }
+}
+
+// ps_msub: fd = fa * fc - fb (both slots, single-precision result)
+static inline void aot_fast_ps_msub(AOTState* s, int fd, int fa, int fc, int fb) {
+    double a0 = aot_u64_to_f64(s->ps[fa].ps0), a1 = aot_u64_to_f64(s->ps[fa].ps1);
+    double c0 = aot_u64_to_f64(s->ps[fc].ps0), c1 = aot_u64_to_f64(s->ps[fc].ps1);
+    double b0 = aot_u64_to_f64(s->ps[fb].ps0), b1 = aot_u64_to_f64(s->ps[fb].ps1);
+    double r0 = a0 * c0 - b0, r1 = a1 * c1 - b1;
+    if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
+        s->ps[fd].ps0 = aot_f64_to_u64((double)(float)r0);
+        s->ps[fd].ps1 = aot_f64_to_u64((double)(float)r1);
+    } else { aot_ps_msub(s, fd, fa, fc, fb); }
+}
+
 #endif // AOT_RUNTIME_H
 )";
 
