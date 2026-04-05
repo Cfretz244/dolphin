@@ -24,12 +24,14 @@ public:
   AOTCEmitter(const PPCMemoryImage& memory, std::set<u32> known_blocks, std::string prefix);
 
   // Translate a single block. Returns the C function body as a string.
-  std::string TranslateBlock(u32 block_addr, u32 num_instructions);
+  // If from_trace is true, the block was observed during trace collection (hot).
+  std::string TranslateBlock(u32 block_addr, u32 num_instructions, bool from_trace = true);
 
   // Translate a merged chain of blocks as a single C function.
   // The function is named after the chain head. Interior blocks become
   // inline fall-through code with no function call overhead.
-  std::string TranslateMergedChain(const std::vector<std::pair<u32, u32>>& blocks);
+  std::string TranslateMergedChain(const std::vector<std::pair<u32, u32>>& blocks,
+                                   bool from_trace = true);
 
   // Get the set of unhandled opcodes encountered during translation.
   const std::map<std::string, u32>& GetUnhandledOpcodes() const { return m_unhandled_opcodes; }

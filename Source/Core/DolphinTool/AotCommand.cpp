@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sys/stat.h>
 #include <iostream>
@@ -349,6 +350,7 @@ struct CFGBlockInfo
   u32 num_instructions;
   u32 function_addr;
   bool is_translatable;
+  bool from_trace;  // true if observed during trace collection (hot)
 };
 
 struct CFGEdgeInfo
@@ -476,7 +478,7 @@ static bool ReadCFGBlocks(const std::string& db_path, std::vector<CFGBlockInfo>&
 
   sqlite3_stmt* stmt = nullptr;
   sqlite3_prepare_v2(db,
-                     "SELECT ppc_addr, num_instructions, function_addr, is_translatable "
+                     "SELECT ppc_addr, num_instructions, function_addr, is_translatable, source "
                      "FROM blocks ORDER BY ppc_addr",
                      -1, &stmt, nullptr);
 
@@ -488,6 +490,8 @@ static bool ReadCFGBlocks(const std::string& db_path, std::vector<CFGBlockInfo>&
     block.function_addr =
         sqlite3_column_type(stmt, 2) != SQLITE_NULL ? static_cast<u32>(sqlite3_column_int64(stmt, 2)) : 0;
     block.is_translatable = sqlite3_column_int(stmt, 3) != 0;
+    const char* source = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+    block.from_trace = source && (std::strcmp(source, "trace") == 0 || std::strcmp(source, "both") == 0);
     blocks.push_back(block);
   }
 
@@ -609,13 +613,18 @@ int AotCommand(const std::vector<std::string>& args)
     header << AOT_RUNTIME_HEADER;
   }
 
-  // 4. Translate blocks, split into files by address range (64KB granularity)
+  // 4. Translate blocks, grouped by PPC function for I-cache locality
   AOTCEmitter emitter(memory, known_blocks, prefix);
 
-  // Group blocks by high 16 bits of address
+  // Group blocks by function address (blocks in the same PPC function are
+  // neighbors in the binary, improving spatial I-cache locality).
+  // Blocks without a function assignment fall back to address-based grouping.
   std::map<u32, std::vector<const CFGBlockInfo*>> groups;
   for (const auto& b : cfg_blocks)
-    groups[b.ppc_addr >> 16].push_back(&b);
+  {
+    u32 group_key = b.function_addr ? b.function_addr : (b.ppc_addr & 0xFFFF0000u);
+    groups[group_key].push_back(&b);
+  }
 
   // Write forward declarations header
   // Interior chain blocks have no standalone function — only chain heads get declarations.
@@ -639,7 +648,7 @@ int AotCommand(const std::vector<std::string>& args)
   for (const auto& [group_key, group_blocks] : groups)
   {
     std::string filename =
-        fmt::format("{}/{}_blocks_{:04x}.c", output_dir, prefix, group_key);
+        fmt::format("{}/{}_blocks_{:08x}.c", output_dir, prefix, group_key);
     std::ofstream file(filename);
     file << "#include \"aot_runtime.h\"\n";
     file << fmt::format("#include \"{}_forward_decls.h\"\n\n", prefix);
@@ -661,14 +670,15 @@ int AotCommand(const std::vector<std::string>& args)
       if (chain_it != head_to_chain.end())
       {
         const auto& chain = chains[chain_it->second];
-        std::string chain_code = emitter.TranslateMergedChain(chain.blocks);
+        std::string chain_code = emitter.TranslateMergedChain(chain.blocks, b->from_trace);
         file << chain_code << "\n";
         translated += static_cast<u32>(chain.blocks.size());
       }
       else
       {
         // Standalone block — not part of any chain
-        std::string block_code = emitter.TranslateBlock(b->ppc_addr, b->num_instructions);
+        std::string block_code = emitter.TranslateBlock(b->ppc_addr, b->num_instructions,
+                                                        b->from_trace);
         file << block_code << "\n";
         translated++;
       }

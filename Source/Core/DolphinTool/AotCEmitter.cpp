@@ -23,12 +23,14 @@ AOTCEmitter::AOTCEmitter(const PPCMemoryImage& memory, std::set<u32> known_block
 {
 }
 
-std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions)
+std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bool from_trace)
 {
   std::string out;
   m_block_cycle_count = 0;
-  out += fmt::format("__attribute__((noinline)) void {}_block_{:08x}(AOTState* s) {{\n", m_prefix,
-                     block_addr);
+  const char* section = from_trace ? "__TEXT,__aot_hot" : "__TEXT,__aot_cold";
+  out += fmt::format("__attribute__((noinline, section(\"{}\")))"
+                     " void {}_block_{:08x}(AOTState* s) {{\n",
+                     section, m_prefix, block_addr);
 
   for (u32 i = 0; i < num_instructions; i++)
   {
@@ -66,13 +68,16 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions)
   return out;
 }
 
-std::string AOTCEmitter::TranslateMergedChain(const std::vector<std::pair<u32, u32>>& blocks)
+std::string AOTCEmitter::TranslateMergedChain(const std::vector<std::pair<u32, u32>>& blocks,
+                                              bool from_trace)
 {
   std::string out;
   u32 head_addr = blocks[0].first;
+  const char* section = from_trace ? "__TEXT,__aot_hot" : "__TEXT,__aot_cold";
 
-  out += fmt::format("__attribute__((noinline)) void {}_block_{:08x}(AOTState* s) {{\n", m_prefix,
-                     head_addr);
+  out += fmt::format("__attribute__((noinline, section(\"{}\")))"
+                     " void {}_block_{:08x}(AOTState* s) {{\n",
+                     section, m_prefix, head_addr);
 
   m_merge_ctx.active = true;
   m_merge_ctx.cumulative_cycles = 0;
