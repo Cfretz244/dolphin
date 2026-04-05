@@ -124,6 +124,7 @@ AOTCore::~AOTCore()
 }
 
 extern "C" void aot_interpreter_single_step(AOTState* s);
+extern "C" void aot_init_fast_mem();
 
 static void interp_only_dispatch(AOTState* s)
 {
@@ -132,6 +133,9 @@ static void interp_only_dispatch(AOTState* s)
 
 void AOTCore::Init()
 {
+  // Cache RAM pointer and size for fast memory access
+  aot_init_fast_mem();
+
   m_interp_dispatch = &interp_only_dispatch;
 
   // Look up the AOT library for the currently loaded game.

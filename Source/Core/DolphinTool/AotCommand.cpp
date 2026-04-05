@@ -5,12 +5,15 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sys/stat.h>
 #include <iostream>
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <OptionParser.h>
@@ -236,6 +239,108 @@ static inline uint32_t aot_rotation_mask(int mb, int me) {
     return (me >= mb) ? mask : ~mask;
 }
 
+// ============================================================================
+// FP fast-path inlines: common-case arithmetic without interpreter dispatch.
+// Falls back to runtime helpers for NaN/Inf edge cases.
+// The ps[] fields store raw uint64_t bit patterns of doubles.
+// Single-precision ops round to float then "fill" both PS0 and PS1.
+// ============================================================================
+
+// Helper: reinterpret uint64_t <-> double without aliasing issues
+static inline double aot_u64_to_f64(uint64_t u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
+static inline uint64_t aot_f64_to_u64(double d) { uint64_t u; __builtin_memcpy(&u, &d, 8); return u; }
+
+// Single-precision fast paths (fadds, fsubs, fmuls)
+// Fast path: result is not NaN -> store rounded float as double into both PS slots.
+// Slow path: NaN/Inf -> full interpreter path for exact FPSCR handling.
+
+static inline void aot_fast_faddsx(AOTState* s, int fd, int fa, int fb) {
+    double a = aot_u64_to_f64(s->ps[fa].ps0);
+    double b = aot_u64_to_f64(s->ps[fb].ps0);
+    double sum = a + b;
+    if (__builtin_expect(sum == sum, 1)) {
+        uint64_t r = aot_f64_to_u64((double)(float)sum);
+        s->ps[fd].ps0 = r; s->ps[fd].ps1 = r;
+    } else { aot_faddsx(s, fd, fa, fb); }
+}
+
+static inline void aot_fast_fsubsx(AOTState* s, int fd, int fa, int fb) {
+    double a = aot_u64_to_f64(s->ps[fa].ps0);
+    double b = aot_u64_to_f64(s->ps[fb].ps0);
+    double diff = a - b;
+    if (__builtin_expect(diff == diff, 1)) {
+        uint64_t r = aot_f64_to_u64((double)(float)diff);
+        s->ps[fd].ps0 = r; s->ps[fd].ps1 = r;
+    } else { aot_fsubsx(s, fd, fa, fb); }
+}
+
+static inline void aot_fast_fmulsx(AOTState* s, int fd, int fa, int fc) {
+    double a = aot_u64_to_f64(s->ps[fa].ps0);
+    double c = aot_u64_to_f64(s->ps[fc].ps0);
+    double prod = a * c;
+    if (__builtin_expect(prod == prod, 1)) {
+        uint64_t r = aot_f64_to_u64((double)(float)prod);
+        s->ps[fd].ps0 = r; s->ps[fd].ps1 = r;
+    } else { aot_fmulsx(s, fd, fa, fc); }
+}
+
+// Paired-singles fast paths (ps_add, ps_sub, ps_mul)
+// Operate on both PS0 and PS1 independently.
+
+static inline void aot_fast_ps_add(AOTState* s, int fd, int fa, int fb) {
+    double a0 = aot_u64_to_f64(s->ps[fa].ps0), a1 = aot_u64_to_f64(s->ps[fa].ps1);
+    double b0 = aot_u64_to_f64(s->ps[fb].ps0), b1 = aot_u64_to_f64(s->ps[fb].ps1);
+    double r0 = a0 + b0, r1 = a1 + b1;
+    if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
+        s->ps[fd].ps0 = aot_f64_to_u64((double)(float)r0);
+        s->ps[fd].ps1 = aot_f64_to_u64((double)(float)r1);
+    } else { aot_ps_add(s, fd, fa, fb); }
+}
+
+static inline void aot_fast_ps_sub(AOTState* s, int fd, int fa, int fb) {
+    double a0 = aot_u64_to_f64(s->ps[fa].ps0), a1 = aot_u64_to_f64(s->ps[fa].ps1);
+    double b0 = aot_u64_to_f64(s->ps[fb].ps0), b1 = aot_u64_to_f64(s->ps[fb].ps1);
+    double r0 = a0 - b0, r1 = a1 - b1;
+    if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
+        s->ps[fd].ps0 = aot_f64_to_u64((double)(float)r0);
+        s->ps[fd].ps1 = aot_f64_to_u64((double)(float)r1);
+    } else { aot_ps_sub(s, fd, fa, fb); }
+}
+
+static inline void aot_fast_ps_mul(AOTState* s, int fd, int fa, int fc) {
+    double a0 = aot_u64_to_f64(s->ps[fa].ps0), a1 = aot_u64_to_f64(s->ps[fa].ps1);
+    double c0 = aot_u64_to_f64(s->ps[fc].ps0), c1 = aot_u64_to_f64(s->ps[fc].ps1);
+    double r0 = a0 * c0, r1 = a1 * c1;
+    if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
+        s->ps[fd].ps0 = aot_f64_to_u64((double)(float)r0);
+        s->ps[fd].ps1 = aot_f64_to_u64((double)(float)r1);
+    } else { aot_ps_mul(s, fd, fa, fc); }
+}
+
+// ps_madd: fd = fa * fc + fb (both slots, single-precision result)
+static inline void aot_fast_ps_madd(AOTState* s, int fd, int fa, int fc, int fb) {
+    double a0 = aot_u64_to_f64(s->ps[fa].ps0), a1 = aot_u64_to_f64(s->ps[fa].ps1);
+    double c0 = aot_u64_to_f64(s->ps[fc].ps0), c1 = aot_u64_to_f64(s->ps[fc].ps1);
+    double b0 = aot_u64_to_f64(s->ps[fb].ps0), b1 = aot_u64_to_f64(s->ps[fb].ps1);
+    double r0 = a0 * c0 + b0, r1 = a1 * c1 + b1;
+    if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
+        s->ps[fd].ps0 = aot_f64_to_u64((double)(float)r0);
+        s->ps[fd].ps1 = aot_f64_to_u64((double)(float)r1);
+    } else { aot_ps_madd(s, fd, fa, fc, fb); }
+}
+
+// ps_msub: fd = fa * fc - fb (both slots, single-precision result)
+static inline void aot_fast_ps_msub(AOTState* s, int fd, int fa, int fc, int fb) {
+    double a0 = aot_u64_to_f64(s->ps[fa].ps0), a1 = aot_u64_to_f64(s->ps[fa].ps1);
+    double c0 = aot_u64_to_f64(s->ps[fc].ps0), c1 = aot_u64_to_f64(s->ps[fc].ps1);
+    double b0 = aot_u64_to_f64(s->ps[fb].ps0), b1 = aot_u64_to_f64(s->ps[fb].ps1);
+    double r0 = a0 * c0 - b0, r1 = a1 * c1 - b1;
+    if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
+        s->ps[fd].ps0 = aot_f64_to_u64((double)(float)r0);
+        s->ps[fd].ps1 = aot_f64_to_u64((double)(float)r1);
+    } else { aot_ps_msub(s, fd, fa, fc, fb); }
+}
+
 #endif // AOT_RUNTIME_H
 )";
 
@@ -245,7 +350,130 @@ struct CFGBlockInfo
   u32 num_instructions;
   u32 function_addr;
   bool is_translatable;
+  bool from_trace;  // true if observed during trace collection (hot)
 };
+
+struct CFGEdgeInfo
+{
+  u32 from_addr;
+  u32 to_addr;
+  std::string edge_type;  // "static", "fallthrough", "call", "dynamic"
+};
+
+// A merged chain of blocks that will be emitted as a single C function.
+struct MergedChain
+{
+  std::vector<std::pair<u32, u32>> blocks;  // (addr, num_instructions) in order
+};
+
+static bool ReadCFGEdges(const std::string& db_path, std::vector<CFGEdgeInfo>& edges)
+{
+  sqlite3* db = nullptr;
+  if (sqlite3_open_v2(db_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK)
+    return false;
+
+  sqlite3_stmt* stmt = nullptr;
+  sqlite3_prepare_v2(db, "SELECT from_addr, to_addr, edge_type FROM edges", -1, &stmt, nullptr);
+
+  while (sqlite3_step(stmt) == SQLITE_ROW)
+  {
+    CFGEdgeInfo edge{};
+    edge.from_addr = static_cast<u32>(sqlite3_column_int64(stmt, 0));
+    edge.to_addr = static_cast<u32>(sqlite3_column_int64(stmt, 1));
+    edge.edge_type = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+    edges.push_back(edge);
+  }
+
+  sqlite3_finalize(stmt);
+  sqlite3_close(db);
+  return true;
+}
+
+// Detect linear chains of blocks that can be merged into a single C function.
+// A chain A->B is mergeable when:
+//   - A has exactly one non-call successor (static or fallthrough edge to B)
+//   - B has exactly one non-call predecessor (A)
+//   - Both are translatable and neither has indirect exits
+static std::vector<MergedChain> DetectLinearChains(
+    const std::vector<CFGBlockInfo>& blocks, const std::vector<CFGEdgeInfo>& edges,
+    u32 max_chain_length = 20)
+{
+  // Build maps of translatable blocks
+  std::set<u32> translatable;
+  std::unordered_map<u32, u32> block_num_insn;
+  for (const auto& b : blocks)
+  {
+    if (b.is_translatable)
+    {
+      translatable.insert(b.ppc_addr);
+      block_num_insn[b.ppc_addr] = b.num_instructions;
+    }
+  }
+
+  // Build adjacency for chain detection.
+  // Successors: only static/fallthrough edges (chains follow linear control flow).
+  // Predecessors: count ALL edge types including call/dynamic — a block that is
+  // a call target or dynamic branch target must not be an interior chain block.
+  std::unordered_map<u32, std::vector<u32>> successors;
+  std::unordered_map<u32, u32> predecessor_count;
+  std::unordered_map<u32, u32> successor_count;
+
+  for (const auto& e : edges)
+  {
+    if (!translatable.contains(e.to_addr))
+      continue;
+
+    // All edge types contribute to predecessor count
+    if (translatable.contains(e.from_addr) || e.edge_type == "call" || e.edge_type == "dynamic")
+      predecessor_count[e.to_addr]++;
+
+    // Only static/fallthrough edges define chain successors
+    if (e.edge_type == "call" || e.edge_type == "dynamic")
+      continue;
+    if (!translatable.contains(e.from_addr))
+      continue;
+    successors[e.from_addr].push_back(e.to_addr);
+    successor_count[e.from_addr]++;
+  }
+
+  // Build chains: walk forward from each unassigned block
+  std::unordered_set<u32> assigned;
+  std::vector<MergedChain> chains;
+
+  for (const auto& b : blocks)
+  {
+    if (!b.is_translatable || assigned.contains(b.ppc_addr))
+      continue;
+
+    // Try to start a chain from this block
+    std::vector<u32> chain = {b.ppc_addr};
+    assigned.insert(b.ppc_addr);
+
+    // Extend forward
+    u32 cursor = b.ppc_addr;
+    while (chain.size() < max_chain_length)
+    {
+      if (successor_count[cursor] != 1)
+        break;
+      u32 next = successors[cursor][0];
+      if (assigned.contains(next) || predecessor_count[next] != 1)
+        break;
+      chain.push_back(next);
+      assigned.insert(next);
+      cursor = next;
+    }
+
+    if (chain.size() > 1)
+    {
+      MergedChain mc;
+      for (u32 addr : chain)
+        mc.blocks.emplace_back(addr, block_num_insn[addr]);
+      chains.push_back(std::move(mc));
+    }
+  }
+
+  return chains;
+}
 
 static bool ReadCFGBlocks(const std::string& db_path, std::vector<CFGBlockInfo>& blocks)
 {
@@ -258,7 +486,7 @@ static bool ReadCFGBlocks(const std::string& db_path, std::vector<CFGBlockInfo>&
 
   sqlite3_stmt* stmt = nullptr;
   sqlite3_prepare_v2(db,
-                     "SELECT ppc_addr, num_instructions, function_addr, is_translatable "
+                     "SELECT ppc_addr, num_instructions, function_addr, is_translatable, source "
                      "FROM blocks ORDER BY ppc_addr",
                      -1, &stmt, nullptr);
 
@@ -270,6 +498,8 @@ static bool ReadCFGBlocks(const std::string& db_path, std::vector<CFGBlockInfo>&
     block.function_addr =
         sqlite3_column_type(stmt, 2) != SQLITE_NULL ? static_cast<u32>(sqlite3_column_int64(stmt, 2)) : 0;
     block.is_translatable = sqlite3_column_int(stmt, 3) != 0;
+    const char* source = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+    block.from_trace = source && (std::strcmp(source, "trace") == 0 || std::strcmp(source, "both") == 0);
     blocks.push_back(block);
   }
 
@@ -350,9 +580,33 @@ int AotCommand(const std::vector<std::string>& args)
   if (!ReadCFGBlocks(cfg_path, cfg_blocks))
     return EXIT_FAILURE;
 
+  std::vector<CFGEdgeInfo> cfg_edges;
+  ReadCFGEdges(cfg_path, cfg_edges);
+
   fmt::println(std::cerr, "Prefix: {}", prefix);
   fmt::println(std::cerr, "DOL entry: {:#010x}", dol.GetEntryPoint());
   fmt::println(std::cerr, "CFG blocks: {}", cfg_blocks.size());
+
+  // Detect linear chains for block merging
+  auto chains = DetectLinearChains(cfg_blocks, cfg_edges);
+
+  // Build lookup: block addr -> chain index (for blocks that are interior to a chain)
+  std::unordered_set<u32> interior_blocks;  // blocks that are NOT chain heads but in a chain
+  std::unordered_map<u32, size_t> head_to_chain;  // chain head -> chain index
+  for (size_t ci = 0; ci < chains.size(); ci++)
+  {
+    const auto& chain = chains[ci];
+    head_to_chain[chain.blocks[0].first] = ci;
+    for (size_t bi = 1; bi < chain.blocks.size(); bi++)
+      interior_blocks.insert(chain.blocks[bi].first);
+  }
+
+  u32 total_merged = 0;
+  for (const auto& c : chains)
+    total_merged += static_cast<u32>(c.blocks.size());
+  fmt::println(std::cerr, "  Merged chains: {} ({} blocks merged, {} blocks remain standalone)",
+               chains.size(), total_merged,
+               cfg_blocks.size() - total_merged + chains.size());
 
   // Build set of known block addresses for the emitter
   std::set<u32> known_blocks;
@@ -376,6 +630,9 @@ int AotCommand(const std::vector<std::string>& args)
     groups[b.ppc_addr >> 16].push_back(&b);
 
   // Write forward declarations header
+  // All translatable blocks get declarations. Interior chain blocks don't have
+  // standalone functions, but other blocks may still reference them via the
+  // dispatch table or dynamic branches. The linker resolves unused declarations.
   {
     std::ofstream fwd(output_dir + "/" + prefix + "_forward_decls.h");
     fwd << "#ifndef " << prefix << "_FORWARD_DECLS_H\n";
@@ -383,10 +640,11 @@ int AotCommand(const std::vector<std::string>& args)
     fwd << "#include \"aot_runtime.h\"\n\n";
     for (const auto& b : cfg_blocks)
     {
-      if (b.is_translatable)
-        fwd << fmt::format("void {}_block_{:08x}(AOTState* s);\n", prefix, b.ppc_addr);
+      if (b.is_translatable && !interior_blocks.contains(b.ppc_addr))
+        fwd << fmt::format("__attribute__((noinline)) void {}_block_{:08x}(AOTState* s);\n",
+                           prefix, b.ppc_addr);
     }
-    fwd << fmt::format("void {}_dispatch(AOTState* s);\n", prefix);
+    fwd << fmt::format("__attribute__((noinline)) void {}_dispatch(AOTState* s);\n", prefix);
     fwd << "#endif\n";
   }
 
@@ -408,9 +666,27 @@ int AotCommand(const std::vector<std::string>& args)
         continue;
       }
 
-      std::string block_code = emitter.TranslateBlock(b->ppc_addr, b->num_instructions);
-      file << block_code << "\n";
-      translated++;
+      // Skip interior chain blocks — they're emitted as part of their chain head
+      if (interior_blocks.contains(b->ppc_addr))
+        continue;
+
+      // If this block is a chain head, emit the merged chain
+      auto chain_it = head_to_chain.find(b->ppc_addr);
+      if (chain_it != head_to_chain.end())
+      {
+        const auto& chain = chains[chain_it->second];
+        std::string chain_code = emitter.TranslateMergedChain(chain.blocks, b->from_trace);
+        file << chain_code << "\n";
+        translated += static_cast<u32>(chain.blocks.size());
+      }
+      else
+      {
+        // Standalone block — not part of any chain
+        std::string block_code = emitter.TranslateBlock(b->ppc_addr, b->num_instructions,
+                                                        b->from_trace);
+        file << block_code << "\n";
+        translated++;
+      }
     }
   }
 
@@ -447,11 +723,11 @@ int AotCommand(const std::vector<std::string>& args)
 
     file << fmt::format("static AOTBlockFunc {}_fast_table[{}] = {{\n", prefix, table_entries);
 
-    // Build a set for quick lookup
+    // Build a set for quick lookup — interior chain blocks have no standalone function
     std::map<u32, std::string> addr_to_sym;
     for (const auto& b : cfg_blocks)
     {
-      if (b.is_translatable)
+      if (b.is_translatable && !interior_blocks.contains(b.ppc_addr))
         addr_to_sym[b.ppc_addr] = fmt::format("{}_block_{:08x}", prefix, b.ppc_addr);
     }
 
@@ -473,15 +749,15 @@ int AotCommand(const std::vector<std::string>& args)
     file << "extern int aot_single_block_mode;\n\n";
 
     // Emit the fast dispatch function — O(1) array lookup
-    file << fmt::format("void {}_dispatch(AOTState* s) {{\n", prefix);
+    file << fmt::format("__attribute__((noinline)) void {}_dispatch(AOTState* s) {{\n", prefix);
     file << "    if (aot_single_block_mode) return;\n";
     file << "    uint32_t pc = s->pc;\n";
     file << fmt::format("    uint32_t idx = (pc - {}_TABLE_BASE) >> 2;\n", prefix);
     file << fmt::format("    if (idx < {}_TABLE_SIZE) {{\n", prefix);
     file << fmt::format("        AOTBlockFunc fn = {}_fast_table[idx];\n", prefix);
-    file << "        if (fn) { fn(s); return; }\n";
+    file << "        if (fn) { [[clang::musttail]] return fn(s); }\n";
     file << "    }\n";
-    file << "    aot_interpreter_single_step(s);\n";
+    file << "    [[clang::musttail]] return aot_interpreter_single_step(s);\n";
     file << "}\n\n";
 
     // Emit a block lookup function for the diff harness — returns a single
@@ -512,11 +788,14 @@ int AotCommand(const std::vector<std::string>& args)
     script << "set -e\n";
     script << "cd \"$(dirname \"$0\")\"\n";
     script << fmt::format("PREFIX=\"{}\"\n", prefix);
-    script << "CFLAGS=\"-O2 -flto=thin -arch arm64\"\n\n";
+    script << "BLOCK_CFLAGS=\"-Os -flto=thin -arch arm64 -mcpu=apple-a14 -moutline\"\n";
+    script << "DISPATCH_CFLAGS=\"-O2 -flto=thin -arch arm64 -mcpu=apple-a14\"\n\n";
     script << "echo \"Compiling AOT blocks with LTO...\"\n";
-    script << "for f in ${PREFIX}_*.c; do\n";
-    script << "    clang -c $CFLAGS -I. \"$f\" -o \"${f%.c}.o\" &\n";
+    script << "for f in ${PREFIX}_blocks_*.c; do\n";
+    script << "    clang -c $BLOCK_CFLAGS -I. \"$f\" -o \"${f%.c}.o\" &\n";
     script << "done\n";
+    script << "clang -c $DISPATCH_CFLAGS -I. \"${PREFIX}_dispatch.c\""
+              " -o \"${PREFIX}_dispatch.o\" &\n";
     script << "wait\n\n";
     script << "echo \"Creating static library...\"\n";
     script << "ar rcs lib${PREFIX}_aot.a ${PREFIX}_*.o\n\n";
