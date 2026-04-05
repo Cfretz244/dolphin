@@ -410,22 +410,30 @@ static std::vector<MergedChain> DetectLinearChains(
     }
   }
 
-  // Build adjacency: only static and fallthrough edges (not call or dynamic)
-  // successor_count[A] = number of non-call, non-dynamic successors
-  // predecessor_count[B] = number of non-call, non-dynamic predecessors
+  // Build adjacency for chain detection.
+  // Successors: only static/fallthrough edges (chains follow linear control flow).
+  // Predecessors: count ALL edge types including call/dynamic — a block that is
+  // a call target or dynamic branch target must not be an interior chain block.
   std::unordered_map<u32, std::vector<u32>> successors;
   std::unordered_map<u32, u32> predecessor_count;
   std::unordered_map<u32, u32> successor_count;
 
   for (const auto& e : edges)
   {
+    if (!translatable.contains(e.to_addr))
+      continue;
+
+    // All edge types contribute to predecessor count
+    if (translatable.contains(e.from_addr) || e.edge_type == "call" || e.edge_type == "dynamic")
+      predecessor_count[e.to_addr]++;
+
+    // Only static/fallthrough edges define chain successors
     if (e.edge_type == "call" || e.edge_type == "dynamic")
       continue;
-    if (!translatable.contains(e.from_addr) || !translatable.contains(e.to_addr))
+    if (!translatable.contains(e.from_addr))
       continue;
     successors[e.from_addr].push_back(e.to_addr);
     successor_count[e.from_addr]++;
-    predecessor_count[e.to_addr]++;
   }
 
   // Build chains: walk forward from each unassigned block
@@ -622,7 +630,9 @@ int AotCommand(const std::vector<std::string>& args)
     groups[b.ppc_addr >> 16].push_back(&b);
 
   // Write forward declarations header
-  // Interior chain blocks have no standalone function — only chain heads get declarations.
+  // All translatable blocks get declarations. Interior chain blocks don't have
+  // standalone functions, but other blocks may still reference them via the
+  // dispatch table or dynamic branches. The linker resolves unused declarations.
   {
     std::ofstream fwd(output_dir + "/" + prefix + "_forward_decls.h");
     fwd << "#ifndef " << prefix << "_FORWARD_DECLS_H\n";
