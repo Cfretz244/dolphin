@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Dolphin is a GameCube/Wii emulator (GPLv2+). This fork (`instrumentation` branch) adds an **ahead-of-time (AOT) recompilation pipeline** that statically transpiles PPC code to C, compiles it with Clang, and links against Dolphin's runtime — enabling iOS deployment without JIT (no `MAP_JIT`). SSBM runs at full speed on macOS ARM64. The branch is 56 commits ahead of `master` with ~218K lines added.
+Dolphin is a GameCube/Wii emulator (GPLv2+). This fork adds an **ahead-of-time (AOT) recompilation pipeline** that statically transpiles PPC code to C, compiles it with Clang, and links against Dolphin's runtime — enabling iOS deployment without JIT (no `MAP_JIT`). SSBM runs at full speed on macOS ARM64. The `ios-aot` branch adds iOS platform support for integration with the [Delta emulator](https://github.com/rileytestut/Delta) frontend. The branch is ~70 commits ahead of `master` with ~219K lines added.
 
 ## Build Commands
 
@@ -12,11 +12,14 @@ Dolphin is a GameCube/Wii emulator (GPLv2+). This fork (`instrumentation` branch
 # Prerequisites: macOS ARM64, Qt6 (brew install qt), standard Dolphin deps
 # Pull submodules first: git submodule update --init --recursive
 
-# Configure + build
+# Configure + build (macOS)
+# NOTE: MoltenVK (bundled Vulkan) fails to build on recent Xcode/macOS due to
+# a self-linking dylib error. Add -DENABLE_VULKAN=OFF to work around this.
+# Metal is the primary backend anyway, so Vulkan is not needed.
 mkdir -p build && cd build
 cmake .. -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/qt
-make -j$(sysctl -n hw.ncpu) dolphin-emu dolphin-nogui dolphin-tool
+  -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/qt -DENABLE_VULKAN=OFF
+make -j$(sysctl -n hw.ncpu) dolphin-emu dolphin-tool
 
 # Quick rebuild (runtime changes only)
 cd build && make -j$(sysctl -n hw.ncpu) dolphin-emu
@@ -30,6 +33,11 @@ cmake .. -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/qt \
   -DENABLE_LTO=ON \
   -DAOT_STATIC_LIBS="/path/to/libGALE01_aot.a;/path/to/libGZLE01_aot.a"
 make -j$(sysctl -n hw.ncpu) dolphin-emu
+
+# iOS build (as a static library for Delta integration)
+cmake .. -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+  -DDOLPHIN_IOS_BUILD=ON -DENABLE_LTO=ON \
+  -DAOT_STATIC_LIBS="/path/to/libGALE01_aot.a"
 
 # Run tests
 cd build && cmake --build . --target unittests
@@ -117,6 +125,13 @@ Source/Core/DolphinTool/
 Source/Core/Core/Config/MainSettings.{h,cpp} — Config entries for trace/diff/compare
 Source/Core/DolphinQt/Settings/AdvancedPane.cpp — AOT in CPU core dropdown
 Source/Core/Core/PowerPC/PowerPC.{h,cpp} — CPUCore enum (AOT=6), InitializeCPUCore
+
+# iOS / Delta integration
+Source/Core/Core/HW/GCPad.{h,cpp}           — SetExternalProvider() for injecting input from Delta
+Source/Core/AudioCommon/DeltaSoundStream.{h,cpp} — Pull-based audio backend (HAVE_DELTA_AUDIO)
+Source/Core/Common/WindowSystemInfo.h        — WindowSystemType::IOS enum value
+Source/Core/InputCommon/ControllerInterface/ControllerInterface.h — ForceSetInit() for iOS
+Source/Core/VideoBackends/Metal/MTLGfx.{h,mm} — Blit-based frame capture for iOS
 ```
 
 ### AOTState and PowerPCState
@@ -168,6 +183,24 @@ Config entries via `-C`: `Dolphin.Debug.AOTCfgDbPath`, `Dolphin.Debug.AOTDiffMod
 3. **Opcode table numbering matters.** Dolphin uses SUBOP10 (bits 1-10) and SUBOP5 (bits 1-5) for different sub-tables in `AotCEmitter`. Wrong sub-table = silent interpreter fallback with double cycle counting.
 
 4. **Config flags use "Dolphin" prefix**, not "Main". Example: `-C Dolphin.Core.CPUCore=6`.
+
+## iOS Platform Support
+
+The `ios-aot` branch adds support for building Dolphin as a library for integration with the Delta emulator on iOS. Key adaptations:
+
+### Build Differences (`DOLPHIN_IOS_BUILD=ON`)
+
+- **Disabled deps:** libusb (no IOKit), CURL, HIDAPI, Quartz-based ControllerInterface init
+- **JIT vertex loader disabled:** ARM64 JIT code generation unavailable on iOS; uses software vertex loader fallback
+- **SecTranslocate guarded:** macOS-only API excluded via `TARGET_OS_OSX` check
+- **Metal backend:** Accepts `WindowSystemType::IOS`, uses blit-based frame capture (`MTLGfx::CaptureLastFrame()`) instead of swap-chain presentation
+
+### Delta Integration Points
+
+- **Input:** `Pad::SetExternalProvider(callback)` / `Pad::ClearExternalProvider()` — Delta injects `GCPadStatus` directly, bypassing ControllerInterface
+- **Audio:** `DeltaSoundStream` — pull-based backend where Delta calls `PullSamples(buffer, num_frames)` at 48kHz to retrieve mixed audio
+- **Video:** `MTLGfx::CaptureLastFrame()` captures the last rendered frame via blit for Delta to display
+- **Controller init:** `ControllerInterface::ForceSetInit()` skips Quartz-dependent initialization path
 
 ## Dolphin Core Architecture (Non-AOT)
 
