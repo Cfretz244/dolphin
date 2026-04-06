@@ -541,10 +541,16 @@ int AotCommand(const std::vector<std::string>& args)
   // last instruction is not a block-ending instruction, the game patched the code
   // at runtime (SMC not caught by icbi trace). Mark these blocks untranslatable.
   {
-    // Build edge map: block_addr -> set of target addresses
-    std::unordered_map<u32, std::vector<u32>> block_edges;
+    // Build edge map: block_addr -> set of static branch targets only.
+    // Fallthrough edges can have non-sequential targets due to CFG extraction
+    // artifacts (block splitting) and must be excluded. Only "static" edges
+    // (direct branches in the DOL) indicate the block must end with a branch.
+    std::unordered_map<u32, std::vector<u32>> block_static_edges;
     for (const auto& e : cfg_edges)
-      block_edges[e.from_addr].push_back(e.to_addr);
+    {
+      if (e.edge_type == "static")
+        block_static_edges[e.from_addr].push_back(e.to_addr);
+    }
 
     u32 smc_skipped = 0;
     for (auto& b : cfg_blocks)
@@ -553,11 +559,11 @@ int AotCommand(const std::vector<std::string>& args)
         continue;
 
       u32 fall_through_addr = b.ppc_addr + b.num_instructions * 4;
-      auto edge_it = block_edges.find(b.ppc_addr);
+      auto edge_it = block_static_edges.find(b.ppc_addr);
 
-      // Check if any edge targets a non-sequential address (i.e., a branch)
+      // Check if any static edge targets a non-sequential address (i.e., a branch)
       bool has_non_sequential_edge = false;
-      if (edge_it != block_edges.end())
+      if (edge_it != block_static_edges.end())
       {
         for (u32 target : edge_it->second)
         {

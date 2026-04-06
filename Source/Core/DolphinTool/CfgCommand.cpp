@@ -266,11 +266,16 @@ static void RunDisassembly(const PPCMemoryImage& memory, const TraceData& trace,
         split_block.has_indirect_exit = old_indirect;
         blocks[addr] = split_block;
 
-        // Add fall-through edge from old block to new block
-        edges.push_back({existing.start_addr, addr, CFGEdge::FallThrough, false});
+        // Move old edges from truncated block to split block — the branch
+        // instruction that generated them is now in the split-off portion.
+        for (auto& e : edges)
+        {
+          if (e.from_block == existing.start_addr)
+            e.from_block = addr;
+        }
 
-        // Update any edges that referenced the old block's start for edge targets
-        // that should now reference the split block (not needed since edges use to_addr)
+        // Add fall-through edge from truncated block to split block
+        edges.push_back({existing.start_addr, addr, CFGEdge::FallThrough, false});
         break;
       }
     }
