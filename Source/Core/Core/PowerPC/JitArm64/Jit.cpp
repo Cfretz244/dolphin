@@ -1063,7 +1063,12 @@ void JitArm64::Jit(u32 em_address, bool clear_cache_and_retry_on_failure)
 
       if (IsTraceCollectionEnabled())
       {
-        m_trace_collector.RecordBlock(em_address, code_block.m_num_instructions);
+        // Capture instruction bytes from the already-analyzed code buffer
+        std::vector<u32> inst_words(code_block.m_num_instructions);
+        for (u32 i = 0; i < code_block.m_num_instructions; i++)
+          inst_words[i] = m_code_buffer[i].inst.hex;
+        m_trace_collector.RecordBlock(em_address, code_block.m_num_instructions,
+                                      inst_words.data());
         for (const auto& link : b->linkData)
         {
           m_trace_collector.RecordStaticEdge(em_address, link.exitAddress, link.call);

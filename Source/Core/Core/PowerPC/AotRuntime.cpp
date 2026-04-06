@@ -12,6 +12,7 @@
 
 #include "Common/CommonTypes.h"
 #include "Common/Swap.h"
+#include "Core/ConfigManager.h"
 #include "Core/CoreTiming.h"
 #include "Core/HW/GPFifo.h"
 #include "Core/HW/Memmap.h"
@@ -21,6 +22,7 @@
 #include "Core/PowerPC/Interpreter/Interpreter_FPUtils.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/MMU.h"
+#include "Core/PowerPC/AotRegistry.h"
 #include "Core/PowerPC/PPCTables.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -85,6 +87,9 @@ static UGeckoInstruction MakeCRInst(int crfd, int fa, int fb)
 static u8* s_ram_ptr = nullptr;
 static u32 s_ram_size = 0;
 
+// Cached invalidation callback for aot_icbi (set during aot_init_fast_mem)
+static AOTInvalidateFunc s_invalidate_fn = nullptr;
+
 // Interpreter fallback tracking (enabled by AOT_TRACK_FALLBACKS=1)
 static bool s_track_fallbacks = false;
 static std::unordered_map<u32, u64> s_fallback_counts;
@@ -108,6 +113,11 @@ void aot_init_fast_mem()
 {
   s_ram_ptr = GetSystem().GetMemory().GetRAM();
   s_ram_size = GetSystem().GetMemory().GetRamSizeReal();
+
+  // Cache invalidation callback for aot_icbi
+  const std::string game_id = SConfig::GetInstance().GetGameID();
+  auto entry = AotRegistry::Instance().Find(game_id);
+  s_invalidate_fn = (entry && entry->invalidate_block) ? entry->invalidate_block : nullptr;
 }
 
 // ============================================================================
@@ -811,9 +821,14 @@ void aot_dcbt(AOTState* s, uint32_t addr)
 
 void aot_icbi(AOTState* s, uint32_t addr)
 {
-  // Instruction cache block invalidate
-  // In AOT mode, this is used for self-modifying code detection.
-  // For now, just ignore it — SMC regions are already handled by interpreter fallback.
+  // Instruction cache block invalidate — invalidate AOT dispatch table entries
+  // for the 32-byte cache line containing addr (8 PPC instructions).
+  if (s_invalidate_fn)
+  {
+    const u32 line_start = addr & ~31u;
+    for (u32 a = line_start; a < line_start + 32; a += 4)
+      s_invalidate_fn(a);
+  }
 }
 
 #undef FP_IMPL_3

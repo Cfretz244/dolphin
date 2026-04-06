@@ -12,7 +12,7 @@ AotRegistry& AotRegistry::Instance()
 }
 
 void AotRegistry::Register(const std::string& game_id, AOTDispatchFunc dispatch,
-                           AOTLookupFunc lookup)
+                           AOTLookupFunc lookup, AOTInvalidateFunc invalidate)
 {
   if (m_games.contains(game_id))
   {
@@ -20,7 +20,7 @@ void AotRegistry::Register(const std::string& game_id, AOTDispatchFunc dispatch,
     // Last registration wins; this is a build misconfiguration.
     WARN_LOG_FMT(POWERPC, "AotRegistry: Duplicate registration for game {}, overwriting", game_id);
   }
-  m_games[game_id] = AotGameEntry{game_id, dispatch, lookup};
+  m_games[game_id] = AotGameEntry{game_id, dispatch, lookup, invalidate};
 }
 
 std::optional<AotGameEntry> AotRegistry::Find(const std::string& game_id) const
@@ -43,5 +43,11 @@ std::vector<std::string> AotRegistry::GetRegisteredGameIDs() const
 extern "C" void aot_register_game(const char* game_id, AOTDispatchFunc dispatch,
                                   AOTLookupFunc lookup)
 {
-  AotRegistry::Instance().Register(game_id, dispatch, lookup);
+  AotRegistry::Instance().Register(game_id, dispatch, lookup, nullptr);
+}
+
+extern "C" void aot_register_game_v2(const char* game_id, AOTDispatchFunc dispatch,
+                                     AOTLookupFunc lookup, AOTInvalidateFunc invalidate)
+{
+  AotRegistry::Instance().Register(game_id, dispatch, lookup, invalidate);
 }

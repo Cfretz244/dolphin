@@ -21,6 +21,7 @@
 #include <sqlite3.h>
 
 #include "Common/CommonTypes.h"
+#include "Common/Hash.h"
 #include "Common/IOFile.h"
 #include "Common/Swap.h"
 
@@ -57,6 +58,12 @@ struct TraceSMC
   u32 length;
 };
 
+struct TraceInstructionSnapshot
+{
+  u32 crc32;
+  std::vector<u32> instructions;
+};
+
 struct TraceData
 {
   std::vector<TraceBlock> blocks;
@@ -71,6 +78,9 @@ struct TraceData
     u32 vtx_desc_low, vtx_desc_high, vat_g0, vat_g1, vat_g2;
   };
   std::vector<VertexFormat> vertex_formats;
+
+  // Instruction snapshots per block address (v4+)
+  std::unordered_map<u32, std::vector<TraceInstructionSnapshot>> instruction_snapshots;
 };
 
 static bool ReadTraceFile(const std::string& path, TraceData& out)
@@ -89,7 +99,7 @@ static bool ReadTraceFile(const std::string& path, TraceData& out)
       !file.ReadBytes(&smc_count, 4))
     return false;
 
-  if (magic != 0x54485044 || (version != 2 && version != 3))
+  if (magic != 0x54485044 || version < 2 || version > 4)
   {
     fmt::println(std::cerr, "Error: Invalid trace file (magic={:#x}, version={})", magic, version);
     return false;
@@ -99,6 +109,13 @@ static bool ReadTraceFile(const std::string& path, TraceData& out)
   if (version >= 3)
   {
     if (!file.ReadBytes(&vtx_format_count, 4))
+      return false;
+  }
+
+  u32 snapshot_section_offset = 0;
+  if (version >= 4)
+  {
+    if (!file.ReadBytes(&snapshot_section_offset, 4))
       return false;
   }
 
@@ -140,6 +157,33 @@ static bool ReadTraceFile(const std::string& path, TraceData& out)
         !file.ReadBytes(&fmt.vat_g0, 4) || !file.ReadBytes(&fmt.vat_g1, 4) ||
         !file.ReadBytes(&fmt.vat_g2, 4))
       return false;
+  }
+
+  // Read instruction snapshots (v4+)
+  if (version >= 4 && snapshot_section_offset > 0)
+  {
+    file.Seek(snapshot_section_offset, File::SeekOrigin::Begin);
+    while (file.Tell() < file.GetSize())
+    {
+      u32 block_addr, num_snapshots;
+      if (!file.ReadBytes(&block_addr, 4) || !file.ReadBytes(&num_snapshots, 4))
+        break;
+
+      auto& snaps = out.instruction_snapshots[block_addr];
+      for (u32 si = 0; si < num_snapshots; si++)
+      {
+        u32 num_instructions, crc32;
+        if (!file.ReadBytes(&num_instructions, 4) || !file.ReadBytes(&crc32, 4))
+          break;
+
+        TraceInstructionSnapshot snap;
+        snap.crc32 = crc32;
+        snap.instructions.resize(num_instructions);
+        if (!file.ReadBytes(snap.instructions.data(), num_instructions * 4))
+          break;
+        snaps.push_back(std::move(snap));
+      }
+    }
   }
 
   return true;
@@ -523,12 +567,13 @@ IdentifyFunctions(const std::map<u32, CFGBlock>& blocks, const std::vector<CFGEd
 // SQLite output
 // ============================================================================
 
-static bool WriteCFGDatabase(const std::string& path, const std::map<u32, CFGBlock>& blocks,
-                             const std::vector<CFGEdge>& edges,
-                             const std::map<u32, CFGFunction>& functions,
-                             const std::vector<TraceSMC>& smc_regions,
-                             const std::vector<TraceData::VertexFormat>& vertex_formats,
-                             const std::set<u32>& trace_block_addrs, u32 entry_point)
+static bool WriteCFGDatabase(
+    const std::string& path, const std::map<u32, CFGBlock>& blocks,
+    const std::vector<CFGEdge>& edges, const std::map<u32, CFGFunction>& functions,
+    const std::vector<TraceSMC>& smc_regions,
+    const std::vector<TraceData::VertexFormat>& vertex_formats,
+    const std::unordered_map<u32, std::vector<TraceInstructionSnapshot>>& instruction_snapshots,
+    const PPCMemoryImage& memory, const std::set<u32>& trace_block_addrs, u32 entry_point)
 {
   sqlite3* db = nullptr;
   if (sqlite3_open(path.c_str(), &db) != SQLITE_OK)
@@ -576,6 +621,12 @@ static bool WriteCFGDatabase(const std::string& path, const std::map<u32, CFGBlo
       vat_g2 INTEGER NOT NULL,
       PRIMARY KEY (vtx_desc_low, vtx_desc_high, vat_g0, vat_g1, vat_g2)
     );
+    CREATE TABLE IF NOT EXISTS instruction_hashes (
+      ppc_addr INTEGER PRIMARY KEY,
+      dol_crc32 INTEGER,
+      snapshot_count INTEGER NOT NULL,
+      matches_dol INTEGER NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_addr);
     CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_addr);
     CREATE INDEX IF NOT EXISTS idx_blocks_func ON blocks(function_addr);
@@ -611,6 +662,71 @@ static bool WriteCFGDatabase(const std::string& path, const std::map<u32, CFGBlo
       block_to_func[baddr] = entry;
   }
 
+  // Compare instruction snapshots against DOL to detect runtime-modified code.
+  // For each block with snapshots, compute the DOL's CRC32 and compare.
+  struct HashInfo
+  {
+    u32 dol_crc32;
+    u32 snapshot_count;
+    bool matches_dol;
+    bool has_dol;
+  };
+  std::unordered_map<u32, HashInfo> hash_info;
+  u32 snapshot_mismatch_count = 0;
+
+  for (const auto& [addr, block] : blocks)
+  {
+    auto snap_it = instruction_snapshots.find(addr);
+    if (snap_it == instruction_snapshots.end() || snap_it->second.empty())
+      continue;
+
+    // Compute DOL CRC32 for this block
+    std::vector<u32> dol_instructions(block.num_instructions);
+    bool has_dol = true;
+    for (u32 i = 0; i < block.num_instructions; i++)
+    {
+      auto inst = memory.ReadInstruction(addr + i * 4);
+      if (!inst)
+      {
+        has_dol = false;
+        break;
+      }
+      dol_instructions[i] = *inst;
+    }
+
+    u32 dol_crc = 0;
+    if (has_dol)
+    {
+      dol_crc = Common::ComputeCRC32(reinterpret_cast<const u8*>(dol_instructions.data()),
+                                     block.num_instructions * sizeof(u32));
+    }
+
+    // Check if all snapshots match DOL
+    bool all_match = has_dol;
+    if (has_dol)
+    {
+      for (const auto& snap : snap_it->second)
+      {
+        if (snap.crc32 != dol_crc || snap.instructions.size() != block.num_instructions)
+        {
+          all_match = false;
+          break;
+        }
+      }
+    }
+
+    if (!all_match)
+      snapshot_mismatch_count++;
+
+    hash_info[addr] = {dol_crc, static_cast<u32>(snap_it->second.size()), all_match, has_dol};
+  }
+
+  if (snapshot_mismatch_count > 0)
+  {
+    fmt::println(std::cerr, "  Instruction snapshot mismatches: {} blocks differ from DOL",
+                 snapshot_mismatch_count);
+  }
+
   // Insert blocks
   sqlite3_stmt* stmt = nullptr;
   sqlite3_prepare_v2(
@@ -622,6 +738,12 @@ static bool WriteCFGDatabase(const std::string& path, const std::map<u32, CFGBlo
   {
     u32 size_bytes = block.num_instructions * 4;
     bool translatable = !is_in_smc_region(addr, size_bytes);
+
+    // Also mark as untranslatable if instruction snapshots don't match DOL
+    auto hi = hash_info.find(addr);
+    if (hi != hash_info.end() && !hi->second.matches_dol)
+      translatable = false;
+
     const char* source;
     if (block.from_trace && trace_block_addrs.contains(addr))
       source = "both";
@@ -718,6 +840,28 @@ static bool WriteCFGDatabase(const std::string& path, const std::map<u32, CFGBlo
     sqlite3_reset(stmt);
   }
   sqlite3_finalize(stmt);
+
+  // Insert instruction hashes
+  if (!hash_info.empty())
+  {
+    sqlite3_prepare_v2(
+        db,
+        "INSERT OR REPLACE INTO instruction_hashes VALUES (?, ?, ?, ?)",
+        -1, &stmt, nullptr);
+    for (const auto& [addr, info] : hash_info)
+    {
+      sqlite3_bind_int64(stmt, 1, addr);
+      if (info.has_dol)
+        sqlite3_bind_int64(stmt, 2, info.dol_crc32);
+      else
+        sqlite3_bind_null(stmt, 2);
+      sqlite3_bind_int(stmt, 3, info.snapshot_count);
+      sqlite3_bind_int(stmt, 4, info.matches_dol ? 1 : 0);
+      sqlite3_step(stmt);
+      sqlite3_reset(stmt);
+    }
+    sqlite3_finalize(stmt);
+  }
 
   // Insert metadata
   sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO metadata VALUES (?, ?)", -1, &stmt, nullptr);
@@ -901,7 +1045,8 @@ int CfgCommand(const std::vector<std::string>& args)
 
   // 6. Write output
   if (!WriteCFGDatabase(output_path, blocks, edges, functions, trace.smc_regions,
-                        trace.vertex_formats, trace.seed_addresses, dol.GetEntryPoint()))
+                        trace.vertex_formats, trace.instruction_snapshots, memory,
+                        trace.seed_addresses, dol.GetEntryPoint()))
   {
     return EXIT_FAILURE;
   }

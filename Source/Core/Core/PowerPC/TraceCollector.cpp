@@ -4,6 +4,7 @@
 #include "Core/PowerPC/TraceCollector.h"
 
 #include "Common/FileUtil.h"
+#include "Common/Hash.h"
 #include "Common/IOFile.h"
 #include "Common/Logging/Log.h"
 
@@ -35,17 +36,40 @@ void TraceCollector::OnICacheInvalidation(u32 address, u32 length)
   m_smc_events.push_back({address, length, m_event_counter++});
 }
 
-void TraceCollector::RecordBlock(u32 ppc_addr, u32 block_size)
+void TraceCollector::RecordBlock(u32 ppc_addr, u32 block_size, const u32* instruction_words)
 {
+  const u32 crc = Common::ComputeCRC32(reinterpret_cast<const u8*>(instruction_words),
+                                       block_size * sizeof(u32));
+
   auto it = m_blocks.find(ppc_addr);
   if (it == m_blocks.end())
   {
-    m_blocks[ppc_addr] = {ppc_addr, block_size};
+    InstructionSnapshot snap;
+    snap.instructions.assign(instruction_words, instruction_words + block_size);
+    snap.crc32 = crc;
+    m_blocks[ppc_addr] = {ppc_addr, block_size, {std::move(snap)}};
   }
   else
   {
-    // Recompilation — keep latest size.
     it->second.block_size = block_size;
+
+    // Only store a new snapshot if the CRC32 doesn't match any existing one
+    bool found = false;
+    for (const auto& existing : it->second.snapshots)
+    {
+      if (existing.crc32 == crc && existing.instructions.size() == block_size)
+      {
+        found = true;
+        break;
+      }
+    }
+    if (!found)
+    {
+      InstructionSnapshot snap;
+      snap.instructions.assign(instruction_words, instruction_words + block_size);
+      snap.crc32 = crc;
+      it->second.snapshots.push_back(std::move(snap));
+    }
   }
 }
 
@@ -74,6 +98,7 @@ void TraceCollector::FlushToDisk(const std::string& path) const
   header.edge_count = static_cast<u32>(m_edges.size());
   header.smc_count = static_cast<u32>(m_smc_events.size());
   header.vtx_format_count = static_cast<u32>(m_vertex_formats.size());
+  header.snapshot_section_offset = 0;  // will be patched below
   file.WriteBytes(&header, sizeof(header));
 
   // Write blocks (8 bytes each: u32 addr + u32 size)
@@ -109,10 +134,39 @@ void TraceCollector::FlushToDisk(const std::string& path) const
       file.WriteBytes(&val, sizeof(u32));
   }
 
+  // Record the snapshot section offset and patch the header
+  const u64 snapshot_offset = file.Tell();
+  header.snapshot_section_offset = static_cast<u32>(snapshot_offset);
+
+  // Write instruction snapshots (variable length)
+  u32 blocks_with_snapshots = 0;
+  for (const auto& [addr, block] : m_blocks)
+  {
+    if (block.snapshots.empty())
+      continue;
+    blocks_with_snapshots++;
+    u32 block_addr = block.ppc_addr;
+    u32 num_snapshots = static_cast<u32>(block.snapshots.size());
+    file.WriteBytes(&block_addr, sizeof(u32));
+    file.WriteBytes(&num_snapshots, sizeof(u32));
+    for (const auto& snap : block.snapshots)
+    {
+      u32 num_instructions = static_cast<u32>(snap.instructions.size());
+      file.WriteBytes(&num_instructions, sizeof(u32));
+      file.WriteBytes(&snap.crc32, sizeof(u32));
+      file.WriteBytes(snap.instructions.data(), num_instructions * sizeof(u32));
+    }
+  }
+
+  // Patch the header with the snapshot section offset
+  file.Seek(0, File::SeekOrigin::Begin);
+  file.WriteBytes(&header, sizeof(header));
+
   INFO_LOG_FMT(DYNA_REC,
-               "TraceCollector: Flushed {} blocks, {} edges, {} SMC events, {} vertex formats to {}",
-               header.block_count, header.edge_count, header.smc_count, header.vtx_format_count,
-               path);
+               "TraceCollector: Flushed {} blocks ({} with snapshots), {} edges, "
+               "{} SMC events, {} vertex formats to {}",
+               header.block_count, blocks_with_snapshots, header.edge_count, header.smc_count,
+               header.vtx_format_count, path);
 }
 
 void TraceCollector::MergeFromDisk(const std::string& path)
@@ -123,26 +177,36 @@ void TraceCollector::MergeFromDisk(const std::string& path)
   if (!file.IsOpen())
     return;
 
+  // Read header field-by-field to handle v2/v3/v4 size differences
   FileHeader header{};
-  if (!file.ReadBytes(&header, sizeof(header)))
+  if (!file.ReadBytes(&header.magic, sizeof(u32)) ||
+      !file.ReadBytes(&header.version, sizeof(u32)) ||
+      !file.ReadBytes(&header.block_count, sizeof(u32)) ||
+      !file.ReadBytes(&header.edge_count, sizeof(u32)) ||
+      !file.ReadBytes(&header.smc_count, sizeof(u32)))
+  {
     return;
+  }
 
-  if (header.magic != MAGIC || (header.version != FORMAT_VERSION && header.version != 2))
+  if (header.magic != MAGIC || header.version < 2 || header.version > FORMAT_VERSION)
   {
     WARN_LOG_FMT(DYNA_REC, "TraceCollector: Incompatible trace file {} (version {}), skipping merge",
                  path, header.version);
     return;
   }
 
-  // v2 files don't have the vtx_format_count field — it's absent from the header
-  const bool is_v2 = (header.version == 2);
-  if (is_v2)
+  // v3+: read vtx_format_count
+  if (header.version >= 3)
   {
-    // The v2 header is 20 bytes (5 x u32), v3 is 24 bytes (6 x u32).
-    // We read 24 bytes but the last 4 bytes were actually the first block record.
-    // Seek back to re-read from the correct position.
-    header.vtx_format_count = 0;
-    file.Seek(sizeof(u32) * 5, File::SeekOrigin::Begin);
+    if (!file.ReadBytes(&header.vtx_format_count, sizeof(u32)))
+      return;
+  }
+
+  // v4+: read snapshot_section_offset
+  if (header.version >= 4)
+  {
+    if (!file.ReadBytes(&header.snapshot_section_offset, sizeof(u32)))
+      return;
   }
 
   // Merge blocks
@@ -153,7 +217,7 @@ void TraceCollector::MergeFromDisk(const std::string& path)
       return;
 
     if (!m_blocks.contains(ppc_addr))
-      m_blocks[ppc_addr] = {ppc_addr, block_size};
+      m_blocks[ppc_addr] = {ppc_addr, block_size, {}};
   }
 
   // Merge edges
@@ -199,10 +263,69 @@ void TraceCollector::MergeFromDisk(const std::string& path)
     m_vertex_formats.insert(fmt);
   }
 
+  // Merge instruction snapshots (v4+)
+  u32 merged_snapshots = 0;
+  if (header.version >= 4 && header.snapshot_section_offset > 0)
+  {
+    file.Seek(header.snapshot_section_offset, File::SeekOrigin::Begin);
+
+    while (file.Tell() < file.GetSize())
+    {
+      u32 block_addr, num_snapshots;
+      if (!file.ReadBytes(&block_addr, sizeof(u32)) ||
+          !file.ReadBytes(&num_snapshots, sizeof(u32)))
+      {
+        break;
+      }
+
+      for (u32 si = 0; si < num_snapshots; si++)
+      {
+        u32 num_instructions, crc32;
+        if (!file.ReadBytes(&num_instructions, sizeof(u32)) ||
+            !file.ReadBytes(&crc32, sizeof(u32)))
+        {
+          break;
+        }
+
+        std::vector<u32> instructions(num_instructions);
+        if (!file.ReadBytes(instructions.data(), num_instructions * sizeof(u32)))
+          break;
+
+        // Merge into existing block (create if needed)
+        auto& block = m_blocks[block_addr];
+        if (block.ppc_addr == 0)
+        {
+          block.ppc_addr = block_addr;
+          block.block_size = num_instructions;
+        }
+
+        // Deduplicate by CRC32
+        bool found = false;
+        for (const auto& existing : block.snapshots)
+        {
+          if (existing.crc32 == crc32 && existing.instructions.size() == num_instructions)
+          {
+            found = true;
+            break;
+          }
+        }
+        if (!found)
+        {
+          InstructionSnapshot snap;
+          snap.instructions = std::move(instructions);
+          snap.crc32 = crc32;
+          block.snapshots.push_back(std::move(snap));
+          merged_snapshots++;
+        }
+      }
+    }
+  }
+
   INFO_LOG_FMT(DYNA_REC,
-               "TraceCollector: Merged {} blocks, {} edges, {} SMC events, {} vertex formats from {}",
+               "TraceCollector: Merged {} blocks, {} edges, {} SMC events, "
+               "{} vertex formats, {} snapshots from {}",
                header.block_count, header.edge_count, header.smc_count, header.vtx_format_count,
-               path);
+               merged_snapshots, path);
 }
 
 void TraceCollector::Clear()

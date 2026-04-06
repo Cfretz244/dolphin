@@ -744,14 +744,25 @@ int AotCommand(const std::vector<std::string>& args)
     file << "    return 0;\n";
     file << "}\n\n";
 
+    // Emit block invalidation function — NULLs a dispatch table entry so
+    // future dispatches to that address fall back to the interpreter.
+    // Called by aot_icbi at runtime when the game invalidates a cache line.
+    file << fmt::format("void {}_invalidate_block(uint32_t pc) {{\n", prefix);
+    file << fmt::format("    uint32_t idx = (pc - {}_TABLE_BASE) >> 2;\n", prefix);
+    file << fmt::format("    if (idx < {}_TABLE_SIZE)\n", prefix);
+    file << fmt::format("        {}_fast_table[idx] = 0;\n", prefix);
+    file << "}\n\n";
+
     // Emit self-registration constructor — runs before main() to register
-    // this game's dispatch/lookup with Dolphin's AotRegistry.
+    // this game's dispatch/lookup/invalidation with Dolphin's AotRegistry.
     file << "__attribute__((constructor))\n";
     file << fmt::format("static void aot_register_{}(void) {{\n", prefix);
-    file << "    extern void aot_register_game(const char*,"
-            " void (*)(AOTState*), AOTBlockFunc (*)(uint32_t));\n";
-    file << fmt::format("    aot_register_game(\"{}\", {}_dispatch, {}_lookup_block);\n", prefix,
-                        prefix, prefix);
+    file << "    extern void aot_register_game_v2(const char*,"
+            " void (*)(AOTState*), AOTBlockFunc (*)(uint32_t),"
+            " void (*)(uint32_t));\n";
+    file << fmt::format("    aot_register_game_v2(\"{}\", {}_dispatch, {}_lookup_block,"
+                        " {}_invalidate_block);\n",
+                        prefix, prefix, prefix, prefix);
     file << "}\n";
   }
 
