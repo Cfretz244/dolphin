@@ -125,6 +125,8 @@ AOTCore::~AOTCore()
 
 extern "C" void aot_interpreter_single_step(AOTState* s);
 extern "C" void aot_init_fast_mem();
+extern "C" void aot_enable_fallback_tracking();
+extern "C" void aot_dump_fallback_stats();
 
 static void interp_only_dispatch(AOTState* s)
 {
@@ -135,6 +137,9 @@ void AOTCore::Init()
 {
   // Cache RAM pointer and size for fast memory access
   aot_init_fast_mem();
+
+  if (getenv("AOT_TRACK_FALLBACKS"))
+    aot_enable_fallback_tracking();
 
   m_interp_dispatch = &interp_only_dispatch;
 
@@ -226,6 +231,7 @@ void AOTCore::Init()
 
 void AOTCore::Shutdown()
 {
+  aot_dump_fallback_stats();
   m_dispatch = nullptr;
   m_block_sizes.clear();
   std::free(m_ram_shadow);

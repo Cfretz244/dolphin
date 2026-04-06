@@ -19,6 +19,7 @@
 
 #include "Core/DolphinAnalytics.h"
 #include "Core/HW/Memmap.h"
+#include "Core/PowerPC/JitInterface.h"
 #include "Core/System.h"
 
 #include "VideoCommon/AbstractGfx.h"
@@ -242,6 +243,12 @@ VertexLoaderBase* GetOrCreateLoader(int vtx_attr_group)
         VertexLoaderBase::CreateVertexLoader(state->vtx_desc, state->vtx_attr[vtx_attr_group]));
     loader = it->second.get();
     INCSTAT(g_stats.num_vertex_loaders);
+
+    // Record vertex format for AOT trace collection
+    Core::System::GetInstance().GetJitInterface().RecordVertexFormat(
+        state->vtx_desc.low.Hex, state->vtx_desc.high.Hex,
+        state->vtx_attr[vtx_attr_group].g0.Hex, state->vtx_attr[vtx_attr_group].g1.Hex,
+        state->vtx_attr[vtx_attr_group].g2.Hex);
   }
   if (check_for_native_format)
   {

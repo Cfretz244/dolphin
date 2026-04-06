@@ -356,6 +356,18 @@ void JitInterface::CompileExceptionCheckFromJIT(JitInterface& jit_interface, Exc
   jit_interface.CompileExceptionCheck(type);
 }
 
+bool JitInterface::RecordVertexFormat(u32 vtx_desc_low, u32 vtx_desc_high, u32 vat_g0, u32 vat_g1,
+                                      u32 vat_g2)
+{
+  if (m_jit && m_jit->IsTraceCollectionEnabled())
+  {
+    m_jit->m_trace_collector.RecordVertexFormat(vtx_desc_low, vtx_desc_high, vat_g0, vat_g1,
+                                                vat_g2);
+    return true;
+  }
+  return false;
+}
+
 void JitInterface::Shutdown()
 {
   if (m_jit)

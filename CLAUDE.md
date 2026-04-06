@@ -119,8 +119,14 @@ Source/Core/DolphinTool/
   CfgCommand.{h,cpp}         — Phase 2: CFG extraction from traces + disassembly
   AotCEmitter.{h,cpp}        — Phase 3: PPC instruction → C code emitter
   AotCommand.{h,cpp}         — Phase 3: orchestrator + dispatch table generation
+  VertexLoaderCEmitter.{h,cpp} — Vertex format → C vertex loader emitter
+  VtxAotCommand.{h,cpp}      — `dolphin-tool vtxaot`: vertex loader AOT orchestrator
   DiffCommand.{h,cpp}        — Offline AOT-vs-interpreter comparison tool
   PPCMemoryImage.h           — Shared ROM memory image class
+
+Source/Core/VideoCommon/
+  VertexLoaderAOT.{h,cpp}    — VertexLoaderBase impl wrapping AOT-compiled C loaders
+  VertexLoaderAotRegistry.{h,cpp} — Per-game vertex loader registry (constructor-based registration)
 
 Source/Core/Core/Config/MainSettings.{h,cpp} — Config entries for trace/diff/compare
 Source/Core/DolphinQt/Settings/AdvancedPane.cpp — AOT in CPU core dropdown
@@ -160,6 +166,20 @@ Dolphin uses an optimized 64-bit format per CR field (NOT standard PPC 4-bit). A
 
 All FP arithmetic delegates to Dolphin's interpreter methods via macro-generated `extern "C"` wrappers in `AotRuntime.cpp`. Critical: `ps_neg`/`ps_abs`/`ps_nabs` operate on BOTH PS0 and PS1 (unlike scalar `fneg`/`fabs`/`fnabs` which only affect PS0).
 
+### Vertex Loader AOT
+
+On iOS, the ARM64 vertex loader JIT is disabled. The vertex loader AOT pipeline generates pre-compiled C vertex loaders to replace the slow software fallback (~20x faster). Games use only 5-30 unique vertex formats.
+
+**Pipeline:**
+1. **Trace:** Vertex format UIDs (5 u32 register values) are recorded alongside PPC traces during gameplay (`.dpht` v3 format).
+2. **CFG extraction:** `dolphin-tool cfg` extracts vertex formats into a `vertex_formats` SQLite table.
+3. **C generation:** `dolphin-tool vtxaot --cfg cfg.db --output aot_output/ --prefix GALE01` generates monolithic C vertex loader functions.
+4. **Compile + link:** Output `.c` files compile into the same `.a` as PPC AOT code.
+
+**Runtime:** `VertexLoaderAotRegistry` receives registrations via `__attribute__((constructor))`. `CreateVertexLoader()` in `VertexLoaderBase.cpp` checks the registry before falling back to JIT/software. `VertexLoaderAOT` wraps the C function, passing arraybases/strides/z-freeze caches as parameters.
+
+**Validation:** Use `VertexLoaderType::Compare` (`-C Dolphin.GFX.VertexLoaderType=2`) to compare AOT vs JIT output byte-for-byte.
+
 ## Diagnostic Tools
 
 | Env Var / Flag | Purpose |
@@ -170,6 +190,7 @@ All FP arithmetic delegates to Dolphin's interpreter methods via macro-generated
 | `AOT_SWITCH_AT=N` | Interpreter for first N dispatches, then AOT |
 | `AOT_DUMP_FRAME=/path` | Dump 24MB RAM after first VI frame |
 | `AOT_LOG_PC=/path` | Log every dispatch PC for diffing |
+| `AOT_TRACK_FALLBACKS=1` | Log interpreter fallback stats per-PC at shutdown |
 | `dolphin-tool diff --iso --cfg` | Offline block-level AOT-vs-interpreter diff |
 
 Config entries via `-C`: `Dolphin.Debug.AOTCfgDbPath`, `Dolphin.Debug.AOTDiffMode`, `Dolphin.Debug.AOTDiffSavestatePath`, `Dolphin.Debug.AOTDiffLogPath`.

@@ -124,8 +124,12 @@ private:
   void EmitMtspr(std::string& out, UGeckoInstruction inst);
   void EmitMfcr(std::string& out, UGeckoInstruction inst);
   void EmitMtcrf(std::string& out, UGeckoInstruction inst);
+  void EmitMcrxr(std::string& out, UGeckoInstruction inst);
   void EmitMfmsr(std::string& out, UGeckoInstruction inst);
   void EmitMtmsr(std::string& out, UGeckoInstruction inst, u32 pc);
+  void EmitMfsr(std::string& out, UGeckoInstruction inst);
+  void EmitMtsr(std::string& out, UGeckoInstruction inst);
+  void EmitTwi(std::string& out, UGeckoInstruction inst, u32 pc);
   void EmitCrLogical(std::string& out, UGeckoInstruction inst, const char* op);
   void EmitMcrf(std::string& out, UGeckoInstruction inst);
 

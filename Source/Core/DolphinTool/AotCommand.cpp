@@ -85,6 +85,7 @@ extern uint32_t aot_read_u32(AOTState* s, uint32_t addr);
 extern uint64_t aot_read_u64(AOTState* s, uint32_t addr);
 extern void aot_write_u8(AOTState* s, uint32_t val, uint32_t addr);
 extern void aot_write_u16(AOTState* s, uint32_t val, uint32_t addr);
+extern void aot_write_u16_br(AOTState* s, uint32_t val, uint32_t addr);
 extern void aot_write_u32(AOTState* s, uint32_t val, uint32_t addr);
 extern void aot_write_u64(AOTState* s, uint64_t val, uint32_t addr);
 extern void aot_interpreter_single_step(AOTState* s);
@@ -103,6 +104,8 @@ extern uint32_t aot_mfcr(AOTState* s);
 extern void aot_mtcrf(AOTState* s, uint32_t mask, uint32_t rs_reg);
 extern void aot_msr_updated(AOTState* s);
 extern void aot_mtmsr(AOTState* s, uint32_t val);
+extern void aot_sr_updated(AOTState* s);
+extern int aot_twi(AOTState* s, uint32_t TO, int32_t a, int32_t b);
 extern void aot_cr_logical(AOTState* s, int crbD, int crbA, int crbB, const char* op);
 
 // Cache ops
@@ -640,7 +643,7 @@ int AotCommand(const std::vector<std::string>& args)
     fwd << "#include \"aot_runtime.h\"\n\n";
     for (const auto& b : cfg_blocks)
     {
-      if (b.is_translatable && !interior_blocks.contains(b.ppc_addr))
+      if (b.is_translatable)
         fwd << fmt::format("__attribute__((noinline)) void {}_block_{:08x}(AOTState* s);\n",
                            prefix, b.ppc_addr);
     }
@@ -666,10 +669,6 @@ int AotCommand(const std::vector<std::string>& args)
         continue;
       }
 
-      // Skip interior chain blocks — they're emitted as part of their chain head
-      if (interior_blocks.contains(b->ppc_addr))
-        continue;
-
       // If this block is a chain head, emit the merged chain
       auto chain_it = head_to_chain.find(b->ppc_addr);
       if (chain_it != head_to_chain.end())
@@ -679,13 +678,18 @@ int AotCommand(const std::vector<std::string>& args)
         file << chain_code << "\n";
         translated += static_cast<u32>(chain.blocks.size());
       }
-      else
+
+      // Emit standalone function for this block. For interior chain blocks this
+      // is a duplicate (also inlined in the chain head), but it's needed so the
+      // dispatch table has a valid entry when the block is reached via indirect
+      // branches (blr/bctr) or exception returns that aren't tracked as CFG edges.
+      if (!head_to_chain.contains(b->ppc_addr))
       {
-        // Standalone block — not part of any chain
         std::string block_code = emitter.TranslateBlock(b->ppc_addr, b->num_instructions,
                                                         b->from_trace);
         file << block_code << "\n";
-        translated++;
+        if (!interior_blocks.contains(b->ppc_addr))
+          translated++;
       }
     }
   }
@@ -723,11 +727,11 @@ int AotCommand(const std::vector<std::string>& args)
 
     file << fmt::format("static AOTBlockFunc {}_fast_table[{}] = {{\n", prefix, table_entries);
 
-    // Build a set for quick lookup — interior chain blocks have no standalone function
+    // Build a set for quick lookup — all translatable blocks get dispatch entries
     std::map<u32, std::string> addr_to_sym;
     for (const auto& b : cfg_blocks)
     {
-      if (b.is_translatable && !interior_blocks.contains(b.ppc_addr))
+      if (b.is_translatable)
         addr_to_sym[b.ppc_addr] = fmt::format("{}_block_{:08x}", prefix, b.ppc_addr);
     }
 

@@ -101,6 +101,9 @@ public:
   /// used for the page fault unit test, don't use outside of tests!
   void SetJit(std::unique_ptr<JitBase> jit);
 
+  // Returns true if vertex format was recorded (trace collection is active and JIT exists).
+  bool RecordVertexFormat(u32 vtx_desc_low, u32 vtx_desc_high, u32 vat_g0, u32 vat_g1, u32 vat_g2);
+
   void Shutdown();
 
 private:

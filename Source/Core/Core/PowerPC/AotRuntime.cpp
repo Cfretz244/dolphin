@@ -4,10 +4,14 @@
 // AOT Runtime: extern "C" helper functions called by AOT-translated PPC code.
 // These wrap Dolphin's existing subsystems (MMU, Interpreter, CoreTiming).
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <unordered_map>
+#include <vector>
 
 #include "Common/CommonTypes.h"
+#include "Common/Swap.h"
 #include "Core/CoreTiming.h"
 #include "Core/HW/GPFifo.h"
 #include "Core/HW/Memmap.h"
@@ -17,6 +21,7 @@
 #include "Core/PowerPC/Interpreter/Interpreter_FPUtils.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/MMU.h"
+#include "Core/PowerPC/PPCTables.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
@@ -79,6 +84,10 @@ static UGeckoInstruction MakeCRInst(int crfd, int fa, int fb)
 
 static u8* s_ram_ptr = nullptr;
 static u32 s_ram_size = 0;
+
+// Interpreter fallback tracking (enabled by AOT_TRACK_FALLBACKS=1)
+static bool s_track_fallbacks = false;
+static std::unordered_map<u32, u64> s_fallback_counts;
 
 // Check if address is in main RAM (cached or uncached mirror)
 static inline bool IsRAMAddress(u32 addr)
@@ -172,6 +181,17 @@ void aot_write_u16(AOTState* s, uint32_t val, uint32_t addr)
   PowerPC::WriteFromJit<u16>(GetMMU(), static_cast<u16>(val), addr);
 }
 
+void aot_write_u16_br(AOTState* s, uint32_t val, uint32_t addr)
+{
+  if (__builtin_expect(IsRAMAddress(addr), 1))
+  {
+    u16 raw = static_cast<u16>(val);  // no swap — byte-reversed store
+    std::memcpy(&s_ram_ptr[addr & 0x3FFFFFFF], &raw, sizeof(u16));
+    return;
+  }
+  GetMMU().Write_U16_Swap(val, addr);
+}
+
 void aot_write_u32(AOTState* s, uint32_t val, uint32_t addr)
 {
   if (__builtin_expect(IsRAMAddress(addr), 1))
@@ -195,12 +215,69 @@ void aot_write_u64(AOTState* s, uint64_t val, uint32_t addr)
 }
 
 // ============================================================================
+// Interpreter fallback tracking
+// ============================================================================
+
+void aot_enable_fallback_tracking()
+{
+  s_track_fallbacks = true;
+  s_fallback_counts.clear();
+}
+
+void aot_dump_fallback_stats()
+{
+  if (!s_track_fallbacks || s_fallback_counts.empty())
+    return;
+
+  std::vector<std::pair<u32, u64>> sorted(s_fallback_counts.begin(), s_fallback_counts.end());
+  std::sort(sorted.begin(), sorted.end(),
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+
+  u64 total = 0;
+  for (const auto& [pc, count] : sorted)
+    total += count;
+
+  fmt::print(stderr, "\n=== AOT Interpreter Fallback Stats ===\n");
+  fmt::print(stderr, "Total fallbacks: {}\n", total);
+  fmt::print(stderr, "Unique PCs: {}\n\n", sorted.size());
+
+  const size_t limit = std::min<size_t>(sorted.size(), 50);
+  for (size_t i = 0; i < limit; i++)
+  {
+    const u32 pc = sorted[i].first;
+    const u64 count = sorted[i].second;
+    std::string opname = "???";
+    if (s_ram_ptr && IsRAMAddress(pc))
+    {
+      u32 inst_word;
+      std::memcpy(&inst_word, &s_ram_ptr[pc & 0x3FFFFFFF], sizeof(u32));
+      inst_word = Common::swap32(inst_word);
+      UGeckoInstruction inst(inst_word);
+      const GekkoOPInfo* info = PPCTables::GetOpInfo(inst, pc);
+      if (info)
+        opname = info->opname;
+    }
+    fmt::print(stderr, "  {:>12} hits  PC={:#010x}  {}\n", count, pc, opname);
+  }
+  if (sorted.size() > limit)
+    fmt::print(stderr, "  ... and {} more unique PCs\n", sorted.size() - limit);
+  fmt::print(stderr, "======================================\n\n");
+
+  s_fallback_counts.clear();
+  s_track_fallbacks = false;
+}
+
+// ============================================================================
 // Interpreter fallback
 // ============================================================================
 
 void aot_interpreter_single_step(AOTState* s)
 {
   auto& ppc_state = GetPPCState(s);
+
+  if (s_track_fallbacks)
+    s_fallback_counts[ppc_state.pc]++;
+
   auto& system = GetSystem();
 
   auto& interpreter = system.GetInterpreter();
@@ -266,6 +343,26 @@ void aot_mtmsr(AOTState* s, uint32_t val)
   ppc_state.msr.Hex = val;
   aot_msr_updated(s);  // Lightweight — no BAT remapping
   GetSystem().GetPowerPC().CheckExceptions();
+}
+
+void aot_sr_updated(AOTState* s)
+{
+  GetSystem().GetMMU().SRUpdated();
+}
+
+int aot_twi(AOTState* s, uint32_t TO, int32_t a, int32_t b)
+{
+  if ((a < b && (TO & 0x10) != 0) || (a > b && (TO & 0x08) != 0) ||
+      (a == b && (TO & 0x04) != 0) || ((u32)a < (u32)b && (TO & 0x02) != 0) ||
+      ((u32)a > (u32)b && (TO & 0x01) != 0))
+  {
+    auto& ppc_state = GetPPCState(s);
+    ppc_state.Exceptions |= EXCEPTION_PROGRAM;
+    ppc_state.spr[SPR_SRR1] = static_cast<u32>(ProgramExceptionCause::Trap);
+    GetSystem().GetPowerPC().CheckExceptions();
+    return 1;
+  }
+  return 0;
 }
 
 // ============================================================================

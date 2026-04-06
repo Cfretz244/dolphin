@@ -16,6 +16,7 @@
 #include "DolphinTool/ExtractCommand.h"
 #include "DolphinTool/HeaderCommand.h"
 #include "DolphinTool/VerifyCommand.h"
+#include "DolphinTool/VtxAotCommand.h"
 
 #ifdef _WIN32
 #include "Common/StringUtil.h"
@@ -26,7 +27,7 @@ static void PrintUsage()
   fmt::print(std::cerr,
              "usage: dolphin-tool COMMAND -h\n"
              "\n"
-             "commands supported: [convert, verify, header, extract, cfg, translate, diff]\n");
+             "commands supported: [convert, verify, header, extract, cfg, translate, diff, vtxaot]\n");
 }
 
 #ifdef _WIN32
@@ -59,6 +60,8 @@ int main(int argc, char* argv[])
     return DolphinTool::AotCommand(args);
   else if (command_str == "diff")
     return DolphinTool::DiffCommand(args);
+  else if (command_str == "vtxaot")
+    return DolphinTool::VtxAotCommand(args);
   PrintUsage();
   return EXIT_FAILURE;
 }

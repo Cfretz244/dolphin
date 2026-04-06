@@ -9,6 +9,10 @@ add_executable(dolphin-tool
   DiffCommand.cpp
   DiffCommand.h
   PPCMemoryImage.h
+  VertexLoaderCEmitter.cpp
+  VertexLoaderCEmitter.h
+  VtxAotCommand.cpp
+  VtxAotCommand.h
   ExtractCommand.cpp
   ExtractCommand.h
   ConvertCommand.cpp

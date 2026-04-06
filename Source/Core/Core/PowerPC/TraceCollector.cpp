@@ -49,6 +49,12 @@ void TraceCollector::RecordBlock(u32 ppc_addr, u32 block_size)
   }
 }
 
+void TraceCollector::RecordVertexFormat(u32 vtx_desc_low, u32 vtx_desc_high, u32 vat_g0,
+                                        u32 vat_g1, u32 vat_g2)
+{
+  m_vertex_formats.insert({vtx_desc_low, vtx_desc_high, vat_g0, vat_g1, vat_g2});
+}
+
 void TraceCollector::FlushToDisk(const std::string& path) const
 {
   std::lock_guard lock(m_mutex);
@@ -67,6 +73,7 @@ void TraceCollector::FlushToDisk(const std::string& path) const
   header.block_count = static_cast<u32>(m_blocks.size());
   header.edge_count = static_cast<u32>(m_edges.size());
   header.smc_count = static_cast<u32>(m_smc_events.size());
+  header.vtx_format_count = static_cast<u32>(m_vertex_formats.size());
   file.WriteBytes(&header, sizeof(header));
 
   // Write blocks (8 bytes each: u32 addr + u32 size)
@@ -95,8 +102,17 @@ void TraceCollector::FlushToDisk(const std::string& path) const
     file.WriteBytes(&smc.event_counter, sizeof(u64));
   }
 
-  INFO_LOG_FMT(DYNA_REC, "TraceCollector: Flushed {} blocks, {} edges, {} SMC events to {}",
-               header.block_count, header.edge_count, header.smc_count, path);
+  // Write vertex format records (20 bytes each: 5 x u32)
+  for (const auto& fmt : m_vertex_formats)
+  {
+    for (u32 val : fmt)
+      file.WriteBytes(&val, sizeof(u32));
+  }
+
+  INFO_LOG_FMT(DYNA_REC,
+               "TraceCollector: Flushed {} blocks, {} edges, {} SMC events, {} vertex formats to {}",
+               header.block_count, header.edge_count, header.smc_count, header.vtx_format_count,
+               path);
 }
 
 void TraceCollector::MergeFromDisk(const std::string& path)
@@ -111,10 +127,22 @@ void TraceCollector::MergeFromDisk(const std::string& path)
   if (!file.ReadBytes(&header, sizeof(header)))
     return;
 
-  if (header.magic != MAGIC || header.version != FORMAT_VERSION)
+  if (header.magic != MAGIC || (header.version != FORMAT_VERSION && header.version != 2))
   {
-    WARN_LOG_FMT(DYNA_REC, "TraceCollector: Incompatible trace file {}, skipping merge", path);
+    WARN_LOG_FMT(DYNA_REC, "TraceCollector: Incompatible trace file {} (version {}), skipping merge",
+                 path, header.version);
     return;
+  }
+
+  // v2 files don't have the vtx_format_count field — it's absent from the header
+  const bool is_v2 = (header.version == 2);
+  if (is_v2)
+  {
+    // The v2 header is 20 bytes (5 x u32), v3 is 24 bytes (6 x u32).
+    // We read 24 bytes but the last 4 bytes were actually the first block record.
+    // Seek back to re-read from the correct position.
+    header.vtx_format_count = 0;
+    file.Seek(sizeof(u32) * 5, File::SeekOrigin::Begin);
   }
 
   // Merge blocks
@@ -159,8 +187,22 @@ void TraceCollector::MergeFromDisk(const std::string& path)
     m_smc_events.push_back({addr, length, event_counter});
   }
 
-  INFO_LOG_FMT(DYNA_REC, "TraceCollector: Merged {} blocks, {} edges, {} SMC events from {}",
-               header.block_count, header.edge_count, header.smc_count, path);
+  // Merge vertex format records (v3+)
+  for (u32 i = 0; i < header.vtx_format_count; i++)
+  {
+    std::array<u32, 5> fmt;
+    for (u32& val : fmt)
+    {
+      if (!file.ReadBytes(&val, sizeof(u32)))
+        return;
+    }
+    m_vertex_formats.insert(fmt);
+  }
+
+  INFO_LOG_FMT(DYNA_REC,
+               "TraceCollector: Merged {} blocks, {} edges, {} SMC events, {} vertex formats from {}",
+               header.block_count, header.edge_count, header.smc_count, header.vtx_format_count,
+               path);
 }
 
 void TraceCollector::Clear()
@@ -168,6 +210,7 @@ void TraceCollector::Clear()
   m_blocks.clear();
   m_edges.clear();
   m_smc_events.clear();
+  m_vertex_formats.clear();
   m_event_counter = 0;
 }
 

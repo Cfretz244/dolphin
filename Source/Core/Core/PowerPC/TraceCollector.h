@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <array>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -38,6 +40,10 @@ public:
   // Record a block's metadata. Called at JIT compile time (FinalizeBlock).
   void RecordBlock(u32 ppc_addr, u32 block_size);
 
+  // Record a unique vertex loader format configuration.
+  // Called from VertexLoaderManager when a new format is first seen during tracing.
+  void RecordVertexFormat(u32 vtx_desc_low, u32 vtx_desc_high, u32 vat_g0, u32 vat_g1, u32 vat_g2);
+
   bool IsActive() const { return m_active; }
   void SetActive(bool active) { m_active = active; }
 
@@ -68,7 +74,7 @@ private:
 
   // Binary file format constants
   static constexpr u32 MAGIC = 0x54485044;  // "DPHT" little-endian
-  static constexpr u32 FORMAT_VERSION = 2;
+  static constexpr u32 FORMAT_VERSION = 3;
 
   struct FileHeader
   {
@@ -77,6 +83,7 @@ private:
     u32 block_count;
     u32 edge_count;
     u32 smc_count;
+    u32 vtx_format_count;
   };
 
   static u64 MakeEdgeKey(u32 from, u32 to, EdgeType type)
@@ -88,6 +95,7 @@ private:
   std::unordered_map<u32, BlockRecord> m_blocks;
   std::unordered_map<u64, EdgeRecord> m_edges;
   std::vector<SMCRecord> m_smc_events;
+  std::set<std::array<u32, 5>> m_vertex_formats;
   u64 m_event_counter = 0;
   mutable std::mutex m_mutex;
 };

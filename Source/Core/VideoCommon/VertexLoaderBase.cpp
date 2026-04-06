@@ -15,7 +15,10 @@
 #include "Common/CommonTypes.h"
 #include "Common/MsgHandler.h"
 
+#include "Core/ConfigManager.h"
 #include "VideoCommon/VertexLoader.h"
+#include "VideoCommon/VertexLoaderAOT.h"
+#include "VideoCommon/VertexLoaderAotRegistry.h"
 #include "VideoCommon/VertexLoaderManager.h"
 #include "VideoCommon/VertexLoader_Color.h"
 #include "VideoCommon/VertexLoader_Normal.h"
@@ -238,6 +241,24 @@ std::unique_ptr<VertexLoaderBase> VertexLoaderBase::CreateVertexLoader(const TVt
 {
   const VertexLoaderType loader_type = g_ActiveConfig.vertex_loader_type;
 
+  // Try AOT vertex loader first (critical for iOS, also works on desktop for validation)
+  if (loader_type != VertexLoaderType::Software)
+  {
+    auto& registry = VertexLoaderAotRegistry::Instance();
+    if (registry.HasEntries())
+    {
+      VertexLoaderAotRegistry::Key key = {vtx_desc.low.Hex, vtx_desc.high.Hex, vtx_attr.g0.Hex,
+                                          vtx_attr.g1.Hex, vtx_attr.g2.Hex};
+      if (auto* entry = registry.Find(SConfig::GetInstance().GetGameID(), key))
+      {
+        auto aot_loader = std::make_unique<VertexLoaderAOT>(vtx_desc, vtx_attr, *entry);
+        if (loader_type != VertexLoaderType::Compare)
+          return aot_loader;
+        // In compare mode, fall through to create a native/software loader to compare against
+      }
+    }
+  }
+
   if (loader_type == VertexLoaderType::Software)
   {
     return std::make_unique<VertexLoader>(vtx_desc, vtx_attr);
@@ -262,6 +283,19 @@ std::unique_ptr<VertexLoaderBase> VertexLoaderBase::CreateVertexLoader(const TVt
 
   if (loader_type == VertexLoaderType::Compare)
   {
+    // If AOT loader is available, compare AOT against native JIT
+    auto& registry = VertexLoaderAotRegistry::Instance();
+    VertexLoaderAotRegistry::Key key = {vtx_desc.low.Hex, vtx_desc.high.Hex, vtx_attr.g0.Hex,
+                                        vtx_attr.g1.Hex, vtx_attr.g2.Hex};
+    auto* entry = registry.HasEntries() ?
+        registry.Find(SConfig::GetInstance().GetGameID(), key) : nullptr;
+    if (entry)
+    {
+      return std::make_unique<VertexLoaderTester>(
+          std::make_unique<VertexLoaderAOT>(vtx_desc, vtx_attr, *entry),  // AOT
+          std::move(native_loader),                                        // JIT reference
+          vtx_desc, vtx_attr);
+    }
     return std::make_unique<VertexLoaderTester>(
         std::make_unique<VertexLoader>(vtx_desc, vtx_attr),  // the software one
         std::move(native_loader),                            // the new one to compare

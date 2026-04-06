@@ -199,6 +199,10 @@ add_library(videocommon
   UberShaderVertex.h
   VertexLoader.cpp
   VertexLoader.h
+  VertexLoaderAOT.cpp
+  VertexLoaderAOT.h
+  VertexLoaderAotRegistry.cpp
+  VertexLoaderAotRegistry.h
   VertexLoaderBase.cpp
   VertexLoaderBase.h
   VertexLoaderManager.cpp

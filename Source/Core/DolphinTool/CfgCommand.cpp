@@ -64,6 +64,13 @@ struct TraceData
   std::vector<TraceSMC> smc_regions;
   std::set<u32> seed_addresses;
   std::unordered_multimap<u32, u32> dynamic_targets;  // from_block -> to_addr
+
+  // Vertex format configurations recorded during tracing (v3+)
+  struct VertexFormat
+  {
+    u32 vtx_desc_low, vtx_desc_high, vat_g0, vat_g1, vat_g2;
+  };
+  std::vector<VertexFormat> vertex_formats;
 };
 
 static bool ReadTraceFile(const std::string& path, TraceData& out)
@@ -75,30 +82,36 @@ static bool ReadTraceFile(const std::string& path, TraceData& out)
     return false;
   }
 
-  struct
-  {
-    u32 magic, version, block_count, edge_count, smc_count;
-  } header{};
-  if (!file.ReadBytes(&header, sizeof(header)))
+  // Read the common header fields first (v2 has 5 fields, v3 has 6)
+  u32 magic, version, block_count, edge_count, smc_count;
+  if (!file.ReadBytes(&magic, 4) || !file.ReadBytes(&version, 4) ||
+      !file.ReadBytes(&block_count, 4) || !file.ReadBytes(&edge_count, 4) ||
+      !file.ReadBytes(&smc_count, 4))
     return false;
 
-  if (header.magic != 0x54485044 || header.version != 2)
+  if (magic != 0x54485044 || (version != 2 && version != 3))
   {
-    fmt::println(std::cerr, "Error: Invalid trace file (magic={:#x}, version={})", header.magic,
-                 header.version);
+    fmt::println(std::cerr, "Error: Invalid trace file (magic={:#x}, version={})", magic, version);
     return false;
   }
 
-  out.blocks.resize(header.block_count);
-  for (u32 i = 0; i < header.block_count; i++)
+  u32 vtx_format_count = 0;
+  if (version >= 3)
+  {
+    if (!file.ReadBytes(&vtx_format_count, 4))
+      return false;
+  }
+
+  out.blocks.resize(block_count);
+  for (u32 i = 0; i < block_count; i++)
   {
     if (!file.ReadBytes(&out.blocks[i].addr, 4) || !file.ReadBytes(&out.blocks[i].size, 4))
       return false;
     out.seed_addresses.insert(out.blocks[i].addr);
   }
 
-  out.edges.resize(header.edge_count);
-  for (u32 i = 0; i < header.edge_count; i++)
+  out.edges.resize(edge_count);
+  for (u32 i = 0; i < edge_count; i++)
   {
     u8 pad[3];
     if (!file.ReadBytes(&out.edges[i].from, 4) || !file.ReadBytes(&out.edges[i].to, 4) ||
@@ -108,7 +121,7 @@ static bool ReadTraceFile(const std::string& path, TraceData& out)
       out.dynamic_targets.emplace(out.edges[i].from, out.edges[i].to);
   }
 
-  for (u32 i = 0; i < header.smc_count; i++)
+  for (u32 i = 0; i < smc_count; i++)
   {
     TraceSMC smc{};
     u64 counter;
@@ -116,6 +129,17 @@ static bool ReadTraceFile(const std::string& path, TraceData& out)
         !file.ReadBytes(&counter, 8))
       return false;
     out.smc_regions.push_back(smc);
+  }
+
+  // Read vertex format records (v3+)
+  out.vertex_formats.resize(vtx_format_count);
+  for (u32 i = 0; i < vtx_format_count; i++)
+  {
+    auto& fmt = out.vertex_formats[i];
+    if (!file.ReadBytes(&fmt.vtx_desc_low, 4) || !file.ReadBytes(&fmt.vtx_desc_high, 4) ||
+        !file.ReadBytes(&fmt.vat_g0, 4) || !file.ReadBytes(&fmt.vat_g1, 4) ||
+        !file.ReadBytes(&fmt.vat_g2, 4))
+      return false;
   }
 
   return true;
@@ -498,6 +522,7 @@ static bool WriteCFGDatabase(const std::string& path, const std::map<u32, CFGBlo
                              const std::vector<CFGEdge>& edges,
                              const std::map<u32, CFGFunction>& functions,
                              const std::vector<TraceSMC>& smc_regions,
+                             const std::vector<TraceData::VertexFormat>& vertex_formats,
                              const std::set<u32>& trace_block_addrs, u32 entry_point)
 {
   sqlite3* db = nullptr;
@@ -537,6 +562,14 @@ static bool WriteCFGDatabase(const std::string& path, const std::map<u32, CFGBlo
     CREATE TABLE IF NOT EXISTS metadata (
       key TEXT PRIMARY KEY,
       value TEXT
+    );
+    CREATE TABLE IF NOT EXISTS vertex_formats (
+      vtx_desc_low INTEGER NOT NULL,
+      vtx_desc_high INTEGER NOT NULL,
+      vat_g0 INTEGER NOT NULL,
+      vat_g1 INTEGER NOT NULL,
+      vat_g2 INTEGER NOT NULL,
+      PRIMARY KEY (vtx_desc_low, vtx_desc_high, vat_g0, vat_g1, vat_g2)
     );
     CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_addr);
     CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_addr);
@@ -664,6 +697,23 @@ static bool WriteCFGDatabase(const std::string& path, const std::map<u32, CFGBlo
   }
   sqlite3_finalize(stmt);
 
+  // Insert vertex formats
+  sqlite3_prepare_v2(
+      db,
+      "INSERT OR REPLACE INTO vertex_formats VALUES (?, ?, ?, ?, ?)",
+      -1, &stmt, nullptr);
+  for (const auto& fmt : vertex_formats)
+  {
+    sqlite3_bind_int64(stmt, 1, fmt.vtx_desc_low);
+    sqlite3_bind_int64(stmt, 2, fmt.vtx_desc_high);
+    sqlite3_bind_int64(stmt, 3, fmt.vat_g0);
+    sqlite3_bind_int64(stmt, 4, fmt.vat_g1);
+    sqlite3_bind_int64(stmt, 5, fmt.vat_g2);
+    sqlite3_step(stmt);
+    sqlite3_reset(stmt);
+  }
+  sqlite3_finalize(stmt);
+
   // Insert metadata
   sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO metadata VALUES (?, ?)", -1, &stmt, nullptr);
 
@@ -689,6 +739,7 @@ static bool WriteCFGDatabase(const std::string& path, const std::map<u32, CFGBlo
   insert_meta("total_block_count", fmt::format("{}", blocks.size()));
   insert_meta("total_edge_count", fmt::format("{}", edges.size()));
   insert_meta("function_count", fmt::format("{}", functions.size()));
+  insert_meta("vertex_format_count", fmt::format("{}", vertex_formats.size()));
 
   sqlite3_finalize(stmt);
   sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
@@ -838,9 +889,14 @@ int CfgCommand(const std::vector<std::string>& args)
                  100.0 * covered_bytes / total_code_bytes, total_code_bytes / 1024.0);
   }
 
+  if (!trace.vertex_formats.empty())
+  {
+    fmt::println(std::cerr, "  Vertex formats: {}", trace.vertex_formats.size());
+  }
+
   // 6. Write output
   if (!WriteCFGDatabase(output_path, blocks, edges, functions, trace.smc_regions,
-                        trace.seed_addresses, dol.GetEntryPoint()))
+                        trace.vertex_formats, trace.seed_addresses, dol.GetEntryPoint()))
   {
     return EXIT_FAILURE;
   }
