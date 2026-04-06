@@ -68,82 +68,6 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
   return out;
 }
 
-std::string AOTCEmitter::TranslateMergedChain(const std::vector<std::pair<u32, u32>>& blocks,
-                                              bool from_trace)
-{
-  std::string out;
-  u32 head_addr = blocks[0].first;
-  const char* section = from_trace ? "__TEXT,__aot_hot" : "__TEXT,__aot_cold";
-
-  out += fmt::format("__attribute__((noinline, section(\"{}\")))"
-                     " void {}_block_{:08x}(AOTState* s) {{\n",
-                     section, m_prefix, head_addr);
-
-  m_merge_ctx.active = true;
-  m_merge_ctx.cumulative_cycles = 0;
-
-  for (size_t bi = 0; bi < blocks.size(); bi++)
-  {
-    auto [block_addr, num_instructions] = blocks[bi];
-    bool is_last_block = (bi == blocks.size() - 1);
-
-    m_block_cycle_count = 0;
-    m_merge_ctx.next_block_in_chain = is_last_block ? 0 : blocks[bi + 1].first;
-
-    for (u32 i = 0; i < num_instructions; i++)
-    {
-      u32 pc = block_addr + i * 4;
-      auto inst_word = m_memory.ReadInstruction(pc);
-      if (!inst_word)
-        break;
-
-      UGeckoInstruction inst(*inst_word);
-      const GekkoOPInfo* info = PPCTables::GetOpInfo(inst, pc);
-      if (info)
-        m_block_cycle_count += info->num_cycles;
-
-      bool is_last = (i == num_instructions - 1);
-      if (!EmitInstruction(out, inst, pc, is_last))
-      {
-        std::string opname = info ? info->opname : "unknown";
-        m_unhandled_opcodes[opname]++;
-        out += fmt::format("    s->pc = {:#010x}u; aot_interpreter_single_step(s);\n", pc);
-      }
-    }
-
-    m_merge_ctx.cumulative_cycles += m_block_cycle_count;
-
-    // Fallthrough exit for this block within the chain
-    if (!is_last_block)
-    {
-      // Periodic downcount check to prevent interrupt starvation on long chains
-      if (m_merge_ctx.cumulative_cycles >= 100)
-      {
-        u32 next_addr = blocks[bi + 1].first;
-        out += fmt::format("    s->downcount -= {};\n", m_merge_ctx.cumulative_cycles);
-        out += fmt::format("    if(s->downcount<=0){{ s->pc={:#010x}u; return; }}\n", next_addr);
-        m_merge_ctx.cumulative_cycles = 0;
-      }
-      // Otherwise just fall through to next block — no call, no downcount check
-    }
-    else
-    {
-      // Last block in chain — emit final fallthrough exit
-      u32 next_pc = block_addr + num_instructions * 4;
-      out += fmt::format("    s->downcount -= {};\n", m_merge_ctx.cumulative_cycles);
-      out += fmt::format("    s->pc = {:#010x}u;\n", next_pc);
-    }
-  }
-
-  out += "}\n";
-
-  m_merge_ctx.active = false;
-  m_merge_ctx.next_block_in_chain = 0;
-  m_merge_ctx.cumulative_cycles = 0;
-
-  return out;
-}
-
 bool AOTCEmitter::EmitInstruction(std::string& out, UGeckoInstruction inst, u32 pc, bool is_last)
 {
   switch (I(inst.OPCD))
@@ -789,8 +713,7 @@ void AOTCEmitter::EmitBcctrx(std::string& out, UGeckoInstruction inst, u32 pc)
   }
   if (inst.LK_3) out += fmt::format("    s->spr[8]={:#010x}u;\n", pc + 4);
   {
-    u32 cycles = m_merge_ctx.active ? m_merge_ctx.cumulative_cycles + m_block_cycle_count
-                                    : m_block_cycle_count;
+    u32 cycles = m_block_cycle_count;
     out += fmt::format("    s->downcount-={}; s->pc=s->spr[9]&~3u;\n", cycles);
   }
   EmitIndirectDispatch(out);
@@ -818,8 +741,7 @@ void AOTCEmitter::EmitBclrx(std::string& out, UGeckoInstruction inst, u32 pc)
   out += "    uint32_t dest=s->spr[8]&~3u;\n";
   if (inst.LK_3) out += fmt::format("    s->spr[8]={:#010x}u;\n", pc + 4);
   {
-    u32 cycles = m_merge_ctx.active ? m_merge_ctx.cumulative_cycles + m_block_cycle_count
-                                    : m_block_cycle_count;
+    u32 cycles = m_block_cycle_count;
     out += fmt::format("    s->downcount-={}; s->pc=dest;\n", cycles);
   }
   EmitIndirectDispatch(out);
@@ -852,43 +774,29 @@ void AOTCEmitter::EmitOECheck(std::string& out, const char* a, const char* b, co
 
 void AOTCEmitter::EmitBranchTo(std::string& out, u32 target, u32 current_pc)
 {
-  // Inside a merged chain: if the target is the next block, just fall through
-  if (m_merge_ctx.active && target == m_merge_ctx.next_block_in_chain)
-  {
-    // No function call, no downcount check — cycles are accumulated by the chain
-    return;
-  }
-
-  // Exiting a merged chain or standalone block — use accumulated cycles if in chain
-  u32 cycles = m_merge_ctx.active ? m_merge_ctx.cumulative_cycles + m_block_cycle_count
-                                  : m_block_cycle_count;
-
   if (m_known_blocks.contains(target))
   {
     if (target <= current_pc)
     {
       // Backward edge — must check downcount to prevent infinite loops
-      out += fmt::format("    s->downcount-={};\n", cycles);
-      out += fmt::format("    if(s->downcount<=0){{ s->pc={:#010x}u; return; }}\n", target);
+      out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
+      out += fmt::format("    if(s->downcount<=0||aot_single_block_mode){{ s->pc={:#010x}u; return; }}\n", target);
     }
     else
     {
-      // Forward edge — just decrement, skip the check
-      out += fmt::format("    s->downcount-={};\n", cycles);
+      // Forward edge — just decrement (but respect single-block mode for compare harness)
+      out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
+      out += fmt::format("    if(aot_single_block_mode){{ s->pc={:#010x}u; return; }}\n", target);
     }
     out += fmt::format("    [[clang::musttail]] return {}_block_{:08x}(s);\n", m_prefix, target);
   }
   else
   {
     // Unknown target — always check
-    out += fmt::format("    s->downcount-={};\n", cycles);
+    out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
     out += fmt::format("    s->pc={:#010x}u; [[clang::musttail]] return {}_dispatch(s);\n", target,
                        m_prefix);
   }
-
-  // Reset cumulative cycles if we exit the chain via a branch
-  if (m_merge_ctx.active)
-    m_merge_ctx.cumulative_cycles = 0;
 }
 
 void AOTCEmitter::EmitIndirectDispatch(std::string& out)

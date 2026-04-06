@@ -30,6 +30,9 @@
 #include "DiscIO/DiscUtils.h"
 #include "DiscIO/Volume.h"
 
+#include "Core/PowerPC/Gekko.h"
+#include "Core/PowerPC/PPCTables.h"
+
 #include "DolphinTool/AotCEmitter.h"
 #include "DolphinTool/PPCMemoryImage.h"
 
@@ -253,6 +256,22 @@ static inline uint32_t aot_rotation_mask(int mb, int me) {
 static inline double aot_u64_to_f64(uint64_t u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
 static inline uint64_t aot_f64_to_u64(double d) { uint64_t u; __builtin_memcpy(&u, &d, 8); return u; }
 
+// Update FPSCR FPRF field from a single-precision result.
+// FPRF (bits 12-16 PPC = mask 0x0001F000): C, FL, FG, FE, FU
+// Fast path only handles non-NaN (NaN goes to slow path), so no FU case.
+// FPSCR bits: FX(0) XX(6) FI(14) FR(13) are NOT updated by the fast path —
+// only FPRF is set here, matching what matters for control flow (mcrfs, mffs).
+static inline void aot_update_fprf_single(AOTState* s, float result) {
+    uint32_t fprf;
+    if (result == 0.0f)
+        fprf = 0x00002000;  // FE: zero (ignores sign of zero — close enough)
+    else if (result > 0.0f)
+        fprf = 0x00004000;  // FG: positive
+    else
+        fprf = 0x00008000;  // FL: negative
+    s->fpscr = (s->fpscr & ~0x0001F000u) | fprf;
+}
+
 // Single-precision fast paths (fadds, fsubs, fmuls)
 // Fast path: result is not NaN -> store rounded float as double into both PS slots.
 // Slow path: NaN/Inf -> full interpreter path for exact FPSCR handling.
@@ -262,8 +281,10 @@ static inline void aot_fast_faddsx(AOTState* s, int fd, int fa, int fb) {
     double b = aot_u64_to_f64(s->ps[fb].ps0);
     double sum = a + b;
     if (__builtin_expect(sum == sum, 1)) {
-        uint64_t r = aot_f64_to_u64((double)(float)sum);
+        float f = (float)sum;
+        uint64_t r = aot_f64_to_u64((double)f);
         s->ps[fd].ps0 = r; s->ps[fd].ps1 = r;
+        aot_update_fprf_single(s, f);
     } else { aot_faddsx(s, fd, fa, fb); }
 }
 
@@ -272,8 +293,10 @@ static inline void aot_fast_fsubsx(AOTState* s, int fd, int fa, int fb) {
     double b = aot_u64_to_f64(s->ps[fb].ps0);
     double diff = a - b;
     if (__builtin_expect(diff == diff, 1)) {
-        uint64_t r = aot_f64_to_u64((double)(float)diff);
+        float f = (float)diff;
+        uint64_t r = aot_f64_to_u64((double)f);
         s->ps[fd].ps0 = r; s->ps[fd].ps1 = r;
+        aot_update_fprf_single(s, f);
     } else { aot_fsubsx(s, fd, fa, fb); }
 }
 
@@ -282,21 +305,25 @@ static inline void aot_fast_fmulsx(AOTState* s, int fd, int fa, int fc) {
     double c = aot_u64_to_f64(s->ps[fc].ps0);
     double prod = a * c;
     if (__builtin_expect(prod == prod, 1)) {
-        uint64_t r = aot_f64_to_u64((double)(float)prod);
+        float f = (float)prod;
+        uint64_t r = aot_f64_to_u64((double)f);
         s->ps[fd].ps0 = r; s->ps[fd].ps1 = r;
+        aot_update_fprf_single(s, f);
     } else { aot_fmulsx(s, fd, fa, fc); }
 }
 
-// Paired-singles fast paths (ps_add, ps_sub, ps_mul)
-// Operate on both PS0 and PS1 independently.
+// Paired-singles fast paths (ps_add, ps_sub, ps_mul, ps_madd, ps_msub)
+// Operate on both PS0 and PS1 independently. FPRF reflects PS1 result per PPC spec.
 
 static inline void aot_fast_ps_add(AOTState* s, int fd, int fa, int fb) {
     double a0 = aot_u64_to_f64(s->ps[fa].ps0), a1 = aot_u64_to_f64(s->ps[fa].ps1);
     double b0 = aot_u64_to_f64(s->ps[fb].ps0), b1 = aot_u64_to_f64(s->ps[fb].ps1);
     double r0 = a0 + b0, r1 = a1 + b1;
     if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
+        float f1 = (float)r1;
         s->ps[fd].ps0 = aot_f64_to_u64((double)(float)r0);
-        s->ps[fd].ps1 = aot_f64_to_u64((double)(float)r1);
+        s->ps[fd].ps1 = aot_f64_to_u64((double)f1);
+        aot_update_fprf_single(s, f1);
     } else { aot_ps_add(s, fd, fa, fb); }
 }
 
@@ -305,8 +332,10 @@ static inline void aot_fast_ps_sub(AOTState* s, int fd, int fa, int fb) {
     double b0 = aot_u64_to_f64(s->ps[fb].ps0), b1 = aot_u64_to_f64(s->ps[fb].ps1);
     double r0 = a0 - b0, r1 = a1 - b1;
     if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
+        float f1 = (float)r1;
         s->ps[fd].ps0 = aot_f64_to_u64((double)(float)r0);
-        s->ps[fd].ps1 = aot_f64_to_u64((double)(float)r1);
+        s->ps[fd].ps1 = aot_f64_to_u64((double)f1);
+        aot_update_fprf_single(s, f1);
     } else { aot_ps_sub(s, fd, fa, fb); }
 }
 
@@ -315,8 +344,10 @@ static inline void aot_fast_ps_mul(AOTState* s, int fd, int fa, int fc) {
     double c0 = aot_u64_to_f64(s->ps[fc].ps0), c1 = aot_u64_to_f64(s->ps[fc].ps1);
     double r0 = a0 * c0, r1 = a1 * c1;
     if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
+        float f1 = (float)r1;
         s->ps[fd].ps0 = aot_f64_to_u64((double)(float)r0);
-        s->ps[fd].ps1 = aot_f64_to_u64((double)(float)r1);
+        s->ps[fd].ps1 = aot_f64_to_u64((double)f1);
+        aot_update_fprf_single(s, f1);
     } else { aot_ps_mul(s, fd, fa, fc); }
 }
 
@@ -327,8 +358,10 @@ static inline void aot_fast_ps_madd(AOTState* s, int fd, int fa, int fc, int fb)
     double b0 = aot_u64_to_f64(s->ps[fb].ps0), b1 = aot_u64_to_f64(s->ps[fb].ps1);
     double r0 = a0 * c0 + b0, r1 = a1 * c1 + b1;
     if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
+        float f1 = (float)r1;
         s->ps[fd].ps0 = aot_f64_to_u64((double)(float)r0);
-        s->ps[fd].ps1 = aot_f64_to_u64((double)(float)r1);
+        s->ps[fd].ps1 = aot_f64_to_u64((double)f1);
+        aot_update_fprf_single(s, f1);
     } else { aot_ps_madd(s, fd, fa, fc, fb); }
 }
 
@@ -339,10 +372,15 @@ static inline void aot_fast_ps_msub(AOTState* s, int fd, int fa, int fc, int fb)
     double b0 = aot_u64_to_f64(s->ps[fb].ps0), b1 = aot_u64_to_f64(s->ps[fb].ps1);
     double r0 = a0 * c0 - b0, r1 = a1 * c1 - b1;
     if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
+        float f1 = (float)r1;
         s->ps[fd].ps0 = aot_f64_to_u64((double)(float)r0);
-        s->ps[fd].ps1 = aot_f64_to_u64((double)(float)r1);
+        s->ps[fd].ps1 = aot_f64_to_u64((double)f1);
+        aot_update_fprf_single(s, f1);
     } else { aot_ps_msub(s, fd, fa, fc, fb); }
 }
+
+// Single-block mode flag (set by compare/diff harness to stop block chaining)
+extern int aot_single_block_mode;
 
 #endif // AOT_RUNTIME_H
 )";
@@ -361,12 +399,6 @@ struct CFGEdgeInfo
   u32 from_addr;
   u32 to_addr;
   std::string edge_type;  // "static", "fallthrough", "call", "dynamic"
-};
-
-// A merged chain of blocks that will be emitted as a single C function.
-struct MergedChain
-{
-  std::vector<std::pair<u32, u32>> blocks;  // (addr, num_instructions) in order
 };
 
 static bool ReadCFGEdges(const std::string& db_path, std::vector<CFGEdgeInfo>& edges)
@@ -390,92 +422,6 @@ static bool ReadCFGEdges(const std::string& db_path, std::vector<CFGEdgeInfo>& e
   sqlite3_finalize(stmt);
   sqlite3_close(db);
   return true;
-}
-
-// Detect linear chains of blocks that can be merged into a single C function.
-// A chain A->B is mergeable when:
-//   - A has exactly one non-call successor (static or fallthrough edge to B)
-//   - B has exactly one non-call predecessor (A)
-//   - Both are translatable and neither has indirect exits
-static std::vector<MergedChain> DetectLinearChains(
-    const std::vector<CFGBlockInfo>& blocks, const std::vector<CFGEdgeInfo>& edges,
-    u32 max_chain_length = 20)
-{
-  // Build maps of translatable blocks
-  std::set<u32> translatable;
-  std::unordered_map<u32, u32> block_num_insn;
-  for (const auto& b : blocks)
-  {
-    if (b.is_translatable)
-    {
-      translatable.insert(b.ppc_addr);
-      block_num_insn[b.ppc_addr] = b.num_instructions;
-    }
-  }
-
-  // Build adjacency for chain detection.
-  // Successors: only static/fallthrough edges (chains follow linear control flow).
-  // Predecessors: count ALL edge types including call/dynamic — a block that is
-  // a call target or dynamic branch target must not be an interior chain block.
-  std::unordered_map<u32, std::vector<u32>> successors;
-  std::unordered_map<u32, u32> predecessor_count;
-  std::unordered_map<u32, u32> successor_count;
-
-  for (const auto& e : edges)
-  {
-    if (!translatable.contains(e.to_addr))
-      continue;
-
-    // All edge types contribute to predecessor count
-    if (translatable.contains(e.from_addr) || e.edge_type == "call" || e.edge_type == "dynamic")
-      predecessor_count[e.to_addr]++;
-
-    // Only static/fallthrough edges define chain successors
-    if (e.edge_type == "call" || e.edge_type == "dynamic")
-      continue;
-    if (!translatable.contains(e.from_addr))
-      continue;
-    successors[e.from_addr].push_back(e.to_addr);
-    successor_count[e.from_addr]++;
-  }
-
-  // Build chains: walk forward from each unassigned block
-  std::unordered_set<u32> assigned;
-  std::vector<MergedChain> chains;
-
-  for (const auto& b : blocks)
-  {
-    if (!b.is_translatable || assigned.contains(b.ppc_addr))
-      continue;
-
-    // Try to start a chain from this block
-    std::vector<u32> chain = {b.ppc_addr};
-    assigned.insert(b.ppc_addr);
-
-    // Extend forward
-    u32 cursor = b.ppc_addr;
-    while (chain.size() < max_chain_length)
-    {
-      if (successor_count[cursor] != 1)
-        break;
-      u32 next = successors[cursor][0];
-      if (assigned.contains(next) || predecessor_count[next] != 1)
-        break;
-      chain.push_back(next);
-      assigned.insert(next);
-      cursor = next;
-    }
-
-    if (chain.size() > 1)
-    {
-      MergedChain mc;
-      for (u32 addr : chain)
-        mc.blocks.emplace_back(addr, block_num_insn[addr]);
-      chains.push_back(std::move(mc));
-    }
-  }
-
-  return chains;
 }
 
 static bool ReadCFGBlocks(const std::string& db_path, std::vector<CFGBlockInfo>& blocks)
@@ -590,31 +536,71 @@ int AotCommand(const std::vector<std::string>& args)
   fmt::println(std::cerr, "DOL entry: {:#010x}", dol.GetEntryPoint());
   fmt::println(std::cerr, "CFG blocks: {}", cfg_blocks.size());
 
-  // Detect linear chains for block merging
-  auto chains = DetectLinearChains(cfg_blocks, cfg_edges);
-
-  // Build lookup: block addr -> chain index (for blocks that are interior to a chain)
-  std::unordered_set<u32> interior_blocks;  // blocks that are NOT chain heads but in a chain
-  std::unordered_map<u32, size_t> head_to_chain;  // chain head -> chain index
-  for (size_t ci = 0; ci < chains.size(); ci++)
+  // Validate DOL instructions match CFG block boundaries.
+  // If a block's edges indicate a branch (non-sequential target) but the DOL's
+  // last instruction is not a block-ending instruction, the game patched the code
+  // at runtime (SMC not caught by icbi trace). Mark these blocks untranslatable.
   {
-    const auto& chain = chains[ci];
-    head_to_chain[chain.blocks[0].first] = ci;
-    for (size_t bi = 1; bi < chain.blocks.size(); bi++)
-      interior_blocks.insert(chain.blocks[bi].first);
+    // Build edge map: block_addr -> set of target addresses
+    std::unordered_map<u32, std::vector<u32>> block_edges;
+    for (const auto& e : cfg_edges)
+      block_edges[e.from_addr].push_back(e.to_addr);
+
+    u32 smc_skipped = 0;
+    for (auto& b : cfg_blocks)
+    {
+      if (!b.is_translatable || b.num_instructions == 0)
+        continue;
+
+      u32 fall_through_addr = b.ppc_addr + b.num_instructions * 4;
+      auto edge_it = block_edges.find(b.ppc_addr);
+
+      // Check if any edge targets a non-sequential address (i.e., a branch)
+      bool has_non_sequential_edge = false;
+      if (edge_it != block_edges.end())
+      {
+        for (u32 target : edge_it->second)
+        {
+          if (target != fall_through_addr)
+          {
+            has_non_sequential_edge = true;
+            break;
+          }
+        }
+      }
+
+      if (!has_non_sequential_edge)
+        continue;
+
+      // The CFG says this block branches, so the DOL's last instruction should
+      // be a block-ending instruction (branch/trap/etc.). Check it.
+      u32 last_pc = b.ppc_addr + (b.num_instructions - 1) * 4;
+      auto inst_word = memory.ReadInstruction(last_pc);
+      if (!inst_word)
+        continue;
+
+      UGeckoInstruction inst(*inst_word);
+      const GekkoOPInfo* info = PPCTables::GetOpInfo(inst, last_pc);
+      if (info && (info->flags & FL_ENDBLOCK))
+        continue;  // DOL agrees — last instruction is a branch
+
+      // DOL disagrees: last instruction is not a branch but CFG says it should be.
+      // The game patched this code at runtime. Mark untranslatable.
+      b.is_translatable = false;
+      smc_skipped++;
+    }
+
+    if (smc_skipped > 0)
+      fmt::println(std::cerr, "  DOL/runtime mismatch: {} blocks marked untranslatable", smc_skipped);
   }
 
-  u32 total_merged = 0;
-  for (const auto& c : chains)
-    total_merged += static_cast<u32>(c.blocks.size());
-  fmt::println(std::cerr, "  Merged chains: {} ({} blocks merged, {} blocks remain standalone)",
-               chains.size(), total_merged,
-               cfg_blocks.size() - total_merged + chains.size());
-
-  // Build set of known block addresses for the emitter
+  // Build set of known block addresses for the emitter (only translatable blocks)
   std::set<u32> known_blocks;
   for (const auto& b : cfg_blocks)
-    known_blocks.insert(b.ppc_addr);
+  {
+    if (b.is_translatable)
+      known_blocks.insert(b.ppc_addr);
+  }
 
   // 3. Create output directory and write runtime header
   File::CreateFullPath(output_dir + "/");
@@ -633,9 +619,6 @@ int AotCommand(const std::vector<std::string>& args)
     groups[b.ppc_addr >> 16].push_back(&b);
 
   // Write forward declarations header
-  // All translatable blocks get declarations. Interior chain blocks don't have
-  // standalone functions, but other blocks may still reference them via the
-  // dispatch table or dynamic branches. The linker resolves unused declarations.
   {
     std::ofstream fwd(output_dir + "/" + prefix + "_forward_decls.h");
     fwd << "#ifndef " << prefix << "_FORWARD_DECLS_H\n";
@@ -669,28 +652,10 @@ int AotCommand(const std::vector<std::string>& args)
         continue;
       }
 
-      // If this block is a chain head, emit the merged chain
-      auto chain_it = head_to_chain.find(b->ppc_addr);
-      if (chain_it != head_to_chain.end())
-      {
-        const auto& chain = chains[chain_it->second];
-        std::string chain_code = emitter.TranslateMergedChain(chain.blocks, b->from_trace);
-        file << chain_code << "\n";
-        translated += static_cast<u32>(chain.blocks.size());
-      }
-
-      // Emit standalone function for this block. For interior chain blocks this
-      // is a duplicate (also inlined in the chain head), but it's needed so the
-      // dispatch table has a valid entry when the block is reached via indirect
-      // branches (blr/bctr) or exception returns that aren't tracked as CFG edges.
-      if (!head_to_chain.contains(b->ppc_addr))
-      {
-        std::string block_code = emitter.TranslateBlock(b->ppc_addr, b->num_instructions,
-                                                        b->from_trace);
-        file << block_code << "\n";
-        if (!interior_blocks.contains(b->ppc_addr))
-          translated++;
-      }
+      std::string block_code = emitter.TranslateBlock(b->ppc_addr, b->num_instructions,
+                                                      b->from_trace);
+      file << block_code << "\n";
+      translated++;
     }
   }
 
