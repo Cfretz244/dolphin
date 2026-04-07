@@ -103,6 +103,9 @@ void SaveFirstSaved(Core::System& system);
 void UndoSaveState(Core::System& system);
 void UndoLoadState(Core::System& system);
 
+// Block until all pending async save state writes have completed.
+void Flush();
+
 // for calling back into UI code without introducing a dependency on it in core
 using AfterLoadCallbackFunc = std::function<void()>;
 void SetOnAfterLoadCallback(AfterLoadCallbackFunc callback);

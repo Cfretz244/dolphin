@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <functional>
 #include <future>
 #include <mutex>
@@ -872,6 +873,21 @@ void Callback_FramePresented(const PresentInfo& present_info)
 // Called from VideoInterface::Update (CPU thread) at emulated field boundaries
 void Callback_NewField(Core::System& system)
 {
+  // AOT_FRAME_SAVESTATE=<path>: save state at every field boundary for crash debugging.
+  // When the emulator aborts (e.g. invalid opcode), the last complete save on disk
+  // is from the start of the crashing frame — feed it into `dolphin-tool diff`.
+  static const char* frame_savestate_path = std::getenv("AOT_FRAME_SAVESTATE");
+  if (frame_savestate_path)
+  {
+    static u64 field_count = 0;
+    field_count++;
+    if (field_count % 120 == 1)  // log every ~2 seconds (120 fields ~ 60fps x 2 fields)
+      fmt::print(stderr, "AOT_FRAME_SAVESTATE: field {}, PC={:#010x}, saving to {}\n",
+                 field_count, system.GetPowerPC().GetPPCState().pc, frame_savestate_path);
+    ::State::Flush();
+    ::State::SaveAs(system, std::string(frame_savestate_path));
+  }
+
   if (s_frame_step)
   {
     // To ensure that s_stop_frame_step is up to date, wait for the GPU thread queue to empty,

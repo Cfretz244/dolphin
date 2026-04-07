@@ -259,8 +259,8 @@ static inline uint64_t aot_f64_to_u64(double d) { uint64_t u; __builtin_memcpy(&
 // Update FPSCR FPRF field from a single-precision result.
 // FPRF (bits 12-16 PPC = mask 0x0001F000): C, FL, FG, FE, FU
 // Fast path only handles non-NaN (NaN goes to slow path), so no FU case.
-// FPSCR bits: FX(0) XX(6) FI(14) FR(13) are NOT updated by the fast path —
-// only FPRF is set here, matching what matters for control flow (mcrfs, mffs).
+// Only FPRF is updated here. FI/FR handling varies per instruction and is done
+// by each fast-path function individually (fmulsx clears them; fadds/fsubs do not).
 static inline void aot_update_fprf_single(AOTState* s, float result) {
     uint32_t fprf;
     if (result == 0.0f)
@@ -309,6 +309,8 @@ static inline void aot_fast_fmulsx(AOTState* s, int fd, int fa, int fc) {
         uint64_t r = aot_f64_to_u64((double)f);
         s->ps[fd].ps0 = r; s->ps[fd].ps1 = r;
         aot_update_fprf_single(s, f);
+        // fmulsx explicitly clears FI and FR (unlike fadds/fsubs which leave them alone)
+        s->fpscr &= ~0x00060000u;  // clear FR (bit 18) and FI (bit 17)
     } else { aot_fmulsx(s, fd, fa, fc); }
 }
 
@@ -771,6 +773,14 @@ int AotCommand(const std::vector<std::string>& args)
     script << "done\n";
     script << "clang -c $DISPATCH_CFLAGS -I. \"${PREFIX}_dispatch.c\""
               " -o \"${PREFIX}_dispatch.o\" &\n";
+    script << "# Compile vertex loader AOT files if present\n";
+    script << "if [[ -f \"${PREFIX}_vtx_loaders.c\" ]]; then\n";
+    script << "    echo \"Compiling vertex loaders...\"\n";
+    script << "    clang -c $DISPATCH_CFLAGS -I. \"${PREFIX}_vtx_loaders.c\""
+              " -o \"${PREFIX}_vtx_loaders.o\" &\n";
+    script << "    clang -c $DISPATCH_CFLAGS -I. \"${PREFIX}_vtx_dispatch.c\""
+              " -o \"${PREFIX}_vtx_dispatch.o\" &\n";
+    script << "fi\n";
     script << "wait\n\n";
     script << "echo \"Creating static library...\"\n";
     script << "ar rcs lib${PREFIX}_aot.a ${PREFIX}_*.o\n\n";
