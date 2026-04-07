@@ -873,19 +873,24 @@ void Callback_FramePresented(const PresentInfo& present_info)
 // Called from VideoInterface::Update (CPU thread) at emulated field boundaries
 void Callback_NewField(Core::System& system)
 {
-  // AOT_FRAME_SAVESTATE=<path>: save state at every field boundary for crash debugging.
-  // When the emulator aborts (e.g. invalid opcode), the last complete save on disk
-  // is from the start of the crashing frame — feed it into `dolphin-tool diff`.
+  // AOT_FRAME_SAVESTATE=<path>: circular buffer of save states at every field boundary.
+  // Keeps the last N saves (default 20, configurable via AOT_FRAME_SAVESTATE_SLOTS).
+  // On crash, feed all of them into `dolphin-tool diff` in parallel to find the divergence.
+  // Files: <path>_00.sav, <path>_01.sav, ..., <path>_19.sav (circular)
   static const char* frame_savestate_path = std::getenv("AOT_FRAME_SAVESTATE");
   if (frame_savestate_path)
   {
+    static const char* slots_str = std::getenv("AOT_FRAME_SAVESTATE_SLOTS");
+    static const u64 num_slots = slots_str ? std::strtoull(slots_str, nullptr, 10) : 20;
     static u64 field_count = 0;
+    const u64 slot = field_count % num_slots;
     field_count++;
-    if (field_count % 120 == 1)  // log every ~2 seconds (120 fields ~ 60fps x 2 fields)
-      fmt::print(stderr, "AOT_FRAME_SAVESTATE: field {}, PC={:#010x}, saving to {}\n",
-                 field_count, system.GetPowerPC().GetPPCState().pc, frame_savestate_path);
+    std::string path = fmt::format("{}_{:02d}.sav", frame_savestate_path, slot);
+    if (field_count % 120 == 1)
+      fmt::print(stderr, "AOT_FRAME_SAVESTATE: field {}, slot {}/{}, PC={:#010x}\n",
+                 field_count, slot, num_slots, system.GetPowerPC().GetPPCState().pc);
     ::State::Flush();
-    ::State::SaveAs(system, std::string(frame_savestate_path));
+    ::State::SaveAs(system, std::move(path));
   }
 
   if (s_frame_step)

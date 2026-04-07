@@ -257,18 +257,32 @@ static inline double aot_u64_to_f64(uint64_t u) { double d; __builtin_memcpy(&d,
 static inline uint64_t aot_f64_to_u64(double d) { uint64_t u; __builtin_memcpy(&u, &d, 8); return u; }
 
 // Update FPSCR FPRF field from a single-precision result.
+// Gekko truncates the C operand mantissa to 25 bits before multiply.
+// Must match Force25Bit() in Interpreter_FPUtils.h.
+// Fast-path: only handles normal doubles (subnormals fall through to slow path).
+static inline double aot_force_25bit(double d) {
+    uint64_t i;
+    __builtin_memcpy(&i, &d, 8);
+    i = (i & 0xFFFFFFFFF8000000ULL) + (i & 0x8000000);
+    __builtin_memcpy(&d, &i, 8);
+    return d;
+}
+
 // FPRF (bits 12-16 PPC = mask 0x0001F000): C, FL, FG, FE, FU
 // Fast path only handles non-NaN (NaN goes to slow path), so no FU case.
 // Only FPRF is updated here. FI/FR handling varies per instruction and is done
 // by each fast-path function individually (fmulsx clears them; fadds/fsubs do not).
 static inline void aot_update_fprf_single(AOTState* s, float result) {
     uint32_t fprf;
-    if (result == 0.0f)
-        fprf = 0x00002000;  // FE: zero (ignores sign of zero — close enough)
-    else if (result > 0.0f)
-        fprf = 0x00004000;  // FG: positive
+    if (result == 0.0f) {
+        // Must distinguish +0.0 (FPRF=0x02) from -0.0 (FPRF=0x12) via sign bit
+        uint32_t bits;
+        __builtin_memcpy(&bits, &result, 4);
+        fprf = (bits & 0x80000000u) ? 0x00012000 : 0x00002000;  // NZ : PZ
+    } else if (result > 0.0f)
+        fprf = 0x00004000;  // FG: positive normal
     else
-        fprf = 0x00008000;  // FL: negative
+        fprf = 0x00008000;  // FL: negative normal
     s->fpscr = (s->fpscr & ~0x0001F000u) | fprf;
 }
 
@@ -302,7 +316,7 @@ static inline void aot_fast_fsubsx(AOTState* s, int fd, int fa, int fb) {
 
 static inline void aot_fast_fmulsx(AOTState* s, int fd, int fa, int fc) {
     double a = aot_u64_to_f64(s->ps[fa].ps0);
-    double c = aot_u64_to_f64(s->ps[fc].ps0);
+    double c = aot_force_25bit(aot_u64_to_f64(s->ps[fc].ps0));
     double prod = a * c;
     if (__builtin_expect(prod == prod, 1)) {
         float f = (float)prod;
@@ -343,7 +357,8 @@ static inline void aot_fast_ps_sub(AOTState* s, int fd, int fa, int fb) {
 
 static inline void aot_fast_ps_mul(AOTState* s, int fd, int fa, int fc) {
     double a0 = aot_u64_to_f64(s->ps[fa].ps0), a1 = aot_u64_to_f64(s->ps[fa].ps1);
-    double c0 = aot_u64_to_f64(s->ps[fc].ps0), c1 = aot_u64_to_f64(s->ps[fc].ps1);
+    double c0 = aot_force_25bit(aot_u64_to_f64(s->ps[fc].ps0));
+    double c1 = aot_force_25bit(aot_u64_to_f64(s->ps[fc].ps1));
     double r0 = a0 * c0, r1 = a1 * c1;
     if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
         float f1 = (float)r1;
@@ -356,7 +371,8 @@ static inline void aot_fast_ps_mul(AOTState* s, int fd, int fa, int fc) {
 // ps_madd: fd = fa * fc + fb (both slots, single-precision result)
 static inline void aot_fast_ps_madd(AOTState* s, int fd, int fa, int fc, int fb) {
     double a0 = aot_u64_to_f64(s->ps[fa].ps0), a1 = aot_u64_to_f64(s->ps[fa].ps1);
-    double c0 = aot_u64_to_f64(s->ps[fc].ps0), c1 = aot_u64_to_f64(s->ps[fc].ps1);
+    double c0 = aot_force_25bit(aot_u64_to_f64(s->ps[fc].ps0));
+    double c1 = aot_force_25bit(aot_u64_to_f64(s->ps[fc].ps1));
     double b0 = aot_u64_to_f64(s->ps[fb].ps0), b1 = aot_u64_to_f64(s->ps[fb].ps1);
     double r0 = a0 * c0 + b0, r1 = a1 * c1 + b1;
     if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
@@ -370,7 +386,8 @@ static inline void aot_fast_ps_madd(AOTState* s, int fd, int fa, int fc, int fb)
 // ps_msub: fd = fa * fc - fb (both slots, single-precision result)
 static inline void aot_fast_ps_msub(AOTState* s, int fd, int fa, int fc, int fb) {
     double a0 = aot_u64_to_f64(s->ps[fa].ps0), a1 = aot_u64_to_f64(s->ps[fa].ps1);
-    double c0 = aot_u64_to_f64(s->ps[fc].ps0), c1 = aot_u64_to_f64(s->ps[fc].ps1);
+    double c0 = aot_force_25bit(aot_u64_to_f64(s->ps[fc].ps0));
+    double c1 = aot_force_25bit(aot_u64_to_f64(s->ps[fc].ps1));
     double b0 = aot_u64_to_f64(s->ps[fb].ps0), b1 = aot_u64_to_f64(s->ps[fb].ps1);
     double r0 = a0 * c0 - b0, r1 = a1 * c1 - b1;
     if (__builtin_expect(r0 == r0 && r1 == r1, 1)) {
