@@ -813,9 +813,13 @@ void aot_dcbt(AOTState* s, uint32_t addr)
 
 void aot_icbi(AOTState* s, uint32_t addr)
 {
-  // Instruction cache block invalidate
-  // In AOT mode, this is used for self-modifying code detection.
-  // For now, just ignore it — SMC regions are already handled by interpreter fallback.
+  // Must invalidate the emulated icache exactly like Interpreter::icbi: the interpreter
+  // fallback fetches through iCache, and games that load code at runtime (REL modules)
+  // reuse heap addresses — a stale line means executing instructions from an unloaded
+  // module. There is no JIT block cache to flush in AOT mode, but JitInterface handles that.
+  auto& ppc_state = GetPPCState(s);
+  auto& system = GetSystem();
+  ppc_state.iCache.Invalidate(system.GetMemory(), system.GetJitInterface(), addr);
 }
 
 #undef FP_IMPL_3
