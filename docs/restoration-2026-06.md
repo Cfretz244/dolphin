@@ -86,6 +86,27 @@ the interpreter at the AOT run's exit PC (with backward-jump disambiguation for 
 Offline Melee diff: 25 divergences/59k comparisons before → 0 divergences/135k comparisons
 after.
 
+## June 2026 validation results
+
+- Full pipeline regenerated from scratch: `dolphin-tool translate` on `melee_cfg.db` →
+  73,632 blocks translated (40,817 skipped as DOL/runtime mismatch — see note below) →
+  `libGALE01_aot.a` → Dolphin rebuilt with `-DAOT_STATIC_LIB` + LTO. Reproducible build
+  re-established (after fixing the Bundled→System cmake cache issue, see CLAUDE.md).
+- Offline diff (`dolphin-tool diff`): **0 divergences in 134,833 block comparisons** (after
+  the harness false-positive fix; before it, all 25 reported divergences were artifacts).
+- Runtime: Melee boots under `CPUCore=6` on macOS/Metal, plays the full intro cinematic and
+  attract loop for 45+ minutes, **colors correct** — so April's "all colors wrong" did not
+  reproduce on a desktop clean boot, pointing further at the iOS capture→Delta chain.
+- **The April savestates in `~/working/melee testing/` are poisoned** — `start_match.sav`
+  loads into magenta garbage. They were captured during April's corruption-debugging
+  sessions (FP fast paths + unsound downcount batching active), so the corruption is baked
+  into the state. Do not use them for validation; boot clean instead.
+- Open question: 40,817 of 114,449 blocks (36%) marked untranslatable by the DOL/runtime
+  mismatch detection — far more than Wind Waker's ~8,800 cited when the detection was added.
+  Possibly over-aggressive; each such block falls back to single-step interpretation.
+  Worth investigating if performance is below April's full-speed baseline. The deferred
+  icbi/instruction-capture branch is the principled fix.
+
 ## Validation assets
 
 - Traces/CFG DBs: `build/trace_output/` (melee, wind_waker, metroid_prime, metroid_prime_2,
