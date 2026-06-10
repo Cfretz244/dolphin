@@ -92,9 +92,11 @@ static std::unordered_map<u32, u64> s_fallback_counts;
 // Check if address is in main RAM (cached or uncached mirror)
 static inline bool IsRAMAddress(u32 addr)
 {
-  // 0x80000000-0x81800000 (cached) or 0xC0000000-0xC1800000 (uncached)
-  u32 physical = addr & 0x3FFFFFFF;
-  return physical < s_ram_size;
+  // 0x80000000-0x81800000 (cached) or 0xC0000000-0xC1800000 (uncached) only.
+  // Low-memory (0x0xxxxxxx) and 0x4xxxxxxx accesses must take the slow path:
+  // with MSR.DR=1 the interpreter raises a DSI for them (BAT miss), so the fast
+  // path must not silently satisfy them from RAM.
+  return ((addr & ~0x40000000u) - 0x80000000u) < s_ram_size;
 }
 
 extern "C"

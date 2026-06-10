@@ -634,8 +634,12 @@ int AotCommand(const std::vector<std::string>& args)
     script << "set -e\n";
     script << "cd \"$(dirname \"$0\")\"\n";
     script << fmt::format("PREFIX=\"{}\"\n", prefix);
-    script << "BLOCK_CFLAGS=\"-Os -flto=thin -arch arm64 -mcpu=apple-a14 -moutline\"\n";
-    script << "DISPATCH_CFLAGS=\"-O2 -flto=thin -arch arm64 -mcpu=apple-a14\"\n\n";
+    // -fwrapv: emitted code relies on wrapping signed multiply (mulli/mullw, e.g.
+    // LCG RNGs); -fno-strict-aliasing: insurance for generated pointer casts.
+    script << "BLOCK_CFLAGS=\"-Os -flto=thin -arch arm64 -mcpu=apple-a14 -moutline"
+              " -fwrapv -fno-strict-aliasing\"\n";
+    script << "DISPATCH_CFLAGS=\"-O2 -flto=thin -arch arm64 -mcpu=apple-a14"
+              " -fwrapv -fno-strict-aliasing\"\n\n";
     script << "echo \"Compiling AOT blocks with LTO...\"\n";
     script << "for f in ${PREFIX}_blocks_*.c; do\n";
     script << "    clang -c $BLOCK_CFLAGS -I. \"$f\" -o \"${f%.c}.o\" &\n";
