@@ -1338,7 +1338,10 @@ bool AOTCEmitter::EmitTable63(std::string& out, UGeckoInstruction inst, u32 pc)
     if (inst.Rc) out += "    s->cr_fields[1]=s->cr_fields[1];\n";
     return true;
   case 583: // mffsx
-    out += fmt::format("    s->ps[{}].ps0=(uint64_t)s->fpscr;\n", fd);
+    // Matches Interpreter::mffsx: the result is a double with the QNaN-style
+    // high bits set, not a zero-extended FPSCR (games store this via stfd in
+    // OSSaveFPUContext; caught by AOT_COMPARE as a 2-byte RAM divergence).
+    out += fmt::format("    s->ps[{}].ps0=0xFFF8000000000000ULL|(uint64_t)s->fpscr;\n", fd);
     return true;
   case 711: // mtfsfx
     out += fmt::format("    aot_mtfsf(s,{},{});\n", I(inst.FM), fb);
