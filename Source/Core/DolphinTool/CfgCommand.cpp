@@ -29,6 +29,7 @@
 #include "Core/PowerPC/PPCTables.h"
 
 #include "DolphinTool/PPCMemoryImage.h"
+#include "DolphinTool/RelModules.h"
 
 #include "DiscIO/DiscUtils.h"
 #include "DiscIO/Volume.h"
@@ -63,6 +64,9 @@ struct TraceData
   std::vector<TraceEdge> edges;
   std::vector<TraceSMC> smc_regions;
   std::set<u32> seed_addresses;
+  // Statically-derived seeds (e.g. DOL code referenced by REL module relocations).
+  // Worklist-seeded like trace blocks but never marked as trace-hot.
+  std::set<u32> static_seeds;
   std::unordered_multimap<u32, u32> dynamic_targets;  // from_block -> to_addr
 
   // Vertex format configurations recorded during tracing (v3+)
@@ -208,15 +212,27 @@ static bool IsBranchUnconditional(UGeckoInstruction inst)
   return (inst.BO & BO_DONT_DECREMENT_FLAG) && (inst.BO & BO_DONT_CHECK_CONDITION);
 }
 
+// In relocatable modules, branch instructions at relocation sites carry a
+// meaningless encoded displacement (the field is patched at load time) — the
+// real target comes from the relocation table. Sites mapping to
+// RELOC_TARGET_EXTERNAL branch out of the address space being disassembled
+// (another module, or the DOL).
+constexpr u32 RELOC_TARGET_EXTERNAL = 0xFFFFFFFF;
+using RelocBranchTargets = std::unordered_map<u32, u32>;  // site addr -> local target
+
 static void RunDisassembly(const PPCMemoryImage& memory, const TraceData& trace,
                            std::map<u32, CFGBlock>& blocks, std::vector<CFGEdge>& edges,
-                           bool verbose)
+                           bool verbose, const RelocBranchTargets* reloc_branches = nullptr)
 {
   std::set<u32> worklist;
   std::set<u32> visited;
 
   // Seed with all trace block addresses
   for (u32 addr : trace.seed_addresses)
+    worklist.insert(addr);
+
+  // Statically-derived seeds (relocation targets, module entry points)
+  for (u32 addr : trace.static_seeds)
     worklist.insert(addr);
 
   // Also seed with all dynamic branch targets
@@ -330,16 +346,30 @@ static void RunDisassembly(const PPCMemoryImage& memory, const TraceData& trace,
         block.has_indirect_exit = false;
         blocks[block_start] = block;
 
+        // At a relocated branch site the encoded displacement is meaningless;
+        // resolve the target from the relocation table instead (or mark it
+        // external and only keep the local control-flow consequences).
+        std::optional<u32> reloc_target;
+        if (reloc_branches)
+        {
+          auto it = reloc_branches->find(current);
+          if (it != reloc_branches->end())
+            reloc_target = it->second;
+        }
+
         if (inst.OPCD == 18)  // b / bl
         {
-          u32 target = ComputeBranchTarget(inst, current);
+          u32 target = reloc_target ? *reloc_target : ComputeBranchTarget(inst, current);
           if (inst.LK)
           {
-            edges.push_back({block_start, target, CFGEdge::Call, false});
-            worklist.insert(target);
+            if (target != RELOC_TARGET_EXTERNAL)
+            {
+              edges.push_back({block_start, target, CFGEdge::Call, false});
+              worklist.insert(target);
+            }
             worklist.insert(current + 4);
           }
-          else
+          else if (target != RELOC_TARGET_EXTERNAL)
           {
             edges.push_back({block_start, target, CFGEdge::Static, false});
             worklist.insert(target);
@@ -347,9 +377,12 @@ static void RunDisassembly(const PPCMemoryImage& memory, const TraceData& trace,
         }
         else if (inst.OPCD == 16)  // bc / bcl
         {
-          u32 target = ComputeBranchTarget(inst, current);
-          edges.push_back({block_start, target, CFGEdge::Static, false});
-          worklist.insert(target);
+          u32 target = reloc_target ? *reloc_target : ComputeBranchTarget(inst, current);
+          if (target != RELOC_TARGET_EXTERNAL)
+          {
+            edges.push_back({block_start, target, CFGEdge::Static, false});
+            worklist.insert(target);
+          }
 
           if (!IsBranchUnconditional(inst))
           {
@@ -517,6 +550,321 @@ IdentifyFunctions(const std::map<u32, CFGBlock>& blocks, const std::vector<CFGEd
   }
 
   return functions;
+}
+
+// ============================================================================
+// REL module CFGs (section-relative, fully static — no trace input needed)
+// ============================================================================
+
+// Synthetic flat address for (section, offset) so the existing disassembly
+// machinery can run unchanged on module code. Section sizes are far below 16MB.
+static constexpr u32 SectAddr(u32 section, u32 offset)
+{
+  return (section << 24) | offset;
+}
+static constexpr u32 SectOf(u32 synth)
+{
+  return synth >> 24;
+}
+static constexpr u32 OffsetOf(u32 synth)
+{
+  return synth & 0x00FFFFFF;
+}
+
+static bool IsBranchRelocType(u8 type)
+{
+  switch (type)
+  {
+  case R_PPC_ADDR24:
+  case R_PPC_ADDR14:
+  case R_PPC_ADDR14_BRTAKEN:
+  case R_PPC_ADDR14_BRNTAKEN:
+  case R_PPC_REL24:
+  case R_PPC_REL14:
+  case R_PPC_REL14_BRTAKEN:
+  case R_PPC_REL14_BRNTAKEN:
+    return true;
+  default:
+    return false;
+  }
+}
+
+struct ModuleCfg
+{
+  std::map<u32, CFGBlock> blocks;  // keyed by synthetic SectAddr
+  std::vector<CFGEdge> edges;
+  u32 executable_bytes = 0;
+  u32 covered_bytes = 0;
+};
+
+// Every cross-reference into a module's code requires a relocation, so the
+// relocation tables of ALL modules collectively mark nearly every code entry
+// point (actor profile tables, vtables, call sites). Collect those seeds, plus
+// DOL-code targets which feed the main DOL disassembly as extra static seeds.
+static void CollectRelocationSeeds(const std::vector<RelFile>& modules,
+                                   std::unordered_map<u32, std::set<u32>>& module_seeds,
+                                   std::set<u32>& dol_seeds)
+{
+  for (const auto& m : modules)
+  {
+    for (const auto& r : m.relocs)
+    {
+      if ((r.addend & 3) != 0)
+        continue;  // unaligned: a data reference, not a code entry
+      if (r.target_module == 0)
+        dol_seeds.insert(r.addend);
+      else
+        module_seeds[r.target_module].insert(SectAddr(r.target_section, r.addend));
+    }
+  }
+}
+
+static ModuleCfg BuildModuleCfg(const RelFile& rel, const std::set<u32>& reloc_seeds)
+{
+  ModuleCfg cfg;
+
+  // Only executable sections enter the image: seeds landing elsewhere are
+  // data references and get dropped by IsCodeAddress.
+  PPCMemoryImage memory;
+  for (size_t i = 0; i < rel.sections.size(); i++)
+  {
+    const auto& sec = rel.sections[i];
+    if (sec.executable && !sec.data.empty())
+    {
+      memory.AddSection(SectAddr(static_cast<u32>(i), 0), sec.data.data(), sec.size);
+      cfg.executable_bytes += sec.size;
+    }
+  }
+
+  TraceData synth;
+  synth.static_seeds = reloc_seeds;
+  for (u32 entry : {SectAddr(rel.prolog_section, rel.prolog_offset),
+                    SectAddr(rel.epilog_section, rel.epilog_offset),
+                    SectAddr(rel.unresolved_section, rel.unresolved_offset)})
+  {
+    synth.static_seeds.insert(entry);
+  }
+
+  // Branch-site relocation map: sites whose target lives in this same module
+  // resolve locally; everything else is external (followed at runtime via the
+  // module base registry, and recorded in module_relocs for the translator).
+  RelocBranchTargets branch_targets;
+  for (const auto& r : rel.relocs)
+  {
+    if (!IsBranchRelocType(r.type))
+      continue;
+    if (!rel.sections[r.site_section].executable)
+      continue;
+    u32 local = RELOC_TARGET_EXTERNAL;
+    if (r.target_module == rel.module_id && (r.addend & 3) == 0 &&
+        r.target_section < rel.sections.size() && rel.sections[r.target_section].executable)
+    {
+      local = SectAddr(r.target_section, r.addend);
+    }
+    branch_targets[SectAddr(r.site_section, r.site_offset)] = local;
+  }
+
+  RunDisassembly(memory, synth, cfg.blocks, cfg.edges, false, &branch_targets);
+
+  for (const auto& [addr, block] : cfg.blocks)
+    cfg.covered_bytes += block.num_instructions * 4;
+  return cfg;
+}
+
+static bool WriteModuleDatabase(const std::string& path, const std::vector<RelFile>& modules,
+                                const std::map<u32, ModuleCfg>& cfgs)
+{
+  sqlite3* db = nullptr;
+  if (sqlite3_open(path.c_str(), &db) != SQLITE_OK)
+  {
+    fmt::println(std::cerr, "Error: Cannot open database: {}", path);
+    return false;
+  }
+
+  const char* schema = R"(
+    CREATE TABLE IF NOT EXISTS modules (
+      module_id INTEGER PRIMARY KEY,
+      dense_idx INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      num_sections INTEGER NOT NULL,
+      bss_size INTEGER NOT NULL,
+      prolog_section INTEGER, prolog_offset INTEGER,
+      epilog_section INTEGER, epilog_offset INTEGER,
+      unresolved_section INTEGER, unresolved_offset INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS module_sections (
+      module_id INTEGER NOT NULL,
+      section_idx INTEGER NOT NULL,
+      size INTEGER NOT NULL,
+      executable INTEGER NOT NULL,
+      is_bss INTEGER NOT NULL,
+      PRIMARY KEY (module_id, section_idx)
+    );
+    CREATE TABLE IF NOT EXISTS module_blocks (
+      module_id INTEGER NOT NULL,
+      section_idx INTEGER NOT NULL,
+      offset INTEGER NOT NULL,
+      num_instructions INTEGER NOT NULL,
+      is_translatable INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY (module_id, section_idx, offset)
+    );
+    CREATE TABLE IF NOT EXISTS module_edges (
+      module_id INTEGER NOT NULL,
+      from_section INTEGER NOT NULL,
+      from_offset INTEGER NOT NULL,
+      to_section INTEGER NOT NULL,
+      to_offset INTEGER NOT NULL,
+      edge_type TEXT NOT NULL,
+      PRIMARY KEY (module_id, from_section, from_offset, to_section, to_offset, edge_type)
+    );
+    CREATE TABLE IF NOT EXISTS module_relocs (
+      module_id INTEGER NOT NULL,
+      site_section INTEGER NOT NULL,
+      site_offset INTEGER NOT NULL,
+      type INTEGER NOT NULL,
+      target_module INTEGER NOT NULL,
+      target_section INTEGER NOT NULL,
+      addend INTEGER NOT NULL,
+      PRIMARY KEY (module_id, site_section, site_offset)
+    );
+    CREATE TABLE IF NOT EXISTS metadata (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
+  )";
+
+  char* err = nullptr;
+  sqlite3_exec(db, schema, nullptr, nullptr, &err);
+  if (err)
+  {
+    fmt::println(std::cerr, "SQL error: {}", err);
+    sqlite3_free(err);
+    sqlite3_close(db);
+    return false;
+  }
+
+  sqlite3_exec(db, "BEGIN TRANSACTION", nullptr, nullptr, nullptr);
+  sqlite3_stmt* stmt = nullptr;
+
+  sqlite3_prepare_v2(db,
+                     "INSERT OR REPLACE INTO modules VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     -1, &stmt, nullptr);
+  // modules arrive sorted by module_id (sorted at discovery time); dense_idx
+  // is the stable per-game codegen index.
+  for (size_t dense = 0; dense < modules.size(); dense++)
+  {
+    const auto& m = modules[dense];
+    sqlite3_bind_int64(stmt, 1, m.module_id);
+    sqlite3_bind_int(stmt, 2, static_cast<int>(dense));
+    sqlite3_bind_text(stmt, 3, m.name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 4, m.version);
+    sqlite3_bind_int(stmt, 5, static_cast<int>(m.sections.size()));
+    sqlite3_bind_int64(stmt, 6, m.bss_size);
+    sqlite3_bind_int(stmt, 7, m.prolog_section);
+    sqlite3_bind_int64(stmt, 8, m.prolog_offset);
+    sqlite3_bind_int(stmt, 9, m.epilog_section);
+    sqlite3_bind_int64(stmt, 10, m.epilog_offset);
+    sqlite3_bind_int(stmt, 11, m.unresolved_section);
+    sqlite3_bind_int64(stmt, 12, m.unresolved_offset);
+    sqlite3_step(stmt);
+    sqlite3_reset(stmt);
+  }
+  sqlite3_finalize(stmt);
+
+  sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO module_sections VALUES (?, ?, ?, ?, ?)", -1,
+                     &stmt, nullptr);
+  for (const auto& m : modules)
+  {
+    for (size_t i = 0; i < m.sections.size(); i++)
+    {
+      const auto& sec = m.sections[i];
+      sqlite3_bind_int64(stmt, 1, m.module_id);
+      sqlite3_bind_int(stmt, 2, static_cast<int>(i));
+      sqlite3_bind_int64(stmt, 3, sec.size);
+      sqlite3_bind_int(stmt, 4, sec.executable ? 1 : 0);
+      sqlite3_bind_int(stmt, 5, sec.IsBss() ? 1 : 0);
+      sqlite3_step(stmt);
+      sqlite3_reset(stmt);
+    }
+  }
+  sqlite3_finalize(stmt);
+
+  sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO module_blocks VALUES (?, ?, ?, ?, ?)", -1, &stmt,
+                     nullptr);
+  for (const auto& m : modules)
+  {
+    auto it = cfgs.find(m.module_id);
+    if (it == cfgs.end())
+      continue;
+    for (const auto& [addr, block] : it->second.blocks)
+    {
+      sqlite3_bind_int64(stmt, 1, m.module_id);
+      sqlite3_bind_int(stmt, 2, SectOf(addr));
+      sqlite3_bind_int64(stmt, 3, OffsetOf(addr));
+      sqlite3_bind_int(stmt, 4, block.num_instructions);
+      sqlite3_bind_int(stmt, 5, 1);
+      sqlite3_step(stmt);
+      sqlite3_reset(stmt);
+    }
+  }
+  sqlite3_finalize(stmt);
+
+  static const char* edge_type_names[] = {"static", "dynamic", "call", "fallthrough"};
+  sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO module_edges VALUES (?, ?, ?, ?, ?, ?)", -1, &stmt,
+                     nullptr);
+  for (const auto& m : modules)
+  {
+    auto it = cfgs.find(m.module_id);
+    if (it == cfgs.end())
+      continue;
+    for (const auto& e : it->second.edges)
+    {
+      sqlite3_bind_int64(stmt, 1, m.module_id);
+      sqlite3_bind_int(stmt, 2, SectOf(e.from_block));
+      sqlite3_bind_int64(stmt, 3, OffsetOf(e.from_block));
+      sqlite3_bind_int(stmt, 4, SectOf(e.to_addr));
+      sqlite3_bind_int64(stmt, 5, OffsetOf(e.to_addr));
+      sqlite3_bind_text(stmt, 6, edge_type_names[e.type], -1, SQLITE_STATIC);
+      sqlite3_step(stmt);
+      sqlite3_reset(stmt);
+    }
+  }
+  sqlite3_finalize(stmt);
+
+  sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO module_relocs VALUES (?, ?, ?, ?, ?, ?, ?)", -1,
+                     &stmt, nullptr);
+  for (const auto& m : modules)
+  {
+    for (const auto& r : m.relocs)
+    {
+      // Only executable-section sites matter for translation; data sections are
+      // relocated in RAM by the game's own OSLink running under emulation.
+      if (!m.sections[r.site_section].executable)
+        continue;
+      sqlite3_bind_int64(stmt, 1, m.module_id);
+      sqlite3_bind_int(stmt, 2, r.site_section);
+      sqlite3_bind_int64(stmt, 3, r.site_offset);
+      sqlite3_bind_int(stmt, 4, r.type);
+      sqlite3_bind_int64(stmt, 5, r.target_module);
+      sqlite3_bind_int(stmt, 6, r.target_section);
+      sqlite3_bind_int64(stmt, 7, r.addend);
+      sqlite3_step(stmt);
+      sqlite3_reset(stmt);
+    }
+  }
+  sqlite3_finalize(stmt);
+
+  sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO metadata VALUES (?, ?)", -1, &stmt, nullptr);
+  sqlite3_bind_text(stmt, 1, "module_count", -1, SQLITE_STATIC);
+  const std::string count = fmt::format("{}", modules.size());
+  sqlite3_bind_text(stmt, 2, count.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+
+  sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
+  sqlite3_close(db);
+  return true;
 }
 
 // ============================================================================
@@ -765,6 +1113,9 @@ int CfgCommand(const std::vector<std::string>& args)
   parser.add_option("-t", "--trace").action("store").help("Path to .dpht trace file");
   parser.add_option("-o", "--output").action("store").help("Path to output SQLite database");
   parser.add_option("-v", "--verbose").action("store_true").help("Print detailed progress");
+  parser.add_option("--no-rels")
+      .action("store_true")
+      .help("Skip discovery and CFG extraction of .rel relocatable modules");
 
   const optparse::Values options = parser.parse_args(args);
 
@@ -778,6 +1129,7 @@ int CfgCommand(const std::vector<std::string>& args)
   const std::string trace_path = options["trace"];
   const std::string output_path = options["output"];
   const bool verbose = options.is_set("verbose");
+  const bool no_rels = options.is_set("no_rels");
 
   // 1. Open disc and extract DOL
   auto volume = DiscIO::CreateDisc(iso_path);
@@ -833,10 +1185,33 @@ int CfgCommand(const std::vector<std::string>& args)
                  size / 1024.0);
   }
 
-  // 2. Read trace data
+  // 2. Discover REL modules (purely static: every cross-reference into module
+  // code requires a relocation, so module CFGs need no trace input — and the
+  // DOL-code targets of module relocations seed the main pass below).
+  std::vector<RelFile> modules;
+  if (!no_rels)
+    modules = DiscoverRelModules(*volume, verbose);
+  std::sort(modules.begin(), modules.end(),
+            [](const RelFile& a, const RelFile& b) { return a.module_id < b.module_id; });
+
+  std::unordered_map<u32, std::set<u32>> module_seeds;
+  std::set<u32> dol_seeds;
+  CollectRelocationSeeds(modules, module_seeds, dol_seeds);
+
+  if (!modules.empty())
+  {
+    u32 total_relocs = 0;
+    for (const auto& m : modules)
+      total_relocs += static_cast<u32>(m.relocs.size());
+    fmt::println(std::cerr, "Modules: {} RELs, {} relocations, {} DOL seed addresses",
+                 modules.size(), total_relocs, dol_seeds.size());
+  }
+
+  // 3. Read trace data
   TraceData trace;
   if (!ReadTraceFile(trace_path, trace))
     return EXIT_FAILURE;
+  trace.static_seeds = std::move(dol_seeds);
 
   u32 dynamic_count = 0;
   for (const auto& e : trace.edges)
@@ -847,7 +1222,7 @@ int CfgCommand(const std::vector<std::string>& args)
   fmt::println(std::cerr, "Trace: {} seed blocks, {} edges ({} dynamic)", trace.blocks.size(),
                trace.edges.size(), dynamic_count);
 
-  // 3. Run recursive descent disassembly
+  // 4. Run recursive descent disassembly
   std::map<u32, CFGBlock> blocks;
   std::vector<CFGEdge> edges;
 
@@ -856,10 +1231,10 @@ int CfgCommand(const std::vector<std::string>& args)
 
   RunDisassembly(memory, trace, blocks, edges, verbose);
 
-  // 4. Identify functions
+  // 5. Identify functions
   auto functions = IdentifyFunctions(blocks, edges, dol.GetEntryPoint());
 
-  // 5. Compute statistics
+  // 6. Compute statistics
   u32 trace_only = 0, static_only = 0, both_count = 0;
   for (const auto& [addr, block] : blocks)
   {
@@ -899,12 +1274,58 @@ int CfgCommand(const std::vector<std::string>& args)
     fmt::println(std::cerr, "  Vertex formats: {}", trace.vertex_formats.size());
   }
 
-  // 6. Write output
+  // 6. Per-module CFGs (static, relocation-seeded)
+  std::map<u32, ModuleCfg> module_cfgs;
+  if (!modules.empty())
+  {
+    u32 total_blocks = 0;
+    u64 total_exec = 0, total_covered = 0;
+    u32 worst_coverage_id = 0;
+    double worst_coverage = 100.0;
+    for (const auto& m : modules)
+    {
+      static const std::set<u32> no_seeds;
+      auto seed_it = module_seeds.find(m.module_id);
+      ModuleCfg cfg = BuildModuleCfg(m, seed_it != module_seeds.end() ? seed_it->second : no_seeds);
+      total_blocks += static_cast<u32>(cfg.blocks.size());
+      total_exec += cfg.executable_bytes;
+      total_covered += cfg.covered_bytes;
+      if (cfg.executable_bytes > 0)
+      {
+        const double pct = 100.0 * cfg.covered_bytes / cfg.executable_bytes;
+        if (pct < worst_coverage)
+        {
+          worst_coverage = pct;
+          worst_coverage_id = m.module_id;
+        }
+        if (verbose)
+        {
+          fmt::println(std::cerr, "  module {:3d} {}: {} blocks, {:.1f}% of {:.1f} KB",
+                       m.module_id, m.name, cfg.blocks.size(), pct,
+                       cfg.executable_bytes / 1024.0);
+        }
+      }
+      module_cfgs.emplace(m.module_id, std::move(cfg));
+    }
+    fmt::println(std::cerr, "Module CFGs: {} blocks across {} modules", total_blocks,
+                 modules.size());
+    if (total_exec > 0)
+    {
+      fmt::println(std::cerr, "  Module code coverage: {:.1f}% of {:.1f} KB (worst: {:.1f}% in "
+                              "module {})",
+                   100.0 * total_covered / total_exec, total_exec / 1024.0, worst_coverage,
+                   worst_coverage_id);
+    }
+  }
+
+  // 7. Write output
   if (!WriteCFGDatabase(output_path, blocks, edges, functions, trace.smc_regions,
                         trace.vertex_formats, trace.seed_addresses, dol.GetEntryPoint()))
   {
     return EXIT_FAILURE;
   }
+  if (!modules.empty() && !WriteModuleDatabase(output_path, modules, module_cfgs))
+    return EXIT_FAILURE;
 
   fmt::println(std::cerr, "Output written to {}", output_path);
   return EXIT_SUCCESS;

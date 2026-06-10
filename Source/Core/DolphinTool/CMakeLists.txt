@@ -9,6 +9,14 @@ add_executable(dolphin-tool
   DiffCommand.cpp
   DiffCommand.h
   PPCMemoryImage.h
+  RarcReader.cpp
+  RarcReader.h
+  RelFile.cpp
+  RelFile.h
+  RelModules.cpp
+  RelModules.h
+  Yaz0.cpp
+  Yaz0.h
   VertexLoaderCEmitter.cpp
   VertexLoaderCEmitter.h
   VtxAotCommand.cpp
