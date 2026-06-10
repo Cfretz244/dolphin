@@ -1421,7 +1421,7 @@ bool AOTCore::CompareSnapshots(const PPCSnapshot&, const PPCSnapshot&, u32, FILE
 void AOTCore::LogDivergence(u32, u32, const PPCSnapshot&, const PPCSnapshot&, const PPCSnapshot&,
                             FILE*) {}
 bool AOTCore::BlockAccessesMMIO(const PPCSnapshot&, u32, u32) { return false; }
-int AOTCore::RunInterpreterBlock(Interpreter&, u32, u32, bool) { return 0; }
+int AOTCore::RunInterpreterBlock(Interpreter&, u32, u32, bool, u32) { return 0; }
 void AOTCore::RunInterpreterDispatch(Interpreter&) {}
 std::unordered_map<u32, u32> AOTCore::s_diff_block_sizes;
 std::atomic<bool> AOTCore::s_shutdown_requested{false};
