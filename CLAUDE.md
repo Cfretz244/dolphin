@@ -16,6 +16,12 @@ Dolphin is a GameCube/Wii emulator (GPLv2+). This fork adds an **ahead-of-time (
 # NOTE: MoltenVK (bundled Vulkan) fails to build on recent Xcode/macOS due to
 # a self-linking dylib error. Add -DENABLE_VULKAN=OFF to work around this.
 # Metal is the primary backend anyway, so Vulkan is not needed.
+# NOTE: An existing build cache errors with "The selection for <LIB> changed
+# from 'Bundled' to 'System'" when homebrew has since installed a matching lib
+# (e.g. fmt, xxhash). Pin the affected libs back to bundled with
+# -DUSE_SYSTEM_<LIB>=OFF (and clear stale detection results with -U "<LIB>_*"
+# if a failed configure already cached them), or reconfigure from a fresh
+# build directory.
 mkdir -p build && cd build
 cmake .. -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/qt -DENABLE_VULKAN=OFF
