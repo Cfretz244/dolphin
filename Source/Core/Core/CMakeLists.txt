@@ -558,6 +558,8 @@ add_library(core
   PowerPC/PPCCache.h
   PowerPC/AOTCore.cpp
   PowerPC/AOTCore.h
+  PowerPC/AotModuleTracker.cpp
+  PowerPC/AotModuleTracker.h
   PowerPC/AotRegistry.cpp
   PowerPC/AotRegistry.h
   PowerPC/AotRuntime.cpp

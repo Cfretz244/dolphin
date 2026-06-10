@@ -28,6 +28,7 @@
 #include "Core/State.h"
 #include "VideoCommon/CommandProcessor.h"
 #include "Core/ConfigManager.h"
+#include "Core/PowerPC/AotModuleTracker.h"
 #include "Core/PowerPC/AotRegistry.h"
 #include "Core/PowerPC/MMIOCapture.h"
 #include "Core/PowerPC/MMU.h"
@@ -150,7 +151,9 @@ void AOTCore::Init()
   {
     m_dispatch = entry->dispatch;
     m_lookup_block = entry->lookup_block;
-    INFO_LOG_FMT(POWERPC, "AOTCore: Found AOT library for game {}", game_id);
+    AotModuleTracker::Init(entry->modules, entry->module_count);
+    INFO_LOG_FMT(POWERPC, "AOTCore: Found AOT library for game {} ({} REL modules)", game_id,
+                 entry->module_count);
   }
   else
   {
@@ -232,12 +235,18 @@ void AOTCore::Init()
 void AOTCore::Shutdown()
 {
   aot_dump_fallback_stats();
+  AotModuleTracker::Shutdown();
   m_dispatch = nullptr;
   m_block_sizes.clear();
   std::free(m_ram_shadow);
   m_ram_shadow = nullptr;
   std::free(m_ram_shadow_aot);
   m_ram_shadow_aot = nullptr;
+}
+
+void AOTCore::ClearCache()
+{
+  AotModuleTracker::MarkDirty();
 }
 
 void AOTCore::Run()
@@ -1412,6 +1421,7 @@ AOTCore::AOTCore(Core::System& system)
 AOTCore::~AOTCore() = default;
 void AOTCore::Init() {}
 void AOTCore::Shutdown() {}
+void AOTCore::ClearCache() {}
 void AOTCore::Run() {}
 void AOTCore::SingleStep() {}
 void AOTCore::RunDiff() {}

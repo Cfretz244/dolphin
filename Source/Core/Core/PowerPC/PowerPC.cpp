@@ -1,6 +1,7 @@
 // Copyright 2008 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "Core/PowerPC/AotModuleTracker.h"
 #include "Core/PowerPC/PowerPC.h"
 
 #include <algorithm>
@@ -123,6 +124,10 @@ void PowerPCManager::DoState(PointerWrap& p)
 
     mmu.IBATUpdated();
     mmu.DBATUpdated();
+
+    // A savestate load replaces RAM without any icbi — the AOT module tracker
+    // must rescan the OS module queue before trusting its active ranges.
+    AotModuleTracker::MarkDirty();
   }
   else
   {

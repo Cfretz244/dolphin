@@ -39,7 +39,9 @@ public:
   void Shutdown() override;
   void Run() override;
   void SingleStep() override;
-  void ClearCache() override {}
+  // Savestate loads clear caches and can wholesale replace the loaded-module
+  // landscape — force a module queue rescan.
+  void ClearCache() override;
   const char* GetName() const override { return "AOT"; }
 
   // Set block sizes for diff mode (called by DiffCommand before boot)

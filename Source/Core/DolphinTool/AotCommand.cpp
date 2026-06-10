@@ -673,17 +673,20 @@ int AotCommand(const std::vector<std::string>& args)
 
         if (is_imm_type(r.type))
         {
+          // ELF semantics: ADDR16_* relocations point at the 16-bit immediate
+          // FIELD (instruction + 2), not the instruction word. The emitter is
+          // keyed by instruction pc, so mask down.
+          const u32 inst_site = (u32(r.site_section) << 24) | (r.site_offset & ~3u);
           if (r.target_module == 0)
           {
-            // Immediate field = low 16 bits of the big-endian instruction word.
             const u16 f = field16(r.type, r.addend);
             auto& data = patched[r.site_section];
-            data[r.site_offset + 2] = static_cast<u8>(f >> 8);
-            data[r.site_offset + 3] = static_cast<u8>(f);
+            data[r.site_offset] = static_cast<u8>(f >> 8);
+            data[r.site_offset + 1] = static_cast<u8>(f);
           }
           else if (r.target_module == rel.module_id)
           {
-            mode.imm_relocs[site] = ModuleImmReloc{
+            mode.imm_relocs[inst_site] = ModuleImmReloc{
                 r.type,
                 fmt::format("({}_base[{}]+{:#x}u)", mp, r.target_section, r.addend)};
           }
@@ -691,7 +694,7 @@ int AotCommand(const std::vector<std::string>& args)
           {
             // Cross-module immediate (a handful per game): the in-RAM
             // instruction was relocated by the game's own OSLink — single-step.
-            mode.force_fallback.insert(site);
+            mode.force_fallback.insert(inst_site);
           }
         }
         else if (is_branch_type(r.type))
