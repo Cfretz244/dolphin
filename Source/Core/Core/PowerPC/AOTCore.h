@@ -90,6 +90,8 @@ private:
 
   // Block boundary map: ppc_addr -> num_instructions (loaded from CFG DB for diff mode)
   std::unordered_map<u32, u32> m_block_sizes;
+  // REL module blocks: (module_id << 32 | section << 24 | offset) -> instructions
+  std::unordered_map<u64, u32> m_module_block_sizes;
 
   // Track how many times each block has passed comparison (for skipping validated blocks)
   std::unordered_map<u32, u32> m_block_pass_count;

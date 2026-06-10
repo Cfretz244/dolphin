@@ -36,6 +36,8 @@ struct ActiveRange
   u32 base;
   u32 size;
   const AOTBlockFunc* table;
+  u32 module_id;
+  u32 section;
 };
 
 const AotModuleDesc* s_modules = nullptr;
@@ -125,7 +127,7 @@ void RescanModules()
           const u32 base = raw & ~3u;
           *desc.sections[i].base_slot = base;
           if (desc.sections[i].table && base != 0 && in_ram(base))
-            s_ranges.push_back({base, desc.sections[i].size, desc.sections[i].table});
+            s_ranges.push_back({base, desc.sections[i].size, desc.sections[i].table, id, i});
           if (debug_dump && desc.sections[i].size > 0)
           {
             WARN_LOG_FMT(POWERPC, "  module {} section {}: base={:#010x} size={:#x} exec={}", id,
@@ -208,6 +210,23 @@ void Shutdown()
 void MarkDirty()
 {
   s_dirty = 1;
+}
+
+bool LookupBlock(u32 pc, AOTBlockFunc* fn, u32* module_id, u32* section, u32* offset)
+{
+  if (s_dirty)
+  {
+    s_dirty = 0;
+    RescanModules();
+  }
+  const ActiveRange* r = LookupRange(pc);
+  if (!r)
+    return false;
+  *fn = r->table[(pc - r->base) >> 2];
+  *module_id = r->module_id;
+  *section = r->section;
+  *offset = pc - r->base;
+  return true;
 }
 }  // namespace AotModuleTracker
 

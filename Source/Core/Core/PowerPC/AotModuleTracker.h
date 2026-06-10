@@ -7,6 +7,7 @@
 
 struct AOTState;
 struct AotModuleDesc;
+using AOTBlockFunc = void (*)(AOTState*);
 
 // Tracks which REL modules the game currently has loaded and at what
 // addresses, by walking the OS module queue in emulated low memory whenever
@@ -25,6 +26,12 @@ void Shutdown();
 // Schedules a rescan of the OS module queue before the next module dispatch.
 // Cheap enough to call from every aot_icbi.
 void MarkDirty();
+
+// Resolves pc against the active module ranges (processing any pending rescan
+// first). Returns the translated block function (may be null for table gaps)
+// and the module-relative identity for CFG database lookups; returns false if
+// pc is not inside any active module's executable section.
+bool LookupBlock(u32 pc, AOTBlockFunc* fn, u32* module_id, u32* section, u32* offset);
 }  // namespace AotModuleTracker
 
 // Module-aware terminal dispatch, musttail-called by generated <ID>_dispatch

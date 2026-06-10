@@ -220,9 +220,25 @@ void AOTCore::Init()
           }
           sqlite3_finalize(stmt);
         }
+        // Module blocks are keyed by (module, section, offset) — resolved at
+        // runtime via the module tracker since load addresses are dynamic.
+        const char* mod_sql = "SELECT module_id, section_idx, offset, num_instructions "
+                              "FROM module_blocks WHERE is_translatable = 1";
+        if (sqlite3_prepare_v2(db, mod_sql, -1, &stmt, nullptr) == SQLITE_OK)
+        {
+          while (sqlite3_step(stmt) == SQLITE_ROW)
+          {
+            const u64 mid = static_cast<u64>(sqlite3_column_int64(stmt, 0));
+            const u64 sect = static_cast<u64>(sqlite3_column_int(stmt, 1));
+            const u64 off = static_cast<u64>(sqlite3_column_int64(stmt, 2));
+            const u32 num_instr = static_cast<u32>(sqlite3_column_int64(stmt, 3));
+            m_module_block_sizes[(mid << 32) | (sect << 24) | off] = num_instr;
+          }
+          sqlite3_finalize(stmt);
+        }
         sqlite3_close(db);
-        INFO_LOG_FMT(POWERPC, "AOT_COMPARE: Loaded {} block boundaries from {}",
-                     m_block_sizes.size(), cfg_path);
+        INFO_LOG_FMT(POWERPC, "AOT_COMPARE: Loaded {} block boundaries (+{} module blocks) from {}",
+                     m_block_sizes.size(), m_module_block_sizes.size(), cfg_path);
       }
     }
     else
@@ -238,6 +254,7 @@ void AOTCore::Shutdown()
   AotModuleTracker::Shutdown();
   m_dispatch = nullptr;
   m_block_sizes.clear();
+  m_module_block_sizes.clear();
   std::free(m_ram_shadow);
   m_ram_shadow = nullptr;
   std::free(m_ram_shadow_aot);
@@ -377,10 +394,32 @@ void AOTCore::Run()
         // Try to compare this block: AOT vs interpreter
         AOTBlockFunc aot_fn = m_lookup_block ? m_lookup_block(m_ppc_state.pc) : nullptr;
         u32 block_pc = m_ppc_state.pc;
-
-        if (aot_fn && m_block_sizes.count(block_pc))
+        u32 block_size = 0;
+        if (aot_fn)
         {
-          u32 num_instr = m_block_sizes[block_pc];
+          auto it = m_block_sizes.find(block_pc);
+          if (it != m_block_sizes.end())
+            block_size = it->second;
+        }
+        else
+        {
+          // Not in the DOL fast table — maybe a REL module block.
+          AOTBlockFunc mod_fn = nullptr;
+          u32 mid, sect, off;
+          if (AotModuleTracker::LookupBlock(block_pc, &mod_fn, &mid, &sect, &off) && mod_fn)
+          {
+            auto it = m_module_block_sizes.find((u64(mid) << 32) | (u64(sect) << 24) | off);
+            if (it != m_module_block_sizes.end())
+            {
+              aot_fn = mod_fn;
+              block_size = it->second;
+            }
+          }
+        }
+
+        if (aot_fn && block_size > 0)
+        {
+          u32 num_instr = block_size;
 
           // Skip MMIO/gather-pipe blocks — running both paths would
           // double-send GPU commands and corrupt rendering
