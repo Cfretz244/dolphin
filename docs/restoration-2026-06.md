@@ -101,11 +101,14 @@ after.
   loads into magenta garbage. They were captured during April's corruption-debugging
   sessions (FP fast paths + unsound downcount batching active), so the corruption is baked
   into the state. Do not use them for validation; boot clean instead.
-- Open question: 40,817 of 114,449 blocks (36%) marked untranslatable by the DOL/runtime
-  mismatch detection — far more than Wind Waker's ~8,800 cited when the detection was added.
-  Possibly over-aggressive; each such block falls back to single-step interpretation.
-  Worth investigating if performance is below April's full-speed baseline. The deferred
-  icbi/instruction-capture branch is the principled fix.
+- ~~Open question: 40,817 of 114,449 blocks (36%) marked untranslatable~~ **RESOLVED:**
+  that count came from translating against the wrong disc image. The Melee traces were
+  collected from the **Rev 0** image (`~/Downloads/GALE01 - Super Smash Brothers Melee/
+  game.iso`, plain ISO, no NKit warning), not the Rev 2 NKit in iCloud Downloads. Against
+  Rev 0, **all 114,449 blocks translate, 0 skipped** — the DOL-mismatch detection was
+  correctly flagging revision-different code. ALWAYS regenerate AOT libraries from the same
+  image the traces were collected from. The shipping `libGALE01_aot.a` is now built from
+  Rev 0.
 
 ## Validation assets
 
