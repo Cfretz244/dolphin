@@ -76,6 +76,16 @@ isolation test (same build, interpreter vs `CPUCore=6`, normal Metal presentatio
 - A stale stash exists on the `instrumentation` branch ("Skip already-validated blocks after 100
   successful comparisons") — debug tooling WIP, probably discardable.
 
+## Harness false positives (fixed June 2026)
+
+The compare/diff harness ran the interpreter until PC left the block's address range, but a
+single-block AOT run can exit mid-range (internal unconditional `b`, `mtmsr`, first backward
+edge of an internal loop). Every such block was a guaranteed false-positive divergence —
+this is where much of April's `0x8034xxxx` "divergence" noise came from. Fixed by stopping
+the interpreter at the AOT run's exit PC (with backward-jump disambiguation for loop blocks).
+Offline Melee diff: 25 divergences/59k comparisons before → 0 divergences/135k comparisons
+after.
+
 ## Validation assets
 
 - Traces/CFG DBs: `build/trace_output/` (melee, wind_waker, metroid_prime, metroid_prime_2,
