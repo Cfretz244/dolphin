@@ -35,6 +35,8 @@
 
 #include "DolphinTool/AotCEmitter.h"
 #include "DolphinTool/PPCMemoryImage.h"
+#include "DolphinTool/RelFile.h"
+#include "DolphinTool/RelModules.h"
 
 namespace DolphinTool
 {
@@ -531,6 +533,266 @@ int AotCommand(const std::vector<std::string>& args)
     }
   }
 
+  // 4b. Translate REL modules if the CFG database carries module tables (built
+  // by `dolphin-tool cfg` from purely static relocation-seeded discovery).
+  struct ModuleSectionOut
+  {
+    u32 size = 0;
+    bool executable = false;
+    u32 block_count = 0;
+  };
+  struct ModuleOut
+  {
+    u32 module_id;
+    u32 dense;
+    const RelFile* rel;
+    std::map<u32, u32> blocks;  // synthetic (section<<24)|offset -> num_instructions
+    std::vector<ModuleSectionOut> sections;
+  };
+  std::vector<ModuleOut> mods;
+  std::vector<RelFile> rel_files;
+  {
+    sqlite3* db = nullptr;
+    if (sqlite3_open_v2(cfg_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK)
+    {
+      sqlite3_stmt* stmt = nullptr;
+      if (sqlite3_prepare_v2(db, "SELECT module_id, dense_idx FROM modules ORDER BY dense_idx",
+                             -1, &stmt, nullptr) == SQLITE_OK)
+      {
+        while (sqlite3_step(stmt) == SQLITE_ROW)
+        {
+          ModuleOut m{};
+          m.module_id = static_cast<u32>(sqlite3_column_int64(stmt, 0));
+          m.dense = static_cast<u32>(sqlite3_column_int(stmt, 1));
+          mods.push_back(m);
+        }
+        sqlite3_finalize(stmt);
+
+        sqlite3_prepare_v2(db,
+                           "SELECT module_id, section_idx, offset, num_instructions FROM "
+                           "module_blocks WHERE is_translatable=1",
+                           -1, &stmt, nullptr);
+        std::unordered_map<u32, ModuleOut*> by_id;
+        for (auto& m : mods)
+          by_id[m.module_id] = &m;
+        while (sqlite3_step(stmt) == SQLITE_ROW)
+        {
+          u32 mid = static_cast<u32>(sqlite3_column_int64(stmt, 0));
+          u32 sect = static_cast<u32>(sqlite3_column_int(stmt, 1));
+          u32 off = static_cast<u32>(sqlite3_column_int64(stmt, 2));
+          u32 ni = static_cast<u32>(sqlite3_column_int(stmt, 3));
+          auto it = by_id.find(mid);
+          if (it != by_id.end())
+            it->second->blocks[(sect << 24) | off] = ni;
+        }
+        sqlite3_finalize(stmt);
+      }
+      sqlite3_close(db);
+    }
+  }
+
+  std::unordered_map<u32, u32> module_dense;  // module_id -> dense idx
+  for (const auto& m : mods)
+    module_dense[m.module_id] = m.dense;
+
+  u64 module_table_bytes = 0;
+  u32 module_blocks_translated = 0;
+  std::map<std::string, u32> module_unhandled;
+
+  if (!mods.empty())
+  {
+    // The DB stores no section content — re-discover the RELs from the
+    // (sha256-pinned) disc image for instruction bytes and relocations.
+    rel_files = DiscoverRelModules(*volume, false);
+    std::unordered_map<u32, const RelFile*> rel_by_id;
+    for (const auto& r : rel_files)
+      rel_by_id[r.module_id] = &r;
+    for (auto& m : mods)
+    {
+      auto it = rel_by_id.find(m.module_id);
+      m.rel = it != rel_by_id.end() ? it->second : nullptr;
+      if (!m.rel)
+        fmt::println(std::cerr, "Warning: module {} in CFG DB but not on disc", m.module_id);
+    }
+    std::erase_if(mods, [](const ModuleOut& m) { return m.rel == nullptr; });
+
+    auto field16 = [](u8 type, u32 t) -> u16 {
+      switch (type)
+      {
+      case R_PPC_ADDR16_LO:
+        return static_cast<u16>(t);
+      case R_PPC_ADDR16_HI:
+        return static_cast<u16>(t >> 16);
+      default:  // R_PPC_ADDR16_HA
+        return static_cast<u16>((t + 0x8000) >> 16);
+      }
+    };
+    auto is_imm_type = [](u8 type) {
+      return type == R_PPC_ADDR16_LO || type == R_PPC_ADDR16_HI || type == R_PPC_ADDR16_HA;
+    };
+    auto is_branch_type = [](u8 type) {
+      return type == R_PPC_REL24 || type == R_PPC_REL14 || type == R_PPC_REL14_BRTAKEN ||
+             type == R_PPC_REL14_BRNTAKEN || type == R_PPC_ADDR24 || type == R_PPC_ADDR14 ||
+             type == R_PPC_ADDR14_BRTAKEN || type == R_PPC_ADDR14_BRNTAKEN;
+    };
+
+    for (auto& m : mods)
+    {
+      const RelFile& rel = *m.rel;
+      const std::string mp = fmt::format("{}_m{:03d}", prefix, m.dense);
+
+      m.sections.resize(rel.sections.size());
+      for (size_t i = 0; i < rel.sections.size(); i++)
+      {
+        m.sections[i].size = rel.sections[i].size;
+        m.sections[i].executable = rel.sections[i].executable;
+      }
+
+      // Pre-patch DOL-target immediates into copies of the executable sections:
+      // the absolute address is known, so the patched word translates through
+      // the normal emitter path with no special handling.
+      std::vector<std::vector<u8>> patched(rel.sections.size());
+      for (size_t i = 0; i < rel.sections.size(); i++)
+      {
+        if (rel.sections[i].executable)
+          patched[i] = rel.sections[i].data;
+      }
+
+      ModuleMode mode;
+      mode.fn_prefix = mp;
+      mode.base_array = mp + "_base";
+      mode.dol_blocks = &known_blocks;
+      for (const auto& sec : rel.sections)
+        mode.section_sizes.push_back(sec.size);
+
+      for (const auto& r : rel.relocs)
+      {
+        if (r.site_section >= rel.sections.size() || !rel.sections[r.site_section].executable)
+          continue;
+        const u32 site = (u32(r.site_section) << 24) | r.site_offset;
+
+        if (is_imm_type(r.type))
+        {
+          if (r.target_module == 0)
+          {
+            // Immediate field = low 16 bits of the big-endian instruction word.
+            const u16 f = field16(r.type, r.addend);
+            auto& data = patched[r.site_section];
+            data[r.site_offset + 2] = static_cast<u8>(f >> 8);
+            data[r.site_offset + 3] = static_cast<u8>(f);
+          }
+          else if (r.target_module == rel.module_id)
+          {
+            mode.imm_relocs[site] = ModuleImmReloc{
+                r.type,
+                fmt::format("({}_base[{}]+{:#x}u)", mp, r.target_section, r.addend)};
+          }
+          else
+          {
+            // Cross-module immediate (a handful per game): the in-RAM
+            // instruction was relocated by the game's own OSLink — single-step.
+            mode.force_fallback.insert(site);
+          }
+        }
+        else if (is_branch_type(r.type))
+        {
+          ModuleBranchOverride ov{};
+          if (r.target_module == 0)
+          {
+            ov.kind = ModuleBranchOverride::Absolute;
+            ov.target = r.addend;
+          }
+          else if (r.target_module == rel.module_id && (r.addend & 3) == 0 &&
+                   r.target_section < rel.sections.size() &&
+                   rel.sections[r.target_section].executable)
+          {
+            ov.kind = ModuleBranchOverride::Local;
+            ov.target = (u32(r.target_section) << 24) | r.addend;
+          }
+          else
+          {
+            ov.kind = ModuleBranchOverride::External;
+          }
+          mode.branch_overrides[site] = ov;
+        }
+        else
+        {
+          mode.force_fallback.insert(site);
+        }
+      }
+
+      PPCMemoryImage mod_mem;
+      for (size_t i = 0; i < rel.sections.size(); i++)
+      {
+        if (rel.sections[i].executable && !patched[i].empty())
+          mod_mem.AddSection(static_cast<u32>(i) << 24, patched[i].data(), rel.sections[i].size);
+      }
+
+      std::set<u32> mod_block_set;
+      for (const auto& [addr, ni] : m.blocks)
+        mod_block_set.insert(addr);
+
+      AOTCEmitter mod_emitter(mod_mem, {}, prefix);
+      mod_emitter.SetModuleMode(&mode, std::move(mod_block_set));
+
+      std::string filename = fmt::format("{}/{}_blocks_m{:03d}.c", output_dir, prefix, m.dense);
+      std::ofstream file(filename);
+      file << "#include \"aot_runtime.h\"\n";
+      file << fmt::format("#include \"{}_forward_decls.h\"\n\n", prefix);
+      file << "typedef void (*AOTBlockFunc)(AOTState*);\n\n";
+      // Runtime section bases, written by the module tracker on (un)load.
+      // Zero-initialized = module not resident.
+      file << fmt::format("uint32_t {}_base[{}];\n\n", mp, rel.sections.size());
+
+      // Forward declarations for this module's own blocks (musttail chaining).
+      for (const auto& [addr, ni] : m.blocks)
+      {
+        file << fmt::format("__attribute__((noinline)) void {}_s{}_{:x}(AOTState* s);\n", mp,
+                            addr >> 24, addr & 0x00FFFFFF);
+      }
+      file << "\n";
+
+      for (const auto& [addr, ni] : m.blocks)
+      {
+        file << mod_emitter.TranslateBlock(addr, ni, false) << "\n";
+        module_blocks_translated++;
+        m.sections[addr >> 24].block_count++;
+      }
+
+      // Per-section flat dispatch tables, indexed by (offset >> 2).
+      for (size_t sect = 0; sect < rel.sections.size(); sect++)
+      {
+        if (!rel.sections[sect].executable || rel.sections[sect].size == 0)
+          continue;
+        const u32 entries = (rel.sections[sect].size + 3) / 4;
+        module_table_bytes += u64(entries) * sizeof(void*);
+        file << fmt::format("const AOTBlockFunc {}_s{}_table[{}] = {{\n", mp, sect, entries);
+        auto it = m.blocks.lower_bound(static_cast<u32>(sect) << 24);
+        const u32 sect_end = (static_cast<u32>(sect) << 24) | 0x00FFFFFF;
+        for (u32 e = 0; e < entries; e++)
+        {
+          const u32 addr = (static_cast<u32>(sect) << 24) | (e << 2);
+          while (it != m.blocks.end() && it->first < addr && it->first <= sect_end)
+            ++it;
+          if (it != m.blocks.end() && it->first == addr)
+            file << fmt::format("    {}_s{}_{:x},\n", mp, sect, addr & 0x00FFFFFF);
+          else
+            file << "    0,\n";
+        }
+        file << "};\n\n";
+      }
+
+      for (const auto& [name, count] : mod_emitter.GetUnhandledOpcodes())
+        module_unhandled[name] += count;
+    }
+
+    fmt::println(std::cerr, "  Modules: {} translated ({} blocks, {:.1f} MB of tables)",
+                 mods.size(), module_blocks_translated,
+                 module_table_bytes / (1024.0 * 1024.0));
+    for (const auto& [name, count] : module_unhandled)
+      fmt::println(std::cerr, "    module fallback [{}]: {} sites", name, count);
+  }
+
   // 5. Write dispatch table — flat direct-mapped array for O(1) lookup
   {
     // Find the address range of all translatable blocks
@@ -603,7 +865,17 @@ int AotCommand(const std::vector<std::string>& args)
     file << fmt::format("        AOTBlockFunc fn = {}_fast_table[idx];\n", prefix);
     file << "        if (fn) { [[clang::musttail]] return fn(s); }\n";
     file << "    }\n";
-    file << "    [[clang::musttail]] return aot_interpreter_single_step(s);\n";
+    if (mods.empty())
+    {
+      file << "    [[clang::musttail]] return aot_interpreter_single_step(s);\n";
+    }
+    else
+    {
+      // Module-aware fallback: consults the runtime tracker's active-module
+      // ranges before degrading to the interpreter.
+      file << "    extern void aot_module_dispatch(AOTState*);\n";
+      file << "    [[clang::musttail]] return aot_module_dispatch(s);\n";
+    }
     file << "}\n\n";
 
     // Emit a block lookup function for the diff harness — returns a single
@@ -615,6 +887,52 @@ int AotCommand(const std::vector<std::string>& args)
     file << "    return 0;\n";
     file << "}\n\n";
 
+    // Module descriptors: one entry per compiled REL, registered alongside the
+    // game so the runtime tracker can activate tables and write section bases
+    // when the game loads/unloads modules.
+    if (!mods.empty())
+    {
+      file << "typedef struct AotModuleSectionDesc {\n";
+      file << "    uint32_t size;\n";
+      file << "    uint32_t executable;\n";
+      file << "    const AOTBlockFunc* table;  /* NULL for non-executable sections */\n";
+      file << "    uint32_t* base_slot;        /* runtime section base, 0 = unloaded */\n";
+      file << "} AotModuleSectionDesc;\n";
+      file << "typedef struct AotModuleDesc {\n";
+      file << "    uint32_t module_id;\n";
+      file << "    uint32_t num_sections;\n";
+      file << "    const AotModuleSectionDesc* sections;\n";
+      file << "} AotModuleDesc;\n\n";
+
+      for (const auto& m : mods)
+      {
+        const std::string mp = fmt::format("{}_m{:03d}", prefix, m.dense);
+        file << fmt::format("extern uint32_t {}_base[];\n", mp);
+        for (size_t sect = 0; sect < m.sections.size(); sect++)
+        {
+          if (m.sections[sect].executable && m.sections[sect].size > 0)
+            file << fmt::format("extern const AOTBlockFunc {}_s{}_table[];\n", mp, sect);
+        }
+        file << fmt::format("static const AotModuleSectionDesc {}_sections[] = {{\n", mp);
+        for (size_t sect = 0; sect < m.sections.size(); sect++)
+        {
+          const auto& s = m.sections[sect];
+          const bool has_table = s.executable && s.size > 0;
+          file << fmt::format("    {{ {:#x}u, {}, {}, &{}_base[{}] }},\n", s.size,
+                              s.executable ? 1 : 0,
+                              has_table ? fmt::format("{}_s{}_table", mp, sect) : "0", mp, sect);
+        }
+        file << "};\n";
+      }
+      file << fmt::format("\nstatic const AotModuleDesc {}_modules[] = {{\n", prefix);
+      for (const auto& m : mods)
+      {
+        file << fmt::format("    {{ {}u, {}u, {}_m{:03d}_sections }},\n", m.module_id,
+                            m.sections.size(), prefix, m.dense);
+      }
+      file << "};\n\n";
+    }
+
     // Emit self-registration constructor — runs before main() to register
     // this game's dispatch/lookup with Dolphin's AotRegistry.
     file << "__attribute__((constructor))\n";
@@ -623,6 +941,12 @@ int AotCommand(const std::vector<std::string>& args)
             " void (*)(AOTState*), AOTBlockFunc (*)(uint32_t));\n";
     file << fmt::format("    aot_register_game(\"{}\", {}_dispatch, {}_lookup_block);\n", prefix,
                         prefix, prefix);
+    if (!mods.empty())
+    {
+      file << "    extern void aot_register_game_modules(const char*, const void*, uint32_t);\n";
+      file << fmt::format("    aot_register_game_modules(\"{}\", {}_modules, {}u);\n", prefix,
+                          prefix, mods.size());
+    }
     file << "}\n";
   }
 

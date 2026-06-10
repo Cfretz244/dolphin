@@ -20,7 +20,20 @@ void AotRegistry::Register(const std::string& game_id, AOTDispatchFunc dispatch,
     // Last registration wins; this is a build misconfiguration.
     WARN_LOG_FMT(POWERPC, "AotRegistry: Duplicate registration for game {}, overwriting", game_id);
   }
-  m_games[game_id] = AotGameEntry{game_id, dispatch, lookup};
+  auto& entry = m_games[game_id];
+  entry.game_id = game_id;
+  entry.dispatch = dispatch;
+  entry.lookup_block = lookup;
+}
+
+void AotRegistry::RegisterModules(const std::string& game_id, const AotModuleDesc* modules,
+                                  uint32_t count)
+{
+  auto& entry = m_games[game_id];
+  if (entry.game_id.empty())
+    entry.game_id = game_id;
+  entry.modules = modules;
+  entry.module_count = count;
 }
 
 std::optional<AotGameEntry> AotRegistry::Find(const std::string& game_id) const
@@ -44,4 +57,11 @@ extern "C" void aot_register_game(const char* game_id, AOTDispatchFunc dispatch,
                                   AOTLookupFunc lookup)
 {
   AotRegistry::Instance().Register(game_id, dispatch, lookup);
+}
+
+extern "C" void aot_register_game_modules(const char* game_id, const void* modules,
+                                          uint32_t count)
+{
+  AotRegistry::Instance().RegisterModules(game_id,
+                                          static_cast<const AotModuleDesc*>(modules), count);
 }

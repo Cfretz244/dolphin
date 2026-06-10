@@ -23,14 +23,73 @@ AOTCEmitter::AOTCEmitter(const PPCMemoryImage& memory, std::set<u32> known_block
 {
 }
 
+void AOTCEmitter::SetModuleMode(const ModuleMode* mode, std::set<u32> module_blocks)
+{
+  m_module = mode;
+  if (mode)
+    m_known_blocks = std::move(module_blocks);
+}
+
+std::string AOTCEmitter::PcStr(u32 pc) const
+{
+  if (!m_module)
+    return fmt::format("{:#010x}u", pc);
+  return fmt::format("({}[{}]+{:#x}u)", m_module->base_array, pc >> 24, pc & 0x00FFFFFF);
+}
+
+std::string AOTCEmitter::BlockFn(u32 addr, bool is_dol) const
+{
+  if (!m_module || is_dol)
+    return fmt::format("{}_block_{:08x}", m_prefix, addr);
+  return fmt::format("{}_s{}_{:x}", m_module->fn_prefix, addr >> 24, addr & 0x00FFFFFF);
+}
+
+// The patched 16-bit field value for the current immediate relocation:
+// LO = T & 0xFFFF, HI = T >> 16, HA = (T + 0x8000) >> 16.
+std::string AOTCEmitter::Field16Expr() const
+{
+  const std::string& t = m_cur_imm->target_expr;
+  switch (m_cur_imm->type)
+  {
+  case 4:  // R_PPC_ADDR16_LO
+    return fmt::format("(({})&0xFFFFu)", t);
+  case 5:  // R_PPC_ADDR16_HI
+    return fmt::format("((({})>>16)&0xFFFFu)", t);
+  default:  // R_PPC_ADDR16_HA (6); other types are filtered out upstream
+    return fmt::format("(((({})+0x8000u)>>16)&0xFFFFu)", t);
+  }
+}
+
+std::string AOTCEmitter::DispExpr(s32 offset) const
+{
+  if (!m_cur_imm)
+    return fmt::format("{}", offset);
+  // D-form displacements are sign-extended, like addi.
+  return fmt::format("(uint32_t)(int16_t){}", Field16Expr());
+}
+
+void AOTCEmitter::EmitModuleFallback(std::string& out, u32 pc)
+{
+  out += fmt::format("    s->pc = {}; aot_interpreter_single_step(s);\n", PcStr(pc));
+}
+
+// Opcodes whose 16-bit immediate field can legitimately carry an own-module
+// ADDR16 relocation and that EmitInstruction knows how to emit with an
+// expression immediate: addi/addis, ori/oris, D-form integer and FP load/store,
+// lmw/stmw.
+static bool OpcodeSupportsImmReloc(u32 opcd)
+{
+  return opcd == 14 || opcd == 15 || opcd == 24 || opcd == 25 || (opcd >= 32 && opcd <= 55);
+}
+
 std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bool from_trace)
 {
   std::string out;
   m_block_cycle_count = 0;
   const char* section = from_trace ? "__TEXT,__aot_hot" : "__TEXT,__aot_cold";
   out += fmt::format("__attribute__((noinline, section(\"{}\")))"
-                     " void {}_block_{:08x}(AOTState* s) {{\n",
-                     section, m_prefix, block_addr);
+                     " void {}(AOTState* s) {{\n",
+                     section, BlockFn(block_addr, false));
 
   for (u32 i = 0; i < num_instructions; i++)
   {
@@ -44,15 +103,59 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
     if (info)
       m_block_cycle_count += info->num_cycles;
 
+    // Module mode: look up relocations on this instruction. DOL-target
+    // immediates were pre-patched into the section image, so only own-module
+    // immediate relocs and branch-target overrides arrive here.
+    m_cur_imm = nullptr;
+    m_cur_branch = nullptr;
+    if (m_module)
+    {
+      if (m_module->force_fallback.contains(pc))
+      {
+        // Cross-module reference or exotic relocation type: the in-RAM word was
+        // relocated by the game's own OSLink — single-step it (data ops fall
+        // through to the next inline instruction).
+        m_unhandled_opcodes["forced_reloc_fallback"]++;
+        EmitModuleFallback(out, pc);
+        continue;
+      }
+      if (auto it = m_module->imm_relocs.find(pc); it != m_module->imm_relocs.end())
+        m_cur_imm = &it->second;
+      if (auto it = m_module->branch_overrides.find(pc); it != m_module->branch_overrides.end())
+        m_cur_branch = &it->second;
+
+      if (m_cur_imm && !OpcodeSupportsImmReloc(inst.OPCD))
+      {
+        // A relocated immediate on an opcode we don't special-case: execute the
+        // relocated instruction from RAM. Data ops fall through to the next
+        // inline instruction, exactly like the unhandled-opcode path.
+        m_unhandled_opcodes[fmt::format("imm_reloc_opcd_{}", u32(inst.OPCD))]++;
+        EmitModuleFallback(out, pc);
+        continue;
+      }
+      if (m_cur_branch && inst.OPCD != 18 && inst.OPCD != 16)
+      {
+        // Branch-type reloc on an unexpected opcode — single-step it and stop:
+        // the interpreter may have moved pc anywhere.
+        m_unhandled_opcodes[fmt::format("branch_reloc_opcd_{}", u32(inst.OPCD))]++;
+        out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
+        EmitModuleFallback(out, pc);
+        out += "    return;\n";
+        continue;
+      }
+    }
+
     bool is_last = (i == num_instructions - 1);
     if (!EmitInstruction(out, inst, pc, is_last))
     {
       std::string opname = info ? info->opname : "unknown";
       m_unhandled_opcodes[opname]++;
-      out += fmt::format("    s->pc = {:#010x}u; aot_interpreter_single_step(s);\n", pc);
+      out += fmt::format("    s->pc = {}; aot_interpreter_single_step(s);\n", PcStr(pc));
     }
 
   }
+  m_cur_imm = nullptr;
+  m_cur_branch = nullptr;
 
   // Always emit a fallthrough exit at the end of every block.
   // Branch instructions that are taken will `return` before reaching this.
@@ -61,7 +164,7 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
   {
     u32 next_pc = block_addr + num_instructions * 4;
     out += fmt::format("    s->downcount -= {};\n", m_block_cycle_count);
-    out += fmt::format("    s->pc = {:#010x}u;\n", next_pc);
+    out += fmt::format("    s->pc = {};\n", PcStr(next_pc));
   }
 
   out += "}\n";
@@ -118,8 +221,8 @@ bool AOTCEmitter::EmitInstruction(std::string& out, UGeckoInstruction inst, u32 
   case 56: case 57: case 60: case 61:  // psq_l, psq_lu, psq_st, psq_stu
   case 59: case 63: case 4:            // FP arith, PS arith
   {
-    out += fmt::format("    if(!aot_check_fpu(s,{:#010x}u)) {{ s->downcount-={}; return; }}\n",
-                       pc, m_block_cycle_count);
+    out += fmt::format("    if(!aot_check_fpu(s,{})) {{ s->downcount-={}; return; }}\n",
+                       PcStr(pc), m_block_cycle_count);
     switch (I(inst.OPCD))
     {
     case 48: EmitLfs(out, inst, false, false); return true;
@@ -142,8 +245,8 @@ bool AOTCEmitter::EmitInstruction(std::string& out, UGeckoInstruction inst, u32 
   }
   // Sync/isync (no-ops)
   case 17:
-    out += fmt::format("    s->downcount-={}; s->pc={:#010x}u; s->npc=s->pc; aot_sc(s); return;\n",
-                       m_block_cycle_count, pc + 4);
+    out += fmt::format("    s->downcount-={}; s->pc={}; s->npc=s->pc; aot_sc(s); return;\n",
+                       m_block_cycle_count, PcStr(pc + 4));
     return true; // sc
   case 46 + 128: return true; // placeholder
 
@@ -160,6 +263,15 @@ bool AOTCEmitter::EmitInstruction(std::string& out, UGeckoInstruction inst, u32 
 void AOTCEmitter::EmitAddi(std::string& out, UGeckoInstruction inst)
 {
   u32 rd = I(inst.RD), ra = I(inst.RA);
+  if (m_cur_imm)
+  {
+    std::string imm = fmt::format("(uint32_t)(int16_t){}", Field16Expr());
+    if (ra)
+      out += fmt::format("    s->gpr[{}] = s->gpr[{}] + {};\n", rd, ra, imm);
+    else
+      out += fmt::format("    s->gpr[{}] = {};\n", rd, imm);
+    return;
+  }
   u32 imm = u32(s32(s16(inst.SIMM_16)));
   if (ra)
     out += fmt::format("    s->gpr[{}] = s->gpr[{}] + {:#x}u;\n", rd, ra, imm);
@@ -170,6 +282,15 @@ void AOTCEmitter::EmitAddi(std::string& out, UGeckoInstruction inst)
 void AOTCEmitter::EmitAddis(std::string& out, UGeckoInstruction inst)
 {
   u32 rd = I(inst.RD), ra = I(inst.RA);
+  if (m_cur_imm)
+  {
+    std::string imm = fmt::format("(((uint32_t)(int16_t){})<<16)", Field16Expr());
+    if (ra)
+      out += fmt::format("    s->gpr[{}] = s->gpr[{}] + {};\n", rd, ra, imm);
+    else
+      out += fmt::format("    s->gpr[{}] = {};\n", rd, imm);
+    return;
+  }
   u32 imm = u32(s32(s16(inst.SIMM_16)) << 16);
   if (ra)
     out += fmt::format("    s->gpr[{}] = s->gpr[{}] + {:#x}u;\n", rd, ra, imm);
@@ -204,10 +325,21 @@ void AOTCEmitter::EmitSubfic(std::string& out, UGeckoInstruction inst)
 
 void AOTCEmitter::EmitOri(std::string& out, UGeckoInstruction inst)
 {
+  if (m_cur_imm)
+  {
+    out += fmt::format("    s->gpr[{}]=s->gpr[{}]|{};\n", I(inst.RA), I(inst.RS), Field16Expr());
+    return;
+  }
   out += fmt::format("    s->gpr[{}]=s->gpr[{}]|{:#x}u;\n", I(inst.RA), I(inst.RS), u32(inst.UIMM));
 }
 void AOTCEmitter::EmitOris(std::string& out, UGeckoInstruction inst)
 {
+  if (m_cur_imm)
+  {
+    out += fmt::format("    s->gpr[{}]=s->gpr[{}]|({}<<16);\n", I(inst.RA), I(inst.RS),
+                       Field16Expr());
+    return;
+  }
   out += fmt::format("    s->gpr[{}]=s->gpr[{}]|{:#x}u;\n", I(inst.RA), I(inst.RS), u32(inst.UIMM)<<16);
 }
 void AOTCEmitter::EmitXori(std::string& out, UGeckoInstruction inst)
@@ -664,16 +796,47 @@ void AOTCEmitter::EmitEqvx(std::string& out, UGeckoInstruction inst)
 
 void AOTCEmitter::EmitBx(std::string& out, UGeckoInstruction inst, u32 pc)
 {
-  u32 target = u32(SignExt26(inst.LI << 2));
-  if (!inst.AA) target += pc;
-  if (inst.LK) out += fmt::format("    s->spr[8]={:#010x}u;\n", pc + 4);
-  EmitBranchTo(out, target, pc);
+  if (m_cur_branch && m_cur_branch->kind == ModuleBranchOverride::External)
+  {
+    // Branch into another module (rare): execute the relocated instruction
+    // from RAM and return to the dispatcher — pc has moved arbitrarily.
+    out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
+    EmitModuleFallback(out, pc);
+    out += "    return;\n";
+    return;
+  }
+  u32 target;
+  bool target_is_dol = false;
+  if (m_cur_branch)
+  {
+    target = m_cur_branch->target;
+    target_is_dol = m_cur_branch->kind == ModuleBranchOverride::Absolute;
+  }
+  else
+  {
+    target = u32(SignExt26(inst.LI << 2));
+    if (!inst.AA) target += pc;
+  }
+  if (inst.LK) out += fmt::format("    s->spr[8]={};\n", PcStr(pc + 4));
+  EmitBranchTo(out, target, pc, target_is_dol);
 }
 
 void AOTCEmitter::EmitBcx(std::string& out, UGeckoInstruction inst, u32 pc)
 {
-  u32 target = u32(SignExt16(s16(inst.BD << 2)));
-  if (!inst.AA) target += pc;
+  u32 target;
+  bool target_is_dol = false;
+  bool target_external = false;
+  if (m_cur_branch)
+  {
+    target = m_cur_branch->target;
+    target_is_dol = m_cur_branch->kind == ModuleBranchOverride::Absolute;
+    target_external = m_cur_branch->kind == ModuleBranchOverride::External;
+  }
+  else
+  {
+    target = u32(SignExt16(s16(inst.BD << 2)));
+    if (!inst.AA) target += pc;
+  }
   u32 bo = I(inst.BO);
 
   out += "    {\n";
@@ -695,8 +858,20 @@ void AOTCEmitter::EmitBcx(std::string& out, UGeckoInstruction inst, u32 pc)
     out += "    if(ctr_ok&&cond_ok) {\n";
   }
 
-  if (inst.LK) out += fmt::format("    s->spr[8]={:#010x}u;\n", pc + 4);
-  EmitBranchTo(out, target, pc);
+  if (target_external)
+  {
+    // Note: the interpreter re-evaluates the condition (and re-applies the CTR
+    // decrement); undo the decrement so it is not applied twice.
+    if (!(bo & BO_DONT_DECREMENT_FLAG)) out += "    s->spr[9]++;\n";
+    out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
+    EmitModuleFallback(out, pc);
+    out += "    return;\n";
+  }
+  else
+  {
+    if (inst.LK) out += fmt::format("    s->spr[8]={};\n", PcStr(pc + 4));
+    EmitBranchTo(out, target, pc, target_is_dol);
+  }
 
   if (!always) out += "    }\n";
   out += "    }\n";
@@ -711,7 +886,7 @@ void AOTCEmitter::EmitBcctrx(std::string& out, UGeckoInstruction inst, u32 pc)
   {
     out += fmt::format("    if(aot_cr_get_bit(s,{})=={}) {{\n", I(inst.BI_2), (bo2>>3)&1);
   }
-  if (inst.LK_3) out += fmt::format("    s->spr[8]={:#010x}u;\n", pc + 4);
+  if (inst.LK_3) out += fmt::format("    s->spr[8]={};\n", PcStr(pc + 4));
   {
     u32 cycles = m_block_cycle_count;
     out += fmt::format("    s->downcount-={}; s->pc=s->spr[9]&~3u;\n", cycles);
@@ -739,7 +914,7 @@ void AOTCEmitter::EmitBclrx(std::string& out, UGeckoInstruction inst, u32 pc)
   }
 
   out += "    uint32_t dest=s->spr[8]&~3u;\n";
-  if (inst.LK_3) out += fmt::format("    s->spr[8]={:#010x}u;\n", pc + 4);
+  if (inst.LK_3) out += fmt::format("    s->spr[8]={};\n", PcStr(pc + 4));
   {
     u32 cycles = m_block_cycle_count;
     out += fmt::format("    s->downcount-={}; s->pc=dest;\n", cycles);
@@ -772,22 +947,45 @@ void AOTCEmitter::EmitOECheck(std::string& out, const char* a, const char* b, co
     "s->xer_so_ov=(s->xer_so_ov&0xfe)|ov; if(ov) s->xer_so_ov|=2; }}\n", a, b, result);
 }
 
-void AOTCEmitter::EmitBranchTo(std::string& out, u32 target, u32 /*current_pc*/)
+void AOTCEmitter::EmitBranchTo(std::string& out, u32 target, u32 current_pc,
+                               bool target_is_dol)
 {
-  if (m_known_blocks.contains(target))
+  // In module mode a DOL-absolute target is resolved against the DOL block set
+  // and keeps its absolute-constant pc; local targets use the module's
+  // synthetic block set and base-relative pc expressions.
+  const bool dol_target = m_module && target_is_dol;
+  if (m_module && !dol_target)
+  {
+    // Raw-displacement targets from misdisassembled junk blocks can point
+    // outside the module. Real code cannot: cross-section branches always
+    // carry relocations. Single-step the in-RAM instruction if ever reached.
+    const u32 sect = target >> 24;
+    if (sect >= m_module->section_sizes.size() ||
+        (target & 0x00FFFFFF) >= m_module->section_sizes[sect])
+    {
+      out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
+      EmitModuleFallback(out, current_pc);
+      out += "    return;\n";
+      return;
+    }
+  }
+  const bool known = dol_target ? m_module->dol_blocks->contains(target) :
+                                  m_known_blocks.contains(target);
+  const std::string pc_expr = dol_target ? fmt::format("{:#010x}u", target) : PcStr(target);
+  if (known)
   {
     // Check downcount on every static edge so the Run loop regains control for
     // timing/interrupt delivery (matches pre-optimization behavior and upstream
     // JIT practice; forward-edge batching can be revisited with A/B perf data).
     out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
-    out += fmt::format("    if(s->downcount<=0||aot_single_block_mode){{ s->pc={:#010x}u; return; }}\n", target);
-    out += fmt::format("    [[clang::musttail]] return {}_block_{:08x}(s);\n", m_prefix, target);
+    out += fmt::format("    if(s->downcount<=0||aot_single_block_mode){{ s->pc={}; return; }}\n", pc_expr);
+    out += fmt::format("    [[clang::musttail]] return {}(s);\n", BlockFn(target, dol_target));
   }
   else
   {
     // Unknown target — always check
     out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
-    out += fmt::format("    s->pc={:#010x}u; [[clang::musttail]] return {}_dispatch(s);\n", target,
+    out += fmt::format("    s->pc={}; [[clang::musttail]] return {}_dispatch(s);\n", pc_expr,
                        m_prefix);
   }
 }
@@ -818,9 +1016,9 @@ void AOTCEmitter::EmitLoadInt(std::string& out, UGeckoInstruction inst, const ch
   {
     s32 offset = s32(s16(inst.SIMM_16));
     if (ra)
-      out += fmt::format("        uint32_t ea=s->gpr[{}]+{};\n", ra, offset);
+      out += fmt::format("        uint32_t ea=s->gpr[{}]+{};\n", ra, DispExpr(offset));
     else
-      out += fmt::format("        uint32_t ea=(uint32_t){};\n", offset);
+      out += fmt::format("        uint32_t ea=(uint32_t){};\n", DispExpr(offset));
   }
   out += fmt::format("        uint32_t val={}(s,ea);\n", helper);
   out += fmt::format("        s->gpr[{}]=val;\n", rd);
@@ -846,9 +1044,9 @@ void AOTCEmitter::EmitStoreInt(std::string& out, UGeckoInstruction inst, const c
   {
     s32 offset = s32(s16(inst.SIMM_16));
     if (ra)
-      out += fmt::format("        uint32_t ea=s->gpr[{}]+{};\n", ra, offset);
+      out += fmt::format("        uint32_t ea=s->gpr[{}]+{};\n", ra, DispExpr(offset));
     else
-      out += fmt::format("        uint32_t ea=(uint32_t){};\n", offset);
+      out += fmt::format("        uint32_t ea=(uint32_t){};\n", DispExpr(offset));
   }
   out += fmt::format("        {}(s,s->gpr[{}],ea);\n", helper, rs);
   if (update && ra)
@@ -862,9 +1060,9 @@ void AOTCEmitter::EmitLmw(std::string& out, UGeckoInstruction inst)
   s32 offset = s32(s16(inst.SIMM_16));
   out += "    {\n";
   if (ra)
-    out += fmt::format("        uint32_t ea=s->gpr[{}]+{};\n", ra, offset);
+    out += fmt::format("        uint32_t ea=s->gpr[{}]+{};\n", ra, DispExpr(offset));
   else
-    out += fmt::format("        uint32_t ea=(uint32_t){};\n", offset);
+    out += fmt::format("        uint32_t ea=(uint32_t){};\n", DispExpr(offset));
   out += fmt::format("        for(int r={};r<32;r++,ea+=4) s->gpr[r]=aot_read_u32(s,ea);\n", rd);
   out += "    }\n";
 }
@@ -875,9 +1073,9 @@ void AOTCEmitter::EmitStmw(std::string& out, UGeckoInstruction inst)
   s32 offset = s32(s16(inst.SIMM_16));
   out += "    {\n";
   if (ra)
-    out += fmt::format("        uint32_t ea=s->gpr[{}]+{};\n", ra, offset);
+    out += fmt::format("        uint32_t ea=s->gpr[{}]+{};\n", ra, DispExpr(offset));
   else
-    out += fmt::format("        uint32_t ea=(uint32_t){};\n", offset);
+    out += fmt::format("        uint32_t ea=(uint32_t){};\n", DispExpr(offset));
   out += fmt::format("        for(int r={};r<32;r++,ea+=4) aot_write_u32(s,s->gpr[r],ea);\n", rs);
   out += "    }\n";
 }
@@ -900,7 +1098,7 @@ void AOTCEmitter::EmitLfs(std::string& out, UGeckoInstruction inst, bool update,
   {
     s32 offset = s32(s16(inst.SIMM_16));
     out += fmt::format("        uint32_t ea={}+{};\n",
-                       ra ? fmt::format("s->gpr[{}]", ra) : "0", offset);
+                       ra ? fmt::format("s->gpr[{}]", ra) : "0", DispExpr(offset));
   }
   out += "        uint32_t raw=aot_read_u32(s,ea);\n";
   out += fmt::format("        uint64_t dv=aot_convert_to_double(raw); "
@@ -924,7 +1122,7 @@ void AOTCEmitter::EmitLfd(std::string& out, UGeckoInstruction inst, bool update,
   {
     s32 offset = s32(s16(inst.SIMM_16));
     out += fmt::format("        uint32_t ea={}+{};\n",
-                       ra ? fmt::format("s->gpr[{}]", ra) : "0", offset);
+                       ra ? fmt::format("s->gpr[{}]", ra) : "0", DispExpr(offset));
   }
   out += fmt::format("        s->ps[{}].ps0=aot_read_u64(s,ea);\n", fd);
   if (update && ra)
@@ -946,7 +1144,7 @@ void AOTCEmitter::EmitStfs(std::string& out, UGeckoInstruction inst, bool update
   {
     s32 offset = s32(s16(inst.SIMM_16));
     out += fmt::format("        uint32_t ea={}+{};\n",
-                       ra ? fmt::format("s->gpr[{}]", ra) : "0", offset);
+                       ra ? fmt::format("s->gpr[{}]", ra) : "0", DispExpr(offset));
   }
   out += fmt::format("        aot_write_u32(s,aot_convert_to_single(s->ps[{}].ps0),ea);\n", fs);
   if (update && ra)
@@ -968,7 +1166,7 @@ void AOTCEmitter::EmitStfd(std::string& out, UGeckoInstruction inst, bool update
   {
     s32 offset = s32(s16(inst.SIMM_16));
     out += fmt::format("        uint32_t ea={}+{};\n",
-                       ra ? fmt::format("s->gpr[{}]", ra) : "0", offset);
+                       ra ? fmt::format("s->gpr[{}]", ra) : "0", DispExpr(offset));
   }
   out += fmt::format("        aot_write_u64(s,s->ps[{}].ps0,ea);\n", fs);
   if (update && ra)
@@ -1050,9 +1248,9 @@ void AOTCEmitter::EmitMtmsr(std::string& out, UGeckoInstruction inst, u32 pc)
 {
   // mtmsr ends the block (may enable exceptions). Set PC to fallthrough
   // before calling aot_mtmsr which may change PC via CheckExceptions.
-  out += fmt::format("    s->downcount-={}; s->pc={:#010x}u; s->npc=s->pc; "
+  out += fmt::format("    s->downcount-={}; s->pc={}; s->npc=s->pc; "
                      "aot_mtmsr(s,s->gpr[{}]); return;\n",
-                     m_block_cycle_count, pc + 4, I(inst.RS));
+                     m_block_cycle_count, PcStr(pc + 4), I(inst.RS));
 }
 
 void AOTCEmitter::EmitMfsr(std::string& out, UGeckoInstruction inst)
@@ -1067,9 +1265,9 @@ void AOTCEmitter::EmitMtsr(std::string& out, UGeckoInstruction inst)
 
 void AOTCEmitter::EmitTwi(std::string& out, UGeckoInstruction inst, u32 pc)
 {
-  out += fmt::format("    s->pc={:#010x}u; if(aot_twi(s,{},(int32_t)s->gpr[{}],{})) "
+  out += fmt::format("    s->pc={}; if(aot_twi(s,{},(int32_t)s->gpr[{}],{})) "
                      "{{ s->downcount-={}; return; }}\n",
-                     pc + 4, I(inst.TO), I(inst.RA), I(inst.SIMM_16), m_block_cycle_count);
+                     PcStr(pc + 4), I(inst.TO), I(inst.RA), I(inst.SIMM_16), m_block_cycle_count);
 }
 
 void AOTCEmitter::EmitCrLogical(std::string& out, UGeckoInstruction inst, const char* op)

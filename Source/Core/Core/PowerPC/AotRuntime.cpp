@@ -811,6 +811,15 @@ void aot_dcbt(AOTState* s, uint32_t addr)
   // Prefetch hint — no-op
 }
 
+void aot_module_dispatch(AOTState* s)
+{
+  // Module-aware dispatch fallback, musttail-called by generated <ID>_dispatch
+  // when the DOL fast table misses and the game has compiled REL modules.
+  // The module tracker (M3) will consult active module ranges here; until it
+  // lands, degrade exactly like the old terminal fallback: one interpreter step.
+  aot_interpreter_single_step(s);
+}
+
 void aot_icbi(AOTState* s, uint32_t addr)
 {
   // Must invalidate the emulated icache exactly like Interpreter::icbi: the interpreter

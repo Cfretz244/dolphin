@@ -7,6 +7,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "Common/CommonTypes.h"
 #include "Core/PowerPC/Gekko.h"
@@ -15,6 +16,44 @@
 namespace DolphinTool
 {
 
+// Module mode: translating a relocatable .rel module instead of the DOL.
+// Block addresses are synthetic (section << 24) | offset coordinates; runtime
+// addresses are computed from a per-module section base array written by the
+// module tracker when the game loads the module.
+struct ModuleBranchOverride
+{
+  enum Kind
+  {
+    Absolute,  // target is an absolute DOL address (relocation to module 0)
+    Local,     // target is a synthetic (section, offset) in this same module
+    External,  // target is another module — interpreter-fallback the instruction
+  };
+  Kind kind;
+  u32 target;
+};
+
+struct ModuleImmReloc
+{
+  u8 type;                 // R_PPC_ADDR16_LO / _HI / _HA (own-module targets only;
+                           // DOL targets are pre-patched into the instruction words)
+  std::string target_expr;  // e.g. "(GZLE01_m042_base[4]+0x1234u)"
+};
+
+struct ModuleMode
+{
+  std::string fn_prefix;   // e.g. "GZLE01_m042"
+  std::string base_array;  // e.g. "GZLE01_m042_base"
+  const std::set<u32>* dol_blocks;  // translatable DOL blocks (absolute addresses)
+  std::unordered_map<u32, ModuleImmReloc> imm_relocs;            // synth pc -> reloc
+  std::unordered_map<u32, ModuleBranchOverride> branch_overrides;  // synth pc -> target
+  // Sites that must single-step the relocated in-RAM instruction (cross-module
+  // immediates and exotic relocation types — a handful per game).
+  std::unordered_set<u32> force_fallback;
+  // Per-section sizes, used to reject branch targets computed from raw
+  // displacements in misdisassembled (dead-code) blocks.
+  std::vector<u32> section_sizes;
+};
+
 // Translates PPC basic blocks into C source code for AOT compilation.
 // Each PPC block becomes a C function operating on an AOTState struct
 // that is layout-compatible with Dolphin's PowerPCState.
@@ -22,6 +61,11 @@ class AOTCEmitter
 {
 public:
   AOTCEmitter(const PPCMemoryImage& memory, std::set<u32> known_blocks, std::string prefix);
+
+  // Switches the emitter to module mode (mode must outlive the emitter; pass
+  // nullptr to return to DOL mode). In module mode m_known_blocks holds the
+  // module's synthetic block addresses.
+  void SetModuleMode(const ModuleMode* mode, std::set<u32> module_blocks);
 
   // Translate a single block. Returns the C function body as a string.
   // If from_trace is true, the block was observed during trace collection (hot).
@@ -137,14 +181,29 @@ private:
   void EmitUpdateCR0(std::string& out, const char* result_expr);
   void EmitSetCarry(std::string& out, const char* expr);
   void EmitOECheck(std::string& out, const char* a, const char* b, const char* result);
-  void EmitBranchTo(std::string& out, u32 target, u32 current_pc);
+  void EmitBranchTo(std::string& out, u32 target, u32 current_pc, bool target_is_dol = false);
   void EmitIndirectDispatch(std::string& out);
+
+  // Module-mode formatting: PcStr/BlockFn/DispExpr produce byte-identical output
+  // to the original literals in DOL mode.
+  std::string PcStr(u32 pc) const;                    // "0x80003100u" or base-relative expr
+  std::string BlockFn(u32 addr, bool is_dol) const;   // block function symbol for addr
+  std::string Field16Expr() const;                    // patched 16-bit field of m_cur_imm
+  std::string DispExpr(s32 offset) const;             // D-form displacement or LO reloc expr
+  // Emits "pc = <site>; interpreter_single_step;" for instructions we cannot
+  // translate in module mode (external-module relocs, relocs on unexpected
+  // opcodes). RAM holds the relocated instruction, so this is always correct.
+  void EmitModuleFallback(std::string& out, u32 pc);
 
   const PPCMemoryImage& m_memory;
   std::set<u32> m_known_blocks;
   std::string m_prefix;
   u32 m_block_cycle_count = 0;
   std::map<std::string, u32> m_unhandled_opcodes;
+
+  const ModuleMode* m_module = nullptr;
+  const ModuleImmReloc* m_cur_imm = nullptr;          // reloc on the current instruction
+  const ModuleBranchOverride* m_cur_branch = nullptr;  // branch override on current inst
 };
 
 }  // namespace DolphinTool
