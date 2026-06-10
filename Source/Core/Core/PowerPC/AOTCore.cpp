@@ -412,9 +412,10 @@ void AOTCore::Run()
           RestoreSnapshot(pre);
           std::memcpy(ram, compare_ram_shadow, ram_size);  // pre-RAM restored
 
-          // Run interpreter for the same block
+          // Run interpreter for the same block, stopping where the AOT run exited
           m_ppc_state.downcount = static_cast<s32>(num_instr);
-          RunInterpreterBlock(interp, block_pc, num_instr, /*ignore_exceptions=*/true);
+          RunInterpreterBlock(interp, block_pc, num_instr, /*ignore_exceptions=*/true,
+                              /*stop_pc=*/aot_result.pc);
           CaptureSnapshot(interp_result);
           // Now live RAM = interpreter's result
 
@@ -758,7 +759,7 @@ bool AOTCore::BlockAccessesMMIO(const PPCSnapshot& pre, u32 block_addr, u32 num_
 }
 
 int AOTCore::RunInterpreterBlock(Interpreter& interp, u32 block_addr, u32 num_instructions,
-                                 bool ignore_exceptions)
+                                 bool ignore_exceptions, u32 stop_pc)
 {
   int total_cycles = 0;
   const u32 block_end = block_addr + num_instructions * 4;
@@ -766,10 +767,57 @@ int AOTCore::RunInterpreterBlock(Interpreter& interp, u32 block_addr, u32 num_in
   // Self-looping blocks (polling loops) must be handled by the caller.
   const u32 max_steps = num_instructions;
 
+  // When comparing against an AOT single-block run, stop where the AOT block
+  // actually exited. AOT blocks can legitimately end mid-range (unconditional
+  // b inside a traced block, mtmsr interrupt check), and running the
+  // interpreter further produces false-positive divergences.
+  //
+  // Disambiguation: if a backward branch inside the block targets stop_pc
+  // (e.g. the icbi loop in ICInvalidateRange), the AOT run exited by TAKING
+  // that backward edge after one loop pass — but the interpreter also passes
+  // through stop_pc by plain fallthrough before the loop. In that case only
+  // stop on arrival via a backward jump.
+  bool stop_on_backward_jump_only = false;
+  if (stop_pc != 0 && stop_pc >= block_addr && stop_pc < block_end)
+  {
+    u8* ram = m_system.GetMemory().GetRAM();
+    for (u32 addr = stop_pc; addr < block_end; addr += 4)
+    {
+      u32 opcode;
+      std::memcpy(&opcode, &ram[addr & 0x3FFFFFFF], sizeof(u32));
+      opcode = Common::swap32(opcode);
+      const u32 primary = (opcode >> 26) & 0x3F;
+      u32 target = 0;
+      if (primary == 18)  // b/ba/bl/bla
+      {
+        s32 li = (static_cast<s32>(opcode << 6) >> 6) & ~3;
+        target = (opcode & 2) ? static_cast<u32>(li) : addr + li;
+      }
+      else if (primary == 16)  // bcx
+      {
+        s32 bd = static_cast<s32>(static_cast<s16>(opcode & 0xFFFC));
+        target = (opcode & 2) ? static_cast<u32>(bd) : addr + bd;
+      }
+      else
+      {
+        continue;
+      }
+      if (target == stop_pc)
+      {
+        stop_on_backward_jump_only = true;
+        break;
+      }
+    }
+  }
+
   for (u32 i = 0; i < max_steps; i++)
   {
+    const u32 prev_pc = m_ppc_state.pc;
     total_cycles += interp.SingleStepInner();
 
+    if (stop_pc != 0 && m_ppc_state.pc == stop_pc &&
+        (!stop_on_backward_jump_only || m_ppc_state.pc <= prev_pc))
+      break;
     if (m_ppc_state.pc < block_addr || m_ppc_state.pc >= block_end)
       break;
     if (!ignore_exceptions && m_ppc_state.Exceptions != 0)
@@ -1098,12 +1146,13 @@ void AOTCore::RunDiff()
           m_system.GetCoreTiming().DoState(pw);
         }
 
-        // Run interpreter with MMIO capture
+        // Run interpreter with MMIO capture, stopping where the AOT run exited.
         // ignore_exceptions=true: AOT executes the full block atomically without
         // mid-block exception checks, so the interpreter must do the same for comparison.
         MMIOCaptureReset();
         g_mmio_capture_active = true;
-        RunInterpreterBlock(interp, block_pc, num_instr, /*ignore_exceptions=*/true);
+        RunInterpreterBlock(interp, block_pc, num_instr, /*ignore_exceptions=*/true,
+                            /*stop_pc=*/aot_result.pc);
         m_ppc_state.downcount -= static_cast<s32>(num_instr);
         g_mmio_capture_active = false;
         auto interp_mmio = g_mmio_capture_log;
@@ -1213,11 +1262,12 @@ void AOTCore::RunDiff()
       if (m_ram_shadow_aot)
         std::memcpy(m_ram_shadow_aot, memory.GetRAM(), ram_size);
 
-      // 4. Restore CPU + RAM, run interpreter
+      // 4. Restore CPU + RAM, run interpreter (stopping where the AOT run exited)
       RestoreSnapshot(pre_snap);
       std::memcpy(memory.GetRAM(), m_ram_shadow, ram_size);
 
-      RunInterpreterBlock(interp, block_pc, num_instr);
+      RunInterpreterBlock(interp, block_pc, num_instr, /*ignore_exceptions=*/false,
+                          /*stop_pc=*/aot_result.pc);
       m_ppc_state.downcount -= static_cast<s32>(num_instr);
 
       PPCSnapshot interp_result;

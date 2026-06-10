@@ -74,7 +74,7 @@ private:
   bool BlockReadsTimebase(u32 block_addr, u32 num_instructions);
   bool BlockAccessesMMIO(const PPCSnapshot& pre, u32 block_addr, u32 num_instructions);
   int RunInterpreterBlock(Interpreter& interp, u32 block_addr, u32 num_instructions,
-                          bool ignore_exceptions = false);
+                          bool ignore_exceptions = false, u32 stop_pc = 0);
   void RunInterpreterDispatch(Interpreter& interp);
 
   Core::System& m_system;
