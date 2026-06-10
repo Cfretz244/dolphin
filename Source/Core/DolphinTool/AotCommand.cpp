@@ -592,6 +592,11 @@ int AotCommand(const std::vector<std::string>& args)
     // Emit the fast dispatch function — O(1) array lookup
     file << fmt::format("__attribute__((noinline)) void {}_dispatch(AOTState* s) {{\n", prefix);
     file << "    if (aot_single_block_mode) return;\n";
+    // Downcount check: pc is always set before musttail-ing into dispatch, so a
+    // plain return resumes the Run loop. Without this, execution cycles whose only
+    // backward jumps are indirect (blr/bctr) never return to the Run loop and
+    // interrupts are never delivered.
+    file << "    if (s->downcount <= 0) return;\n";
     file << "    uint32_t pc = s->pc;\n";
     file << fmt::format("    uint32_t idx = (pc - {}_TABLE_BASE) >> 2;\n", prefix);
     file << fmt::format("    if (idx < {}_TABLE_SIZE) {{\n", prefix);

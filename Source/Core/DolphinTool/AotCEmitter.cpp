@@ -772,22 +772,15 @@ void AOTCEmitter::EmitOECheck(std::string& out, const char* a, const char* b, co
     "s->xer_so_ov=(s->xer_so_ov&0xfe)|ov; if(ov) s->xer_so_ov|=2; }}\n", a, b, result);
 }
 
-void AOTCEmitter::EmitBranchTo(std::string& out, u32 target, u32 current_pc)
+void AOTCEmitter::EmitBranchTo(std::string& out, u32 target, u32 /*current_pc*/)
 {
   if (m_known_blocks.contains(target))
   {
-    if (target <= current_pc)
-    {
-      // Backward edge — must check downcount to prevent infinite loops
-      out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
-      out += fmt::format("    if(s->downcount<=0||aot_single_block_mode){{ s->pc={:#010x}u; return; }}\n", target);
-    }
-    else
-    {
-      // Forward edge — just decrement (but respect single-block mode for compare harness)
-      out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
-      out += fmt::format("    if(aot_single_block_mode){{ s->pc={:#010x}u; return; }}\n", target);
-    }
+    // Check downcount on every static edge so the Run loop regains control for
+    // timing/interrupt delivery (matches pre-optimization behavior and upstream
+    // JIT practice; forward-edge batching can be revisited with A/B perf data).
+    out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
+    out += fmt::format("    if(s->downcount<=0||aot_single_block_mode){{ s->pc={:#010x}u; return; }}\n", target);
     out += fmt::format("    [[clang::musttail]] return {}_block_{:08x}(s);\n", m_prefix, target);
   }
   else
