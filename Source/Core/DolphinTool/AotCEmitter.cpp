@@ -574,7 +574,12 @@ bool AOTCEmitter::EmitTable31(std::string& out, UGeckoInstruction inst, u32 pc)
   case 86:  return true; // dcbf (no-op for AOT)
   case 54:  return true; // dcbst (no-op for AOT)
   case 470: return true; // dcbi (no-op for AOT)
-  case 982: out += fmt::format("    aot_icbi(s,s->gpr[{}]+s->gpr[{}]);\n", I(inst.RA), I(inst.RB)); return true;
+  case 982:
+    if (I(inst.RA))
+      out += fmt::format("    aot_icbi(s,s->gpr[{}]+s->gpr[{}]);\n", I(inst.RA), I(inst.RB));
+    else
+      out += fmt::format("    aot_icbi(s,s->gpr[{}]);\n", I(inst.RB));
+    return true;
   // Missing arithmetic
   case 200: EmitSubfzex(out, inst); return true;  // subfzex
   // MSR
@@ -582,9 +587,15 @@ bool AOTCEmitter::EmitTable31(std::string& out, UGeckoInstruction inst, u32 pc)
   case 146: EmitMtmsr(out, inst, pc); return true;
   // Timebase
   case 371: out += fmt::format("    s->gpr[{}]=aot_mftb(s,{});\n", I(inst.RD), I(inst.SPR)); return true;
-  // stfiwx
-  case 983: out += fmt::format("    aot_write_u32(s,(uint32_t)s->ps[{}].ps0,s->gpr[{}]+s->gpr[{}]);\n",
-                               I(inst.RS), I(inst.RA), I(inst.RB)); return true;
+  // stfiwx — like all X-form load/stores, RA=0 means literal zero, not r0
+  case 983:
+    if (I(inst.RA))
+      out += fmt::format("    aot_write_u32(s,(uint32_t)s->ps[{}].ps0,s->gpr[{}]+s->gpr[{}]);\n",
+                         I(inst.RS), I(inst.RA), I(inst.RB));
+    else
+      out += fmt::format("    aot_write_u32(s,(uint32_t)s->ps[{}].ps0,s->gpr[{}]);\n",
+                         I(inst.RS), I(inst.RB));
+    return true;
   default:  return false;
   }
 }
