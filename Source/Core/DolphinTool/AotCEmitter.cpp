@@ -86,7 +86,12 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
 {
   std::string out;
   m_block_cycle_count = 0;
-  const char* section = from_trace ? "__TEXT,__aot_hot" : "__TEXT,__aot_cold";
+  // regular,pure_instructions marks these as code sections — without it the
+  // linker won't synthesize branch islands, and once total __TEXT exceeds the
+  // ±128MB B/BL range (5+ games linked together) direct branches from AOT
+  // blocks back to <ID>_dispatch fail to fix up.
+  const char* section = from_trace ? "__TEXT,__aot_hot,regular,pure_instructions" :
+                                     "__TEXT,__aot_cold,regular,pure_instructions";
   out += fmt::format("__attribute__((noinline, section(\"{}\")))"
                      " void {}(AOTState* s) {{\n",
                      section, BlockFn(block_addr, false));

@@ -966,22 +966,25 @@ int AotCommand(const std::vector<std::string>& args)
     script << "BLOCK_CFLAGS=\"-Os -flto=thin -arch arm64 -mcpu=apple-a14 -moutline"
               " -fwrapv -fno-strict-aliasing\"\n";
     script << "DISPATCH_CFLAGS=\"-O2 -flto=thin -arch arm64 -mcpu=apple-a14"
-              " -fwrapv -fno-strict-aliasing\"\n\n";
-    script << "echo \"Compiling AOT blocks with LTO...\"\n";
-    script << "for f in ${PREFIX}_blocks_*.c; do\n";
-    script << "    clang -c $BLOCK_CFLAGS -I. \"$f\" -o \"${f%.c}.o\" &\n";
-    script << "done\n";
+              " -fwrapv -fno-strict-aliasing\"\n";
+    // Bounded parallelism: hundreds of block files with one clang each swamps
+    // the machine. xargs -P instead of `wait -n` — macOS ships bash 3.2.
+    script << "JOBS=\"${AOT_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}\"\n\n";
+    script << "echo \"Compiling AOT blocks with LTO (${JOBS} jobs)...\"\n";
+    script << "export BLOCK_CFLAGS\n";
+    script << "printf '%s\\0' ${PREFIX}_blocks_*.c | \\\n";
+    script << "    xargs -0 -n1 -P \"$JOBS\" sh -c"
+              " 'exec clang -c $BLOCK_CFLAGS -I. \"$1\" -o \"${1%.c}.o\"' sh\n";
     script << "clang -c $DISPATCH_CFLAGS -I. \"${PREFIX}_dispatch.c\""
-              " -o \"${PREFIX}_dispatch.o\" &\n";
+              " -o \"${PREFIX}_dispatch.o\"\n";
     script << "# Compile vertex loader AOT files if present\n";
     script << "if [[ -f \"${PREFIX}_vtx_loaders.c\" ]]; then\n";
     script << "    echo \"Compiling vertex loaders...\"\n";
     script << "    clang -c $DISPATCH_CFLAGS -I. \"${PREFIX}_vtx_loaders.c\""
-              " -o \"${PREFIX}_vtx_loaders.o\" &\n";
+              " -o \"${PREFIX}_vtx_loaders.o\"\n";
     script << "    clang -c $DISPATCH_CFLAGS -I. \"${PREFIX}_vtx_dispatch.c\""
-              " -o \"${PREFIX}_vtx_dispatch.o\" &\n";
-    script << "fi\n";
-    script << "wait\n\n";
+              " -o \"${PREFIX}_vtx_dispatch.o\"\n";
+    script << "fi\n\n";
     script << "echo \"Creating static library...\"\n";
     script << "ar rcs lib${PREFIX}_aot.a ${PREFIX}_*.o\n\n";
     script << "echo \"Done: lib${PREFIX}_aot.a\"\n";
