@@ -184,7 +184,20 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
   {
     u32 next_pc = block_addr + num_instructions * 4;
     out += fmt::format("    s->downcount -= {};\n", m_block_cycle_count);
-    out += fmt::format("    s->pc = {};\n", PcStr(next_pc));
+    if (m_known_blocks.contains(next_pc))
+    {
+      // Chain the fall-through edge like a taken static edge (same guard shape
+      // as EmitBranchTo). Un-chained fall-throughs were the dominant source of
+      // dispatch-table bounces: every not-taken conditional and split-block
+      // boundary unwound to the Run loop and re-entered <prefix>_dispatch.
+      out += fmt::format("    if(s->downcount<=0||s->exceptions AOT_EDGE_STOP){{ s->pc={}; return; }}\n",
+                         PcStr(next_pc));
+      out += fmt::format("    [[clang::musttail]] return {}(s);\n", BlockFn(next_pc, false));
+    }
+    else
+    {
+      out += fmt::format("    s->pc = {};\n", PcStr(next_pc));
+    }
   }
 
   out += "}\n";
@@ -1009,10 +1022,14 @@ void AOTCEmitter::EmitBranchTo(std::string& out, u32 target, u32 current_pc,
   if (known)
   {
     // Check downcount on every static edge so the Run loop regains control for
-    // timing/interrupt delivery (matches pre-optimization behavior and upstream
-    // JIT practice; forward-edge batching can be revisited with A/B perf data).
+    // timing/interrupt delivery (matches upstream JIT practice; forward-edge
+    // batching can be revisited with A/B perf data). The exceptions term keeps
+    // synchronous-exception servicing (slow-path DSI, gather-pipe interrupts) at
+    // per-edge latency now that chains span fall-throughs too; the JIT omits it
+    // on linked edges, so it is a removal candidate once chaining soaks clean.
     out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
-    out += fmt::format("    if(s->downcount<=0 AOT_EDGE_STOP){{ s->pc={}; return; }}\n", pc_expr);
+    out += fmt::format("    if(s->downcount<=0||s->exceptions AOT_EDGE_STOP){{ s->pc={}; return; }}\n",
+                       pc_expr);
     out += fmt::format("    [[clang::musttail]] return {}(s);\n", BlockFn(target, dol_target));
   }
   else

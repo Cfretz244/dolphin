@@ -957,7 +957,11 @@ int AotCommand(const std::vector<std::string>& args)
 
     // Emit the fast dispatch function — O(1) array lookup
     file << fmt::format("__attribute__((noinline)) void {}_dispatch(AOTState* s) {{\n", prefix);
+    // Single-block mode only exists in harness builds (macOS build.sh passes
+    // -DAOT_HARNESS=1); production/iOS skips the global load on every dispatch.
+    file << "#if AOT_HARNESS\n";
     file << "    if (aot_single_block_mode) return;\n";
+    file << "#endif\n";
     // Downcount check: pc is always set before musttail-ing into dispatch, so a
     // plain return resumes the Run loop. Without this, execution cycles whose only
     // backward jumps are indirect (blr/bctr) never return to the Run loop and
