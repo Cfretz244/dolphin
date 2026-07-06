@@ -245,7 +245,7 @@ std::unique_ptr<VertexLoaderBase> VertexLoaderBase::CreateVertexLoader(const TVt
   if (loader_type != VertexLoaderType::Software)
   {
     auto& registry = VertexLoaderAotRegistry::Instance();
-    if (registry.HasEntries())
+    if (registry.HasEntriesForGame(SConfig::GetInstance().GetGameID()))
     {
       VertexLoaderAotRegistry::Key key = {vtx_desc.low.Hex, vtx_desc.high.Hex, vtx_attr.g0.Hex,
                                           vtx_attr.g1.Hex, vtx_attr.g2.Hex};

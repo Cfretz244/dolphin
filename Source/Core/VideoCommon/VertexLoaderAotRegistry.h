@@ -38,6 +38,14 @@ public:
 
   bool HasEntries() const { return !m_games.empty(); }
 
+  // Whether THIS game registered any loaders. A multi-game binary links vtx AOT
+  // for some games and not others (e.g. Melee's is backed out), so per-game
+  // checks must use this, not HasEntries().
+  bool HasEntriesForGame(const std::string& game_id) const
+  {
+    return m_games.find(game_id) != m_games.end();
+  }
+
 private:
   struct KeyHash
   {
