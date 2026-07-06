@@ -71,6 +71,18 @@ std::string AOTCEmitter::DispExpr(s32 offset) const
 void AOTCEmitter::EmitModuleFallback(std::string& out, u32 pc)
 {
   out += fmt::format("    s->pc = {}; aot_interpreter_single_step(s);\n", PcStr(pc));
+  // The interpreted step may deliver an exception (which clears MSR.FP on entry) while
+  // the block continues inline — force the next FP instruction to re-check.
+  m_fpu_checked = false;
+}
+
+void AOTCEmitter::EmitFpuCheck(std::string& out, u32 pc)
+{
+  if (m_fpu_checked)
+    return;
+  out += fmt::format("    if(!aot_check_fpu(s,{})) {{ s->downcount-={}; return; }}\n",
+                     PcStr(pc), m_block_cycle_count);
+  m_fpu_checked = true;
 }
 
 // Opcodes whose 16-bit immediate field can legitimately carry an own-module
@@ -86,6 +98,7 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
 {
   std::string out;
   m_block_cycle_count = 0;
+  m_fpu_checked = false;
   // regular,pure_instructions marks these as code sections — without it the
   // linker won't synthesize branch islands, and once total __TEXT exceeds the
   // ±128MB B/BL range (5+ games linked together) direct branches from AOT
@@ -156,6 +169,8 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
       std::string opname = info ? info->opname : "unknown";
       m_unhandled_opcodes[opname]++;
       out += fmt::format("    s->pc = {}; aot_interpreter_single_step(s);\n", PcStr(pc));
+      // Interpreted step may deliver an exception clearing MSR.FP — re-check after.
+      m_fpu_checked = false;
     }
 
   }
@@ -226,8 +241,7 @@ bool AOTCEmitter::EmitInstruction(std::string& out, UGeckoInstruction inst, u32 
   case 56: case 57: case 60: case 61:  // psq_l, psq_lu, psq_st, psq_stu
   case 59: case 63: case 4:            // FP arith, PS arith
   {
-    out += fmt::format("    if(!aot_check_fpu(s,{})) {{ s->downcount-={}; return; }}\n",
-                       PcStr(pc), m_block_cycle_count);
+    EmitFpuCheck(out, pc);
     switch (I(inst.OPCD))
     {
     case 48: EmitLfs(out, inst, false, false); return true;
@@ -542,15 +556,17 @@ bool AOTCEmitter::EmitTable31(std::string& out, UGeckoInstruction inst, u32 pc)
   case 215: EmitStoreInt(out, inst, "aot_write_u8", false, true); return true;  // stbx
   case 247: EmitStoreInt(out, inst, "aot_write_u8", true, true); return true;   // stbux
   case 918: EmitStoreInt(out, inst, "aot_write_u16_br", false, true); return true; // sthbrx
-  // Indexed load/store FP
-  case 535: EmitLfs(out, inst, false, true); return true;   // lfsx
-  case 567: EmitLfs(out, inst, true, true); return true;    // lfsux
-  case 599: EmitLfd(out, inst, false, true); return true;   // lfdx
-  case 631: EmitLfd(out, inst, true, true); return true;    // lfdux
-  case 663: EmitStfs(out, inst, false, true); return true;  // stfsx
-  case 695: EmitStfs(out, inst, true, true); return true;   // stfsux
-  case 727: EmitStfd(out, inst, false, true); return true;  // stfdx
-  case 759: EmitStfd(out, inst, true, true); return true;   // stfdux
+  // Indexed load/store FP — these use FPRs, so the interpreter raises
+  // EXCEPTION_FPU_UNAVAILABLE for them when MSR.FP=0 (FL_USE_FPU); check like the
+  // D-form FP ops. (Pre-2026-07 these emitted no check at all.)
+  case 535: EmitFpuCheck(out, pc); EmitLfs(out, inst, false, true); return true;   // lfsx
+  case 567: EmitFpuCheck(out, pc); EmitLfs(out, inst, true, true); return true;    // lfsux
+  case 599: EmitFpuCheck(out, pc); EmitLfd(out, inst, false, true); return true;   // lfdx
+  case 631: EmitFpuCheck(out, pc); EmitLfd(out, inst, true, true); return true;    // lfdux
+  case 663: EmitFpuCheck(out, pc); EmitStfs(out, inst, false, true); return true;  // stfsx
+  case 695: EmitFpuCheck(out, pc); EmitStfs(out, inst, true, true); return true;   // stfsux
+  case 727: EmitFpuCheck(out, pc); EmitStfd(out, inst, false, true); return true;  // stfdx
+  case 759: EmitFpuCheck(out, pc); EmitStfd(out, inst, true, true); return true;   // stfdux
   // SPR
   case 339: EmitMfspr(out, inst); return true;
   case 467: EmitMtspr(out, inst); return true;
@@ -587,8 +603,10 @@ bool AOTCEmitter::EmitTable31(std::string& out, UGeckoInstruction inst, u32 pc)
   case 146: EmitMtmsr(out, inst, pc); return true;
   // Timebase
   case 371: out += fmt::format("    s->gpr[{}]=aot_mftb(s,{});\n", I(inst.RD), I(inst.SPR)); return true;
-  // stfiwx — like all X-form load/stores, RA=0 means literal zero, not r0
+  // stfiwx — like all X-form load/stores, RA=0 means literal zero, not r0.
+  // Uses an FPR → needs the MSR.FP check like the other FP load/stores.
   case 983:
+    EmitFpuCheck(out, pc);
     if (I(inst.RA))
       out += fmt::format("    aot_write_u32(s,(uint32_t)s->ps[{}].ps0,s->gpr[{}]+s->gpr[{}]);\n",
                          I(inst.RS), I(inst.RA), I(inst.RB));

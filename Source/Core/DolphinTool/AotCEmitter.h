@@ -178,6 +178,11 @@ private:
   void EmitBclrx(std::string& out, UGeckoInstruction inst, u32 pc);
 
   // Helpers emitted inline
+  // Emits the MSR.FP availability check once per block (first FP instruction) — MSR.FP
+  // is block-invariant, so later FP instructions in the same straight-line block are
+  // dominated by the first. Fallback emissions reset the flag (an interpreted step may
+  // deliver an exception that clears MSR.FP).
+  void EmitFpuCheck(std::string& out, u32 pc);
   void EmitUpdateCR0(std::string& out, const char* result_expr);
   void EmitSetCarry(std::string& out, const char* expr);
   void EmitOECheck(std::string& out, const char* a, const char* b, const char* result);
@@ -199,6 +204,7 @@ private:
   std::set<u32> m_known_blocks;
   std::string m_prefix;
   u32 m_block_cycle_count = 0;
+  bool m_fpu_checked = false;  // true once the current block emitted its MSR.FP check
   std::map<std::string, u32> m_unhandled_opcodes;
 
   const ModuleMode* m_module = nullptr;

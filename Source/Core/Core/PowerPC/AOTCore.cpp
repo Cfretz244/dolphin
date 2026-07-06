@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_set>
 
 #include <fmt/format.h>
 #include <sqlite3.h>
@@ -350,12 +351,25 @@ void AOTCore::Run()
   const u32 ram_size = memory.GetRamSizeReal();
   u8* compare_ram_shadow = nullptr;
   u8* compare_ram_aot = nullptr;
+  // Harness throttles: the full-RAM shadow compare moves ~3x RAM size per block, which
+  // reads as a hang over a gameplay soak. Defaults: compare each unique block once
+  // (first clean visit), registers on every comparison, full RAM every Nth comparison.
+  // AOT_COMPARE_EVERY_VISIT=1 restores the original compare-every-visit behavior and
+  // forces full RAM each time unless AOT_COMPARE_RAM_INTERVAL overrides it.
+  const bool compare_every_visit = std::getenv("AOT_COMPARE_EVERY_VISIT") != nullptr;
+  u64 compare_ram_interval = compare_every_visit ? 1 : 16;
+  if (const char* iv = std::getenv("AOT_COMPARE_RAM_INTERVAL"))
+    compare_ram_interval = std::max<u64>(1, std::strtoull(iv, nullptr, 10));
+  std::unordered_set<u64> compared_keys;
   if (compare_mode)
   {
     compare_ram_shadow = static_cast<u8*>(std::malloc(ram_size));
     compare_ram_aot = static_cast<u8*>(std::malloc(ram_size));
-    fmt::print(stderr, "AOT_COMPARE: Active, {} block sizes loaded, {}MB RAM shadow x2\n",
-               m_block_sizes.size(), ram_size / (1024 * 1024));
+    fmt::print(stderr,
+               "AOT_COMPARE: Active, {} block sizes loaded, {}MB RAM shadow x2, "
+               "{} visits, full-RAM every {} comparison(s)\n",
+               m_block_sizes.size(), ram_size / (1024 * 1024),
+               compare_every_visit ? "all" : "first", compare_ram_interval);
   }
 
   while (cpu.GetState() == CPU::State::Running)
@@ -395,6 +409,9 @@ void AOTCore::Run()
         AOTBlockFunc aot_fn = m_lookup_block ? m_lookup_block(m_ppc_state.pc) : nullptr;
         u32 block_pc = m_ppc_state.pc;
         u32 block_size = 0;
+        // Dedup key: DOL pc, or bit63-tagged module composite (module keys can otherwise
+        // collide with DOL pcs when mid is small).
+        u64 compare_key = block_pc;
         if (aot_fn)
         {
           auto it = m_block_sizes.find(block_pc);
@@ -413,11 +430,18 @@ void AOTCore::Run()
             {
               aot_fn = mod_fn;
               block_size = it->second;
+              compare_key = (u64(1) << 63) | (u64(mid) << 32) | (u64(sect) << 24) | off;
             }
           }
         }
 
-        if (aot_fn && block_size > 0)
+        if (aot_fn && block_size > 0 && !compare_every_visit &&
+            compared_keys.count(compare_key) != 0)
+        {
+          // Already compared clean on a previous visit — run at production speed.
+          active_dispatch(aot_state);
+        }
+        else if (aot_fn && block_size > 0)
         {
           u32 num_instr = block_size;
 
@@ -428,7 +452,9 @@ void AOTCore::Run()
           if (BlockAccessesMMIO(pre_check, block_pc, num_instr) ||
               BlockReadsTimebase(block_pc, num_instr))
           {
-            // Run normally through AOT, no comparison for MMIO/timebase blocks
+            // Run normally through AOT, no comparison for MMIO/timebase blocks.
+            // Deliberately NOT marked as compared: a later non-MMIO visit (different
+            // register values) should still get a real comparison.
             s32 saved_dc2 = m_ppc_state.downcount;
             m_ppc_state.downcount = static_cast<s32>(num_instr);
             aot_single_block_mode = 1;
@@ -441,11 +467,21 @@ void AOTCore::Run()
 
           compare_count++;
 
-          // Save pre-state (registers + RAM)
+          // Full-RAM comparison is ~3x RAM size of memory traffic; do it every Nth
+          // comparison. Register comparison happens on all. On register-only
+          // comparisons the interpreter re-runs against AOT-written RAM — identical
+          // to pre-state whenever the AOT block is correct, so no false positives;
+          // pure-RAM divergences on those visits are caught probabilistically by the
+          // sampled full-RAM passes.
+          const bool full_ram = (compare_count % compare_ram_interval) == 1 ||
+                                compare_ram_interval == 1;
+
+          // Save pre-state (registers, and RAM when sampling)
           PPCSnapshot pre, aot_result, interp_result;
           pre = pre_check;
           u8* ram = memory.GetRAM();
-          std::memcpy(compare_ram_shadow, ram, ram_size);  // pre-RAM saved
+          if (full_ram)
+            std::memcpy(compare_ram_shadow, ram, ram_size);  // pre-RAM saved
 
           // Run AOT single block
           s32 saved_dc = m_ppc_state.downcount;
@@ -455,10 +491,13 @@ void AOTCore::Run()
           aot_single_block_mode = 0;
           CaptureSnapshot(aot_result);
 
-          // Save AOT's RAM, then restore pre-state
-          std::memcpy(compare_ram_aot, ram, ram_size);  // AOT-RAM saved
+          if (full_ram)
+          {
+            // Save AOT's RAM, then restore pre-RAM for an independent interpreter run
+            std::memcpy(compare_ram_aot, ram, ram_size);  // AOT-RAM saved
+            std::memcpy(ram, compare_ram_shadow, ram_size);  // pre-RAM restored
+          }
           RestoreSnapshot(pre);
-          std::memcpy(ram, compare_ram_shadow, ram_size);  // pre-RAM restored
 
           // Run interpreter for the same block, stopping where the AOT run exited
           m_ppc_state.downcount = static_cast<s32>(num_instr);
@@ -472,14 +511,20 @@ void AOTCore::Run()
 
           // Compare RAM (AOT result vs interpreter result)
           bool ram_match = true;
-          for (u32 j = 0; j < ram_size; j++)
+          if (full_ram)
           {
-            if (compare_ram_aot[j] != ram[j])
+            for (u32 j = 0; j < ram_size; j++)
             {
-              ram_match = false;
-              break;
+              if (compare_ram_aot[j] != ram[j])
+              {
+                ram_match = false;
+                break;
+              }
             }
           }
+
+          if (regs_match && ram_match && !compare_every_visit)
+            compared_keys.insert(compare_key);
 
           if (!regs_match || !ram_match)
           {
@@ -508,9 +553,11 @@ void AOTCore::Run()
 
           m_ppc_state.downcount = saved_dc - static_cast<s32>(num_instr);
 
-          if (compare_count % 10000 == 0)
-            fmt::print(stderr, "AOT_COMPARE: {} blocks compared, 0 divergences, PC={:#010x}\n",
-                       compare_count, m_ppc_state.pc);
+          if (compare_count % 2000 == 0)
+            fmt::print(stderr,
+                       "AOT_COMPARE: {} comparisons ({} unique blocks), 0 divergences, "
+                       "PC={:#010x}\n",
+                       compare_count, compared_keys.size(), m_ppc_state.pc);
           }  // end else (non-MMIO comparison)
         }  // end if (aot_fn && block_sizes)
         else

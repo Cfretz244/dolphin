@@ -41,14 +41,28 @@ static PowerPC::PowerPCState& GetPPCState(AOTState* s)
   return *reinterpret_cast<PowerPC::PowerPCState*>(s);
 }
 
+// Cached singleton pointers, filled in aot_init_fast_mem() (called from AOTCore::Init()
+// before any block runs, same lifecycle as s_ram_ptr below). Core::System::GetInstance()
+// is a function-local static whose thread-safe guard costs an atomic load on EVERY call —
+// and every delegated FP/PS/psq op funnels through it. System is a never-destroyed
+// singleton, so the cached addresses are stable. Lazy fallback keeps pre-init calls
+// correct.
+static Core::System* s_system = nullptr;
+static Interpreter* s_interpreter = nullptr;
+static PowerPC::MMU* s_mmu = nullptr;
+
 static Core::System& GetSystem()
 {
-  return Core::System::GetInstance();
+  if (!s_system)
+    s_system = &Core::System::GetInstance();
+  return *s_system;
 }
 
 static PowerPC::MMU& GetMMU()
 {
-  return GetSystem().GetMMU();
+  if (!s_mmu)
+    s_mmu = &GetSystem().GetMMU();
+  return *s_mmu;
 }
 
 // Helper: construct a UGeckoInstruction with register fields for interpreter dispatch
@@ -109,8 +123,11 @@ extern "C"
 
 void aot_init_fast_mem()
 {
-  s_ram_ptr = GetSystem().GetMemory().GetRAM();
-  s_ram_size = GetSystem().GetMemory().GetRamSizeReal();
+  s_system = &Core::System::GetInstance();
+  s_interpreter = &s_system->GetInterpreter();
+  s_mmu = &s_system->GetMMU();
+  s_ram_ptr = s_system->GetMemory().GetRAM();
+  s_ram_size = s_system->GetMemory().GetRamSizeReal();
 }
 
 // ============================================================================
@@ -563,10 +580,12 @@ uint32_t aot_convert_to_single(uint64_t double_bits)
 // FP arithmetic — all delegate to interpreter methods
 // ============================================================================
 
-// Helper: get the interpreter instance
+// Helper: get the interpreter instance (cached — see s_interpreter above)
 static Interpreter& GetInterpreter()
 {
-  return GetSystem().GetInterpreter();
+  if (!s_interpreter)
+    s_interpreter = &GetSystem().GetInterpreter();
+  return *s_interpreter;
 }
 
 #define FP_IMPL_3(name, interp_method) \
