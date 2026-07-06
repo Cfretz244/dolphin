@@ -14,6 +14,7 @@
 #include "Common/Swap.h"
 #include "Core/HW/Memmap.h"
 #include "Core/PowerPC/AotRegistry.h"
+#include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
 extern "C" void aot_interpreter_single_step(AOTState* s);
@@ -233,6 +234,14 @@ bool LookupBlock(u32 pc, AOTBlockFunc* fn, u32* module_id, u32* section, u32* of
 extern "C" void aot_module_dispatch(AOTState* s)
 {
   using namespace AotModuleTracker;
+  // Downcount guard mirroring <ID>_dispatch's entry check. Today every caller
+  // sits behind that check already, but per-site indirect probes make this
+  // entry point reachable on its own — it must be self-sufficient as the bound
+  // on pure-indirect cycles. pc is always set before dispatch, so a plain
+  // return resumes the Run loop. (AOTState is layout-compatible with
+  // PowerPCState — static_asserted in AotRuntime.cpp.)
+  if (reinterpret_cast<const PowerPC::PowerPCState*>(s)->downcount <= 0)
+    return;
   if (s_dirty)
   {
     s_dirty = 0;

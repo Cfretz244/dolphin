@@ -593,12 +593,30 @@ int AotCommand(const std::vector<std::string>& args)
   for (const auto& b : cfg_blocks)
     groups[b.ppc_addr >> 16].push_back(&b);
 
+  // Dispatch-table extent — needed up front: the forward-decls header exposes
+  // the table to every block TU for per-site indirect (blr/bctr) dispatch.
+  u32 table_base = UINT32_MAX, table_max_addr = 0;
+  for (const auto& b : cfg_blocks)
+  {
+    if (b.is_translatable)
+    {
+      table_base = std::min(table_base, b.ppc_addr);
+      table_max_addr = std::max(table_max_addr, b.ppc_addr);
+    }
+  }
+  // Align base to 4-byte boundary
+  table_base &= ~3u;
+  const u32 table_entries = ((table_max_addr - table_base) >> 2) + 1;
+
   // Write forward declarations header
   {
     std::ofstream fwd(output_dir + "/" + prefix + "_forward_decls.h");
     fwd << "#ifndef " << prefix << "_FORWARD_DECLS_H\n";
     fwd << "#define " << prefix << "_FORWARD_DECLS_H\n";
     fwd << "#include \"aot_runtime.h\"\n\n";
+    fwd << fmt::format("#define {}_TABLE_BASE {:#010x}u\n", prefix, table_base);
+    fwd << fmt::format("#define {}_TABLE_SIZE {}u\n", prefix, table_entries);
+    fwd << fmt::format("extern void (*{}_fast_table[])(AOTState*);\n\n", prefix);
     for (const auto& b : cfg_blocks)
     {
       if (b.is_translatable)
@@ -898,23 +916,12 @@ int AotCommand(const std::vector<std::string>& args)
   }
 
   // 5. Write dispatch table — flat direct-mapped array for O(1) lookup
+  // (extent computed above, alongside the forward-decls header)
   {
-    // Find the address range of all translatable blocks
-    u32 min_addr = UINT32_MAX, max_addr = 0;
-    for (const auto& b : cfg_blocks)
-    {
-      if (b.is_translatable)
-      {
-        min_addr = std::min(min_addr, b.ppc_addr);
-        max_addr = std::max(max_addr, b.ppc_addr);
-      }
-    }
-    // Align base to 4-byte boundary
-    min_addr &= ~3u;
-    u32 table_entries = ((max_addr - min_addr) >> 2) + 1;
+    const u32 min_addr = table_base;
 
     fmt::println(std::cerr, "  Dispatch table: {:#010x}-{:#010x} ({} entries, {:.1f} MB)",
-                 min_addr, max_addr, table_entries,
+                 min_addr, table_max_addr, table_entries,
                  table_entries * sizeof(void*) / (1024.0 * 1024.0));
 
     std::string dispatch_file = fmt::format("{}/{}_dispatch.c", output_dir, prefix);
@@ -924,11 +931,10 @@ int AotCommand(const std::vector<std::string>& args)
 
     file << "typedef void (*AOTBlockFunc)(AOTState*);\n\n";
 
-    // Emit the flat lookup table
-    file << fmt::format("#define {}_TABLE_BASE {:#010x}u\n", prefix, min_addr);
-    file << fmt::format("#define {}_TABLE_SIZE {}u\n\n", prefix, table_entries);
-
-    file << fmt::format("static AOTBlockFunc {}_fast_table[{}] = {{\n", prefix, table_entries);
+    // Emit the flat lookup table. Non-static: block TUs probe it directly at
+    // blr/bctr sites (declared in the forward-decls header; TABLE_BASE/SIZE
+    // defines live there too). Read-only after link.
+    file << fmt::format("AOTBlockFunc {}_fast_table[{}] = {{\n", prefix, table_entries);
 
     // Build a set for quick lookup — all translatable blocks get dispatch entries
     std::map<u32, std::string> addr_to_sym;

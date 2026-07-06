@@ -1043,6 +1043,28 @@ void AOTCEmitter::EmitBranchTo(std::string& out, u32 target, u32 current_pc,
 
 void AOTCEmitter::EmitIndirectDispatch(std::string& out)
 {
+  // Per-site inline table probe (production only): every blr/bctr previously
+  // musttail'd into the ONE shared <prefix>_dispatch, so all indirect transfers
+  // shared a single indirect-branch predictor site. Probing the table at the
+  // site gives each its own BTB entry and skips the dispatcher hop.
+  //
+  // The downcount check is LOAD-BEARING: mirroring the dispatch-entry check, it
+  // is the sole bound on execution cycles whose only backward branches are
+  // indirect — without it such loops never return to the Run loop and
+  // interrupts are never delivered. pc is already set by the caller, so a plain
+  // return resumes the Run loop correctly.
+  //
+  // Harness builds keep the shared dispatch site: its entry honors
+  // aot_single_block_mode, which an inline musttail into the target would skip.
+  out += "#if !AOT_HARNESS\n";
+  out += "    if(s->downcount<=0){ return; }\n";
+  out += fmt::format("    {{ uint32_t _idx=(s->pc-{}_TABLE_BASE)>>2;\n", m_prefix);
+  out += fmt::format("    if(_idx<{}_TABLE_SIZE){{\n", m_prefix);
+  out += fmt::format("        void (*_fn)(AOTState*)={}_fast_table[_idx];\n", m_prefix);
+  out += "        if(_fn){ [[clang::musttail]] return _fn(s); }\n";
+  out += "    } }\n";
+  out += "#endif\n";
+  // Miss / out-of-table (REL module or untranslated) / harness path.
   out += fmt::format("    [[clang::musttail]] return {}_dispatch(s);\n", m_prefix);
 }
 
