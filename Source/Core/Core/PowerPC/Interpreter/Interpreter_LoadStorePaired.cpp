@@ -18,6 +18,9 @@
 #include "Core/System.h"
 
 // dequantize table
+// extern (not internal) linkage: AotRuntime.cpp's psq fast paths reference these
+// tables so their scaling stays bit-identical to the interpreter's.
+extern const float m_dequantizeTable[];
 const float m_dequantizeTable[] = {
     1.0 / (1ULL << 0),  1.0 / (1ULL << 1),  1.0 / (1ULL << 2),  1.0 / (1ULL << 3),
     1.0 / (1ULL << 4),  1.0 / (1ULL << 5),  1.0 / (1ULL << 6),  1.0 / (1ULL << 7),
@@ -38,6 +41,7 @@ const float m_dequantizeTable[] = {
 };
 
 // quantize table
+extern const float m_quantizeTable[];  // see m_dequantizeTable above
 const float m_quantizeTable[] = {
     (1ULL << 0),        (1ULL << 1),        (1ULL << 2),        (1ULL << 3),
     (1ULL << 4),        (1ULL << 5),        (1ULL << 6),        (1ULL << 7),

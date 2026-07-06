@@ -5,9 +5,14 @@
 // These wrap Dolphin's existing subsystems (MMU, Interpreter, CoreTiming).
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <tuple>
+#include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "Common/CommonTypes.h"
@@ -16,6 +21,7 @@
 #include "Core/HW/GPFifo.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/SystemTimers.h"
+#include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/Interpreter/ExceptionUtils.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
 #include "Core/PowerPC/AotModuleTracker.h"
@@ -99,6 +105,8 @@ static UGeckoInstruction MakeCRInst(int crfd, int fa, int fb)
 
 static u8* s_ram_ptr = nullptr;
 static u32 s_ram_size = 0;
+static u8* s_l1_ptr = nullptr;
+static u32 s_l1_size = 0;
 
 // Interpreter fallback tracking (enabled by AOT_TRACK_FALLBACKS=1)
 static bool s_track_fallbacks = false;
@@ -112,6 +120,24 @@ static inline bool IsRAMAddress(u32 addr)
   // with MSR.DR=1 the interpreter raises a DSI for them (BAT miss), so the fast
   // path must not silently satisfy them from RAM.
   return ((addr & ~0x40000000u) - 0x80000000u) < s_ram_size;
+}
+
+// Resolve an effective address to a host pointer for fast-path access: main RAM
+// (cached or uncached mirror) or the locked L1 cache at its conventional
+// 0xE0000000 mapping ("Locked L1 technically doesn't have a fixed address, but
+// games all use 0xE0000000" — MMU.cpp; the SDK's LCEnable sets up the identity
+// DBAT). Mirrors MMU::WriteToHardware's L1 branch, which is a plain memcpy into
+// the L1 buffer. Returns null for everything else (MMIO, EFB, gather pipe,
+// unmapped) → slow path.
+static inline u8* FastMemHostPtr(u32 addr)
+{
+  if (IsRAMAddress(addr))
+    return s_ram_ptr + (addr & 0x3FFFFFFFu);
+  // The +8 guard keeps the largest fast-path access (paired u32) inside the
+  // small L1 buffer; the final few bytes fall back to the checked slow path.
+  if (s_l1_ptr != nullptr && (addr >> 28) == 0xE && addr + 8 <= 0xE0000000u + s_l1_size)
+    return s_l1_ptr + (addr & 0x0FFFFFFFu);
+  return nullptr;
 }
 
 extern "C"
@@ -139,6 +165,8 @@ void aot_init_fast_mem()
   s_mmu = &s_system->GetMMU();
   s_ram_ptr = s_system->GetMemory().GetRAM();
   s_ram_size = s_system->GetMemory().GetRamSizeReal();
+  s_l1_ptr = s_system->GetMemory().GetL1Cache();
+  s_l1_size = s_system->GetMemory().GetL1CacheSize();
   aot_fast_mem.ram = s_ram_ptr;
   aot_fast_mem.size = s_ram_size;
 }
@@ -150,48 +178,100 @@ void aot_init_fast_mem()
 // so a pre-init call (aot_fast_mem.size == 0) degrades to correct-but-slow.
 // ============================================================================
 
+// The locked L1 cache is checked here rather than in the inlined header fast
+// path: LC traffic is bursty (video decode, LC-DMA staging) so one call's
+// overhead is fine, and it keeps the generated-code ABI unchanged.
 uint32_t aot_read_u8_slow(AOTState* s, uint32_t addr)
 {
+  if (const u8* p = FastMemHostPtr(addr))
+    return *p;
   return PowerPC::ReadFromJit<u8>(GetMMU(), addr);
 }
 
 uint32_t aot_read_u16_slow(AOTState* s, uint32_t addr)
 {
+  if (const u8* p = FastMemHostPtr(addr))
+  {
+    u16 v;
+    std::memcpy(&v, p, sizeof(v));
+    return Common::swap16(v);
+  }
   return PowerPC::ReadFromJit<u16>(GetMMU(), addr);
 }
 
 uint32_t aot_read_u32_slow(AOTState* s, uint32_t addr)
 {
+  if (const u8* p = FastMemHostPtr(addr))
+  {
+    u32 v;
+    std::memcpy(&v, p, sizeof(v));
+    return Common::swap32(v);
+  }
   return PowerPC::ReadFromJit<u32>(GetMMU(), addr);
 }
 
 uint64_t aot_read_u64_slow(AOTState* s, uint32_t addr)
 {
+  if (const u8* p = FastMemHostPtr(addr))
+  {
+    u64 v;
+    std::memcpy(&v, p, sizeof(v));
+    return Common::swap64(v);
+  }
   return PowerPC::ReadFromJit<u64>(GetMMU(), addr);
 }
 
 void aot_write_u8_slow(AOTState* s, uint32_t val, uint32_t addr)
 {
+  if (u8* p = FastMemHostPtr(addr))
+  {
+    *p = static_cast<u8>(val);
+    return;
+  }
   PowerPC::WriteFromJit<u8>(GetMMU(), static_cast<u8>(val), addr);
 }
 
 void aot_write_u16_slow(AOTState* s, uint32_t val, uint32_t addr)
 {
+  if (u8* p = FastMemHostPtr(addr))
+  {
+    const u16 v = Common::swap16(static_cast<u16>(val));
+    std::memcpy(p, &v, sizeof(v));
+    return;
+  }
   PowerPC::WriteFromJit<u16>(GetMMU(), static_cast<u16>(val), addr);
 }
 
 void aot_write_u16_br_slow(AOTState* s, uint32_t val, uint32_t addr)
 {
+  if (u8* p = FastMemHostPtr(addr))
+  {
+    const u16 v = static_cast<u16>(val);  // no swap — byte-reversed store
+    std::memcpy(p, &v, sizeof(v));
+    return;
+  }
   GetMMU().Write_U16_Swap(val, addr);
 }
 
 void aot_write_u32_slow(AOTState* s, uint32_t val, uint32_t addr)
 {
+  if (u8* p = FastMemHostPtr(addr))
+  {
+    const u32 v = Common::swap32(val);
+    std::memcpy(p, &v, sizeof(v));
+    return;
+  }
   PowerPC::WriteFromJit<u32>(GetMMU(), val, addr);
 }
 
 void aot_write_u64_slow(AOTState* s, uint64_t val, uint32_t addr)
 {
+  if (u8* p = FastMemHostPtr(addr))
+  {
+    const u64 v = Common::swap64(val);
+    std::memcpy(p, &v, sizeof(v));
+    return;
+  }
   PowerPC::WriteFromJit<u64>(GetMMU(), val, addr);
 }
 
@@ -642,25 +722,245 @@ void aot_mcrfs(AOTState* s, int crfd, int crfs)
 }
 
 // ============================================================================
-// Paired singles — delegate to interpreter
+// Paired singles
 // ============================================================================
 
-// PS arithmetic
-FP_IMPL_3(aot_ps_add, ps_add)
-FP_IMPL_3(aot_ps_sub, ps_sub)
-FP_IMPL_3C(aot_ps_mul, ps_mul)
+// PS arithmetic — transcribed from Interpreter_Paired.cpp, dropping only the
+// interpreter-method dispatch and UGeckoInstruction reconstruction. The Rc=1
+// (UpdateCR1) branch is omitted because these wrappers always passed Rc=0;
+// keep that in sync with the emitter. div/res/rsqrte stay delegated — they're
+// rare and their exception logic is more involved.
+void aot_ps_add(AOTState* s, int fd, int fa, int fb)
+{
+  auto& ppc_state = GetPPCState(s);
+  const auto& a = ppc_state.ps[fa];
+  const auto& b = ppc_state.ps[fb];
+
+  const float ps0 =
+      ForceSingle(ppc_state.fpscr, NI_add(ppc_state, a.PS0AsDouble(), b.PS0AsDouble()).value);
+  const float ps1 =
+      ForceSingle(ppc_state.fpscr, NI_add(ppc_state, a.PS1AsDouble(), b.PS1AsDouble()).value);
+
+  ppc_state.ps[fd].SetBoth(ps0, ps1);
+  ppc_state.UpdateFPRFSingle(ps0);
+}
+
+void aot_ps_sub(AOTState* s, int fd, int fa, int fb)
+{
+  auto& ppc_state = GetPPCState(s);
+  const auto& a = ppc_state.ps[fa];
+  const auto& b = ppc_state.ps[fb];
+
+  const float ps0 =
+      ForceSingle(ppc_state.fpscr, NI_sub(ppc_state, a.PS0AsDouble(), b.PS0AsDouble()).value);
+  const float ps1 =
+      ForceSingle(ppc_state.fpscr, NI_sub(ppc_state, a.PS1AsDouble(), b.PS1AsDouble()).value);
+
+  ppc_state.ps[fd].SetBoth(ps0, ps1);
+  ppc_state.UpdateFPRFSingle(ps0);
+}
+
+void aot_ps_mul(AOTState* s, int fd, int fa, int fc)
+{
+  auto& ppc_state = GetPPCState(s);
+  const auto& a = ppc_state.ps[fa];
+  const auto& c = ppc_state.ps[fc];
+
+  const double c0 = Force25Bit(c.PS0AsDouble());
+  const double c1 = Force25Bit(c.PS1AsDouble());
+
+  const float ps0 = ForceSingle(ppc_state.fpscr, NI_mul(ppc_state, a.PS0AsDouble(), c0).value);
+  const float ps1 = ForceSingle(ppc_state.fpscr, NI_mul(ppc_state, a.PS1AsDouble(), c1).value);
+
+  ppc_state.ps[fd].SetBoth(ps0, ps1);
+  ppc_state.UpdateFPRFSingle(ps0);
+}
+
 FP_IMPL_3(aot_ps_div, ps_div)
-FP_IMPL_4(aot_ps_madd, ps_madd)
-FP_IMPL_4(aot_ps_msub, ps_msub)
-FP_IMPL_4(aot_ps_nmadd, ps_nmadd)
-FP_IMPL_4(aot_ps_nmsub, ps_nmsub)
-FP_IMPL_4(aot_ps_sum0, ps_sum0)
-FP_IMPL_4(aot_ps_sum1, ps_sum1)
-FP_IMPL_3C(aot_ps_muls0, ps_muls0)
-FP_IMPL_3C(aot_ps_muls1, ps_muls1)
-FP_IMPL_4(aot_ps_madds0, ps_madds0)
-FP_IMPL_4(aot_ps_madds1, ps_madds1)
-FP_IMPL_4(aot_ps_sel, ps_sel)
+
+void aot_ps_madd(AOTState* s, int fd, int fa, int fc, int fb)
+{
+  auto& ppc_state = GetPPCState(s);
+  const auto& a = ppc_state.ps[fa];
+  const auto& b = ppc_state.ps[fb];
+  const auto& c = ppc_state.ps[fc];
+
+  const float ps0 = ForceSingle(
+      ppc_state.fpscr,
+      NI_madd<true>(ppc_state, a.PS0AsDouble(), c.PS0AsDouble(), b.PS0AsDouble()).value);
+  const float ps1 = ForceSingle(
+      ppc_state.fpscr,
+      NI_madd<true>(ppc_state, a.PS1AsDouble(), c.PS1AsDouble(), b.PS1AsDouble()).value);
+
+  ppc_state.ps[fd].SetBoth(ps0, ps1);
+  ppc_state.UpdateFPRFSingle(ps0);
+}
+
+void aot_ps_msub(AOTState* s, int fd, int fa, int fc, int fb)
+{
+  auto& ppc_state = GetPPCState(s);
+  const auto& a = ppc_state.ps[fa];
+  const auto& b = ppc_state.ps[fb];
+  const auto& c = ppc_state.ps[fc];
+
+  const float ps0 = ForceSingle(
+      ppc_state.fpscr,
+      NI_msub<true>(ppc_state, a.PS0AsDouble(), c.PS0AsDouble(), b.PS0AsDouble()).value);
+  const float ps1 = ForceSingle(
+      ppc_state.fpscr,
+      NI_msub<true>(ppc_state, a.PS1AsDouble(), c.PS1AsDouble(), b.PS1AsDouble()).value);
+
+  ppc_state.ps[fd].SetBoth(ps0, ps1);
+  ppc_state.UpdateFPRFSingle(ps0);
+}
+
+void aot_ps_nmadd(AOTState* s, int fd, int fa, int fc, int fb)
+{
+  auto& ppc_state = GetPPCState(s);
+  const auto& a = ppc_state.ps[fa];
+  const auto& b = ppc_state.ps[fb];
+  const auto& c = ppc_state.ps[fc];
+
+  const float tmp0 = ForceSingle(
+      ppc_state.fpscr,
+      NI_madd<true>(ppc_state, a.PS0AsDouble(), c.PS0AsDouble(), b.PS0AsDouble()).value);
+  const float tmp1 = ForceSingle(
+      ppc_state.fpscr,
+      NI_madd<true>(ppc_state, a.PS1AsDouble(), c.PS1AsDouble(), b.PS1AsDouble()).value);
+
+  const float ps0 = std::isnan(tmp0) ? tmp0 : -tmp0;
+  const float ps1 = std::isnan(tmp1) ? tmp1 : -tmp1;
+
+  ppc_state.ps[fd].SetBoth(ps0, ps1);
+  ppc_state.UpdateFPRFSingle(ps0);
+}
+
+void aot_ps_nmsub(AOTState* s, int fd, int fa, int fc, int fb)
+{
+  auto& ppc_state = GetPPCState(s);
+  const auto& a = ppc_state.ps[fa];
+  const auto& b = ppc_state.ps[fb];
+  const auto& c = ppc_state.ps[fc];
+
+  const float tmp0 = ForceSingle(
+      ppc_state.fpscr,
+      NI_msub<true>(ppc_state, a.PS0AsDouble(), c.PS0AsDouble(), b.PS0AsDouble()).value);
+  const float tmp1 = ForceSingle(
+      ppc_state.fpscr,
+      NI_msub<true>(ppc_state, a.PS1AsDouble(), c.PS1AsDouble(), b.PS1AsDouble()).value);
+
+  const float ps0 = std::isnan(tmp0) ? tmp0 : -tmp0;
+  const float ps1 = std::isnan(tmp1) ? tmp1 : -tmp1;
+
+  ppc_state.ps[fd].SetBoth(ps0, ps1);
+  ppc_state.UpdateFPRFSingle(ps0);
+}
+
+void aot_ps_sum0(AOTState* s, int fd, int fa, int fc, int fb)
+{
+  auto& ppc_state = GetPPCState(s);
+  const auto& a = ppc_state.ps[fa];
+  const auto& b = ppc_state.ps[fb];
+  const auto& c = ppc_state.ps[fc];
+
+  const float ps0 =
+      ForceSingle(ppc_state.fpscr, NI_add(ppc_state, a.PS0AsDouble(), b.PS1AsDouble()).value);
+  const float ps1 = ForceSingle(ppc_state.fpscr, c.PS1AsDouble());
+
+  ppc_state.ps[fd].SetBoth(ps0, ps1);
+  ppc_state.UpdateFPRFSingle(ps0);
+}
+
+void aot_ps_sum1(AOTState* s, int fd, int fa, int fc, int fb)
+{
+  auto& ppc_state = GetPPCState(s);
+  const auto& a = ppc_state.ps[fa];
+  const auto& b = ppc_state.ps[fb];
+  const auto& c = ppc_state.ps[fc];
+
+  const float ps0 = ForceSingle(ppc_state.fpscr, c.PS0AsDouble());
+  const float ps1 =
+      ForceSingle(ppc_state.fpscr, NI_add(ppc_state, a.PS0AsDouble(), b.PS1AsDouble()).value);
+
+  ppc_state.ps[fd].SetBoth(ps0, ps1);
+  ppc_state.UpdateFPRFSingle(ps1);
+}
+
+void aot_ps_muls0(AOTState* s, int fd, int fa, int fc)
+{
+  auto& ppc_state = GetPPCState(s);
+  const auto& a = ppc_state.ps[fa];
+  const auto& c = ppc_state.ps[fc];
+
+  const double c0 = Force25Bit(c.PS0AsDouble());
+  const float ps0 = ForceSingle(ppc_state.fpscr, NI_mul(ppc_state, a.PS0AsDouble(), c0).value);
+  const float ps1 = ForceSingle(ppc_state.fpscr, NI_mul(ppc_state, a.PS1AsDouble(), c0).value);
+
+  ppc_state.ps[fd].SetBoth(ps0, ps1);
+  ppc_state.UpdateFPRFSingle(ps0);
+}
+
+void aot_ps_muls1(AOTState* s, int fd, int fa, int fc)
+{
+  auto& ppc_state = GetPPCState(s);
+  const auto& a = ppc_state.ps[fa];
+  const auto& c = ppc_state.ps[fc];
+
+  const double c1 = Force25Bit(c.PS1AsDouble());
+  const float ps0 = ForceSingle(ppc_state.fpscr, NI_mul(ppc_state, a.PS0AsDouble(), c1).value);
+  const float ps1 = ForceSingle(ppc_state.fpscr, NI_mul(ppc_state, a.PS1AsDouble(), c1).value);
+
+  ppc_state.ps[fd].SetBoth(ps0, ps1);
+  ppc_state.UpdateFPRFSingle(ps0);
+}
+
+void aot_ps_madds0(AOTState* s, int fd, int fa, int fc, int fb)
+{
+  auto& ppc_state = GetPPCState(s);
+  const auto& a = ppc_state.ps[fa];
+  const auto& b = ppc_state.ps[fb];
+  const auto& c = ppc_state.ps[fc];
+
+  const float ps0 = ForceSingle(
+      ppc_state.fpscr,
+      NI_madd<true>(ppc_state, a.PS0AsDouble(), c.PS0AsDouble(), b.PS0AsDouble()).value);
+  const float ps1 = ForceSingle(
+      ppc_state.fpscr,
+      NI_madd<true>(ppc_state, a.PS1AsDouble(), c.PS0AsDouble(), b.PS1AsDouble()).value);
+
+  ppc_state.ps[fd].SetBoth(ps0, ps1);
+  ppc_state.UpdateFPRFSingle(ps0);
+}
+
+void aot_ps_madds1(AOTState* s, int fd, int fa, int fc, int fb)
+{
+  auto& ppc_state = GetPPCState(s);
+  const auto& a = ppc_state.ps[fa];
+  const auto& b = ppc_state.ps[fb];
+  const auto& c = ppc_state.ps[fc];
+
+  const float ps0 = ForceSingle(
+      ppc_state.fpscr,
+      NI_madd<true>(ppc_state, a.PS0AsDouble(), c.PS1AsDouble(), b.PS0AsDouble()).value);
+  const float ps1 = ForceSingle(
+      ppc_state.fpscr,
+      NI_madd<true>(ppc_state, a.PS1AsDouble(), c.PS1AsDouble(), b.PS1AsDouble()).value);
+
+  ppc_state.ps[fd].SetBoth(ps0, ps1);
+  ppc_state.UpdateFPRFSingle(ps0);
+}
+
+void aot_ps_sel(AOTState* s, int fd, int fa, int fc, int fb)
+{
+  auto& ppc_state = GetPPCState(s);
+  const auto& a = ppc_state.ps[fa];
+  const auto& b = ppc_state.ps[fb];
+  const auto& c = ppc_state.ps[fc];
+
+  ppc_state.ps[fd].SetBoth(a.PS0AsDouble() >= -0.0 ? c.PS0AsDouble() : b.PS0AsDouble(),
+                           a.PS1AsDouble() >= -0.0 ? c.PS1AsDouble() : b.PS1AsDouble());
+}
+
 FP_IMPL_2(aot_ps_res, ps_res)
 FP_IMPL_2(aot_ps_rsqrte, ps_rsqrte)
 
@@ -720,45 +1020,344 @@ FP_CMP(aot_ps_cmpo0, ps_cmpo0)
 FP_CMP(aot_ps_cmpu1, ps_cmpu1)
 FP_CMP(aot_ps_cmpo1, ps_cmpo1)
 
-// PS quantized load/store — pass raw instruction to interpreter
+}  // close extern "C" — the psq fast-path helpers below are C++ (templates)
+
+// ============================================================================
+// PS quantized load/store fast path
+//
+// Exact transcriptions of Helper_Dequantize / Helper_Quantize from
+// Interpreter_LoadStorePaired.cpp with the MMU access replaced by the direct
+// RAM path (same address rule as IsRAMAddress). The scale tables are the
+// interpreter's own (external linkage granted there), so scaling stays
+// bit-identical. The helpers return false to delegate to the interpreter:
+// non-RAM address (MMIO/EFB/locked cache — also anything that could DSI) or
+// an invalid GQR quantize type. The D-form wrappers additionally delegate when
+// HID2.LSQE=0 so the program exception comes from the one authoritative
+// implementation.
+// ============================================================================
+
+extern const float m_dequantizeTable[];  // defined in Interpreter_LoadStorePaired.cpp
+extern const float m_quantizeTable[];
+
+namespace
+{
+template <typename U>
+inline U FastRead(const u8* p)
+{
+  U v;
+  std::memcpy(&v, p, sizeof(U));
+  if constexpr (sizeof(U) == 2)
+    v = Common::swap16(v);
+  else if constexpr (sizeof(U) == 4)
+    v = Common::swap32(v);
+  else if constexpr (sizeof(U) == 8)
+    v = Common::swap64(v);
+  return v;
+}
+
+template <typename U>
+inline void FastWrite(U v, u8* p)
+{
+  if constexpr (sizeof(U) == 2)
+    v = Common::swap16(v);
+  else if constexpr (sizeof(U) == 4)
+    v = Common::swap32(v);
+  else if constexpr (sizeof(U) == 8)
+    v = Common::swap64(v);
+  std::memcpy(p, &v, sizeof(U));
+}
+
+// Pair access reads/writes one value of twice the element width, exactly like
+// the interpreter's ReadPair/WritePair (element 0 in the high half).
+template <typename U>
+inline std::pair<U, U> FastReadPair(const u8* p)
+{
+  if constexpr (sizeof(U) == 1)
+  {
+    const u16 val = FastRead<u16>(p);
+    return {U(val >> 8), U(val)};
+  }
+  else if constexpr (sizeof(U) == 2)
+  {
+    const u32 val = FastRead<u32>(p);
+    return {U(val >> 16), U(val)};
+  }
+  else
+  {
+    const u64 val = FastRead<u64>(p);
+    return {U(val >> 32), U(val)};
+  }
+}
+
+template <typename U>
+inline void FastWritePair(U val1, U val2, u8* p)
+{
+  if constexpr (sizeof(U) == 1)
+    FastWrite<u16>(u16((u16{val1} << 8) | u16{val2}), p);
+  else if constexpr (sizeof(U) == 2)
+    FastWrite<u32>((u32{val1} << 16) | u32{val2}, p);
+  else
+    FastWrite<u64>((u64{val1} << 32) | u64{val2}, p);
+}
+
+template <typename SType>
+SType FastScaleAndClamp(double ps, u32 st_scale)
+{
+  const float conv_ps = float(ps) * m_quantizeTable[st_scale];
+  constexpr float min = float(std::numeric_limits<SType>::min());
+  constexpr float max = float(std::numeric_limits<SType>::max());
+
+  return SType(std::clamp(conv_ps, min, max));
+}
+
+template <typename T>
+std::pair<double, double> FastLoadAndDequantize(const u8* p, u32 instW, u32 ld_scale)
+{
+  using U = std::make_unsigned_t<T>;
+
+  float ps0, ps1;
+  if (instW != 0)
+  {
+    const U value = FastRead<U>(p);
+    ps0 = float(T(value)) * m_dequantizeTable[ld_scale];
+    ps1 = 1.0f;
+  }
+  else
+  {
+    const auto [first, second] = FastReadPair<U>(p);
+    ps0 = float(T(first)) * m_dequantizeTable[ld_scale];
+    ps1 = float(T(second)) * m_dequantizeTable[ld_scale];
+  }
+  // ps0 and ps1 always contain finite and normal numbers, so casting to double is safe
+  return {static_cast<double>(ps0), static_cast<double>(ps1)};
+}
+
+template <typename T>
+void FastQuantizeAndStore(double ps0, double ps1, u8* p, u32 instW, u32 st_scale)
+{
+  using U = std::make_unsigned_t<T>;
+
+  const U conv_ps0 = U(FastScaleAndClamp<T>(ps0, st_scale));
+  if (instW != 0)
+  {
+    FastWrite<U>(conv_ps0, p);
+  }
+  else
+  {
+    const U conv_ps1 = U(FastScaleAndClamp<T>(ps1, st_scale));
+    FastWritePair<U>(conv_ps0, conv_ps1, p);
+  }
+}
+
+bool FastDequantize(PowerPC::PowerPCState& ppcs, u32 addr, u32 instI, u32 instRD, u32 instW)
+{
+  const u8* p = FastMemHostPtr(addr);
+  if (p == nullptr)
+    return false;
+
+  const UGQR gqr(ppcs.spr[SPR_GQR0 + instI]);
+  const u32 ld_scale = gqr.ld_scale;
+
+  double ps0 = 0.0;
+  double ps1 = 0.0;
+
+  switch (gqr.ld_type)
+  {
+  case QUANTIZE_FLOAT:
+    if (instW != 0)
+    {
+      const u32 value = FastRead<u32>(p);
+      ps0 = std::bit_cast<double>(ConvertToDouble(value));
+      ps1 = 1.0;
+    }
+    else
+    {
+      const auto [first, second] = FastReadPair<u32>(p);
+      ps0 = std::bit_cast<double>(ConvertToDouble(first));
+      ps1 = std::bit_cast<double>(ConvertToDouble(second));
+    }
+    break;
+
+  case QUANTIZE_U8:
+    std::tie(ps0, ps1) = FastLoadAndDequantize<u8>(p, instW, ld_scale);
+    break;
+
+  case QUANTIZE_U16:
+    std::tie(ps0, ps1) = FastLoadAndDequantize<u16>(p, instW, ld_scale);
+    break;
+
+  case QUANTIZE_S8:
+    std::tie(ps0, ps1) = FastLoadAndDequantize<s8>(p, instW, ld_scale);
+    break;
+
+  case QUANTIZE_S16:
+    std::tie(ps0, ps1) = FastLoadAndDequantize<s16>(p, instW, ld_scale);
+    break;
+
+  default:  // QUANTIZE_INVALID1-3: let the interpreter's ASSERT handle it
+    return false;
+  }
+
+  ppcs.ps[instRD].SetBoth(ps0, ps1);
+  return true;
+}
+
+bool FastQuantize(PowerPC::PowerPCState& ppcs, u32 addr, u32 instI, u32 instRS, u32 instW)
+{
+  u8* p = FastMemHostPtr(addr);
+  if (p == nullptr)
+    return false;
+
+  const UGQR gqr(ppcs.spr[SPR_GQR0 + instI]);
+  const u32 st_scale = gqr.st_scale;
+
+  const double ps0 = ppcs.ps[instRS].PS0AsDouble();
+  const double ps1 = ppcs.ps[instRS].PS1AsDouble();
+
+  switch (gqr.st_type)
+  {
+  case QUANTIZE_FLOAT:
+  {
+    const u32 conv_ps0 = ConvertToSingleFTZ(std::bit_cast<u64>(ps0));
+    if (instW != 0)
+    {
+      FastWrite<u32>(conv_ps0, p);
+    }
+    else
+    {
+      const u32 conv_ps1 = ConvertToSingleFTZ(std::bit_cast<u64>(ps1));
+      FastWritePair<u32>(conv_ps0, conv_ps1, p);
+    }
+    break;
+  }
+
+  case QUANTIZE_U8:
+    FastQuantizeAndStore<u8>(ps0, ps1, p, instW, st_scale);
+    break;
+
+  case QUANTIZE_U16:
+    FastQuantizeAndStore<u16>(ps0, ps1, p, instW, st_scale);
+    break;
+
+  case QUANTIZE_S8:
+    FastQuantizeAndStore<s8>(ps0, ps1, p, instW, st_scale);
+    break;
+
+  case QUANTIZE_S16:
+    FastQuantizeAndStore<s16>(ps0, ps1, p, instW, st_scale);
+    break;
+
+  default:  // QUANTIZE_INVALID1-3: let the interpreter's ASSERT handle it
+    return false;
+  }
+
+  return true;
+}
+}  // namespace
+
+extern "C"
+{
+
+// PS quantized load/store — RAM fast path above, interpreter for everything else.
+// The u-forms update RA only after a successful access; the fast path cannot
+// raise a DSI (RAM addresses only), so the update is unconditional there.
 void aot_psq_l(AOTState* s, int fd, int ra, uint32_t inst_hex)
 {
   UGeckoInstruction inst(inst_hex);
+  auto& ppc_state = GetPPCState(s);
+  if (HID2(ppc_state).LSQE != 0)
+  {
+    const u32 EA = inst.RA ? (ppc_state.gpr[inst.RA] + u32(inst.SIMM_12)) : u32(inst.SIMM_12);
+    if (FastDequantize(ppc_state, EA, inst.I, inst.RD, inst.W))
+      return;
+  }
   Interpreter::psq_l(GetInterpreter(), inst);
 }
 void aot_psq_lu(AOTState* s, int fd, int ra, uint32_t inst_hex)
 {
   UGeckoInstruction inst(inst_hex);
+  auto& ppc_state = GetPPCState(s);
+  if (HID2(ppc_state).LSQE != 0)
+  {
+    const u32 EA = ppc_state.gpr[inst.RA] + u32(inst.SIMM_12);
+    if (FastDequantize(ppc_state, EA, inst.I, inst.RD, inst.W))
+    {
+      ppc_state.gpr[inst.RA] = EA;
+      return;
+    }
+  }
   Interpreter::psq_lu(GetInterpreter(), inst);
 }
 void aot_psq_st(AOTState* s, int fs, int ra, uint32_t inst_hex)
 {
   UGeckoInstruction inst(inst_hex);
+  auto& ppc_state = GetPPCState(s);
+  if (HID2(ppc_state).LSQE != 0)
+  {
+    const u32 EA = inst.RA ? (ppc_state.gpr[inst.RA] + u32(inst.SIMM_12)) : u32(inst.SIMM_12);
+    if (FastQuantize(ppc_state, EA, inst.I, inst.RS, inst.W))
+      return;
+  }
   Interpreter::psq_st(GetInterpreter(), inst);
 }
 void aot_psq_stu(AOTState* s, int fs, int ra, uint32_t inst_hex)
 {
   UGeckoInstruction inst(inst_hex);
+  auto& ppc_state = GetPPCState(s);
+  if (HID2(ppc_state).LSQE != 0)
+  {
+    const u32 EA = ppc_state.gpr[inst.RA] + u32(inst.SIMM_12);
+    if (FastQuantize(ppc_state, EA, inst.I, inst.RS, inst.W))
+    {
+      ppc_state.gpr[inst.RA] = EA;
+      return;
+    }
+  }
   Interpreter::psq_stu(GetInterpreter(), inst);
 }
+// Indexed forms: no LSQE check, matching the interpreter.
 void aot_psq_lx(AOTState* s, uint32_t inst_hex)
 {
   UGeckoInstruction inst(inst_hex);
+  auto& ppc_state = GetPPCState(s);
+  const u32 EA =
+      inst.RA ? (ppc_state.gpr[inst.RA] + ppc_state.gpr[inst.RB]) : ppc_state.gpr[inst.RB];
+  if (FastDequantize(ppc_state, EA, inst.Ix, inst.RD, inst.Wx))
+    return;
   Interpreter::psq_lx(GetInterpreter(), inst);
 }
 void aot_psq_stx(AOTState* s, uint32_t inst_hex)
 {
   UGeckoInstruction inst(inst_hex);
+  auto& ppc_state = GetPPCState(s);
+  const u32 EA =
+      inst.RA ? (ppc_state.gpr[inst.RA] + ppc_state.gpr[inst.RB]) : ppc_state.gpr[inst.RB];
+  if (FastQuantize(ppc_state, EA, inst.Ix, inst.RS, inst.Wx))
+    return;
   Interpreter::psq_stx(GetInterpreter(), inst);
 }
 void aot_psq_lux(AOTState* s, uint32_t inst_hex)
 {
   UGeckoInstruction inst(inst_hex);
+  auto& ppc_state = GetPPCState(s);
+  const u32 EA = ppc_state.gpr[inst.RA] + ppc_state.gpr[inst.RB];
+  if (FastDequantize(ppc_state, EA, inst.Ix, inst.RD, inst.Wx))
+  {
+    ppc_state.gpr[inst.RA] = EA;
+    return;
+  }
   Interpreter::psq_lux(GetInterpreter(), inst);
 }
 void aot_psq_stux(AOTState* s, uint32_t inst_hex)
 {
   UGeckoInstruction inst(inst_hex);
+  auto& ppc_state = GetPPCState(s);
+  const u32 EA = ppc_state.gpr[inst.RA] + ppc_state.gpr[inst.RB];
+  if (FastQuantize(ppc_state, EA, inst.Ix, inst.RS, inst.Wx))
+  {
+    ppc_state.gpr[inst.RA] = EA;
+    return;
+  }
   Interpreter::psq_stux(GetInterpreter(), inst);
 }
 
@@ -766,8 +1365,26 @@ void aot_psq_stux(AOTState* s, uint32_t inst_hex)
 // Cache operations
 // ============================================================================
 
+// dcbz fast path: MMU::ClearDCacheLine is translate + 8 separate 4-byte
+// WriteToHardware calls — for RAM/L1 lines that is exactly a 32-byte zero fill
+// (a 32-aligned line can't cross out of either region, and neither region has
+// the cache-inhibited write quirk). Video decoders dcbz their output buffers
+// constantly, which is what made this loop hot.
+static inline bool FastDcbz(uint32_t addr)
+{
+  const u32 line = addr & ~31u;
+  if (u8* p = FastMemHostPtr(line))
+  {
+    std::memset(p, 0, 32);
+    return true;
+  }
+  return false;
+}
+
 void aot_dcbz(AOTState* s, uint32_t addr)
 {
+  if (FastDcbz(addr))
+    return;
   PowerPC::ClearDCacheLineFromJit(GetMMU(), addr & ~31u);
 }
 
@@ -784,6 +1401,8 @@ void aot_dcbz_l(AOTState* s, uint32_t addr)
     GenerateAlignmentException(ppc_state, addr);
     return;
   }
+  if (FastDcbz(addr))
+    return;
   PowerPC::ClearDCacheLineFromJit(GetMMU(), addr & ~31u);
 }
 
