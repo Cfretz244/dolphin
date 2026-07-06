@@ -372,10 +372,31 @@ void AOTCore::Run()
                compare_every_visit ? "all" : "first", compare_ram_interval);
   }
 
+  // Production fast path: no harness feature is engaged, so skip the per-dispatch
+  // instrumentation checks entirely. The instrumented do/while below stays intact
+  // for AOT_COMPARE / AOT_SWITCH_AT / AOT_LOG_PC / AOT_DUMP_FRAME runs.
+  const bool use_fast_loop =
+      !compare_mode && !pc_log && switch_at == 0 && dump_frame_path == nullptr;
+
   while (cpu.GetState() == CPU::State::Running)
   {
     m_ppc_state.npc = m_ppc_state.pc;
     core_timing.Advance();
+
+    if (use_fast_loop)
+    {
+      auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
+      do
+      {
+        active_dispatch(aot_state);
+        if (m_ppc_state.Exceptions != 0)
+        {
+          m_ppc_state.npc = m_ppc_state.pc;
+          power_pc.CheckExceptions();
+        }
+      } while (m_ppc_state.downcount > 0 && cpu.GetState() == CPU::State::Running);
+      continue;
+    }
 
     // Check if a VI frame just completed (for AOT_DUMP_FRAME)
     if (dump_waiting)
@@ -612,7 +633,11 @@ void AOTCore::SingleStep()
   auto& core_timing = m_system.GetCoreTiming();
   core_timing.Advance();
 
+  // Force the first block terminator's downcount guard to trip so a "step" is
+  // one block, not a whole chained slice (blocks chain across fall-through and
+  // taken edges until downcount exhausts).
   auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
+  m_ppc_state.downcount = 1;
   m_dispatch(aot_state);
 
   m_ppc_state.downcount = 0;
