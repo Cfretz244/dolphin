@@ -82,17 +82,105 @@ typedef struct AOTState {
     uint32_t spr[1024] __attribute__((aligned(8)));
 } AOTState;
 
+// ============================================================================
+// Memory access — RAM fast path inlined into blocks; slow path (MMIO, EFB,
+// locked cache, gather pipe) stays in the Dolphin runtime harness, which is the
+// single authoritative implementation (PowerPC::ReadFromJit/WriteFromJit).
+//
+// The range check must match the runtime's IsRAMAddress exactly: cached RAM
+// (0x80000000-) or the uncached mirror (0xC0000000-) only. Low-memory
+// (0x0xxxxxxx) and 0x4xxxxxxx accesses must take the slow path — with MSR.DR=1
+// the interpreter raises a DSI for them (BAT miss), so the fast path must not
+// silently satisfy them from RAM.
+// ============================================================================
+
+typedef struct { uint8_t* ram; uint32_t size; } AotFastMem;
+extern AotFastMem aot_fast_mem;  // filled by aot_init_fast_mem() before any block runs
+
+extern uint32_t aot_read_u8_slow(AOTState* s, uint32_t addr);
+extern uint32_t aot_read_u16_slow(AOTState* s, uint32_t addr);
+extern uint32_t aot_read_u32_slow(AOTState* s, uint32_t addr);
+extern uint64_t aot_read_u64_slow(AOTState* s, uint32_t addr);
+extern void aot_write_u8_slow(AOTState* s, uint32_t val, uint32_t addr);
+extern void aot_write_u16_slow(AOTState* s, uint32_t val, uint32_t addr);
+extern void aot_write_u16_br_slow(AOTState* s, uint32_t val, uint32_t addr);
+extern void aot_write_u32_slow(AOTState* s, uint32_t val, uint32_t addr);
+extern void aot_write_u64_slow(AOTState* s, uint64_t val, uint32_t addr);
+
+static inline int aot_is_ram(uint32_t addr) {
+    return ((addr & ~0x40000000u) - 0x80000000u) < aot_fast_mem.size;
+}
+
+static inline uint32_t aot_read_u8(AOTState* s, uint32_t addr) {
+    if (__builtin_expect(aot_is_ram(addr), 1))
+        return aot_fast_mem.ram[addr & 0x3FFFFFFFu];
+    return aot_read_u8_slow(s, addr);
+}
+static inline uint32_t aot_read_u16(AOTState* s, uint32_t addr) {
+    if (__builtin_expect(aot_is_ram(addr), 1)) {
+        uint16_t v; __builtin_memcpy(&v, aot_fast_mem.ram + (addr & 0x3FFFFFFFu), 2);
+        return __builtin_bswap16(v);
+    }
+    return aot_read_u16_slow(s, addr);
+}
+static inline uint32_t aot_read_u16_se(AOTState* s, uint32_t addr) {  // sign-extended half
+    return (uint32_t)(int32_t)(int16_t)aot_read_u16(s, addr);
+}
+static inline uint32_t aot_read_u32(AOTState* s, uint32_t addr) {
+    if (__builtin_expect(aot_is_ram(addr), 1)) {
+        uint32_t v; __builtin_memcpy(&v, aot_fast_mem.ram + (addr & 0x3FFFFFFFu), 4);
+        return __builtin_bswap32(v);
+    }
+    return aot_read_u32_slow(s, addr);
+}
+static inline uint64_t aot_read_u64(AOTState* s, uint32_t addr) {
+    if (__builtin_expect(aot_is_ram(addr), 1)) {
+        uint64_t v; __builtin_memcpy(&v, aot_fast_mem.ram + (addr & 0x3FFFFFFFu), 8);
+        return __builtin_bswap64(v);
+    }
+    return aot_read_u64_slow(s, addr);
+}
+static inline void aot_write_u8(AOTState* s, uint32_t val, uint32_t addr) {
+    if (__builtin_expect(aot_is_ram(addr), 1)) {
+        aot_fast_mem.ram[addr & 0x3FFFFFFFu] = (uint8_t)val;
+        return;
+    }
+    aot_write_u8_slow(s, val, addr);
+}
+static inline void aot_write_u16(AOTState* s, uint32_t val, uint32_t addr) {
+    if (__builtin_expect(aot_is_ram(addr), 1)) {
+        uint16_t v = __builtin_bswap16((uint16_t)val);
+        __builtin_memcpy(aot_fast_mem.ram + (addr & 0x3FFFFFFFu), &v, 2);
+        return;
+    }
+    aot_write_u16_slow(s, val, addr);
+}
+static inline void aot_write_u16_br(AOTState* s, uint32_t val, uint32_t addr) {
+    if (__builtin_expect(aot_is_ram(addr), 1)) {
+        uint16_t v = (uint16_t)val;  // no swap — byte-reversed store
+        __builtin_memcpy(aot_fast_mem.ram + (addr & 0x3FFFFFFFu), &v, 2);
+        return;
+    }
+    aot_write_u16_br_slow(s, val, addr);
+}
+static inline void aot_write_u32(AOTState* s, uint32_t val, uint32_t addr) {
+    if (__builtin_expect(aot_is_ram(addr), 1)) {
+        uint32_t v = __builtin_bswap32(val);
+        __builtin_memcpy(aot_fast_mem.ram + (addr & 0x3FFFFFFFu), &v, 4);
+        return;
+    }
+    aot_write_u32_slow(s, val, addr);
+}
+static inline void aot_write_u64(AOTState* s, uint64_t val, uint32_t addr) {
+    if (__builtin_expect(aot_is_ram(addr), 1)) {
+        uint64_t v = __builtin_bswap64(val);
+        __builtin_memcpy(aot_fast_mem.ram + (addr & 0x3FFFFFFFu), &v, 8);
+        return;
+    }
+    aot_write_u64_slow(s, val, addr);
+}
+
 // Runtime helpers (implemented in the Dolphin runtime harness)
-extern uint32_t aot_read_u8(AOTState* s, uint32_t addr);
-extern uint32_t aot_read_u16(AOTState* s, uint32_t addr);
-extern uint32_t aot_read_u16_se(AOTState* s, uint32_t addr);  // sign-extended half
-extern uint32_t aot_read_u32(AOTState* s, uint32_t addr);
-extern uint64_t aot_read_u64(AOTState* s, uint32_t addr);
-extern void aot_write_u8(AOTState* s, uint32_t val, uint32_t addr);
-extern void aot_write_u16(AOTState* s, uint32_t val, uint32_t addr);
-extern void aot_write_u16_br(AOTState* s, uint32_t val, uint32_t addr);
-extern void aot_write_u32(AOTState* s, uint32_t val, uint32_t addr);
-extern void aot_write_u64(AOTState* s, uint64_t val, uint32_t addr);
 extern void aot_interpreter_single_step(AOTState* s);
 extern void aot_sc(AOTState* s);
 extern int aot_check_fpu(AOTState* s, uint32_t pc);
@@ -249,6 +337,19 @@ static inline uint32_t aot_rotation_mask(int mb, int me) {
 
 // Single-block mode flag (set by compare/diff harness to stop block chaining)
 extern int aot_single_block_mode;
+
+// Block edges test AOT_EDGE_STOP alongside the downcount check. In production the
+// flag can never be set, so the load is compiled out; harness builds (macOS
+// build.sh passes -DAOT_HARNESS=1) keep it so AOT_COMPARE can stop chaining and
+// compare single blocks. The dispatch-entry check remains unconditional either way.
+#ifndef AOT_HARNESS
+#define AOT_HARNESS 0
+#endif
+#if AOT_HARNESS
+#define AOT_EDGE_STOP || aot_single_block_mode
+#else
+#define AOT_EDGE_STOP
+#endif
 
 #endif // AOT_RUNTIME_H
 )";
@@ -963,10 +1064,12 @@ int AotCommand(const std::vector<std::string>& args)
     script << fmt::format("PREFIX=\"{}\"\n", prefix);
     // -fwrapv: emitted code relies on wrapping signed multiply (mulli/mullw, e.g.
     // LCG RNGs); -fno-strict-aliasing: insurance for generated pointer casts.
+    // -DAOT_HARNESS=1: macOS libs keep the aot_single_block_mode test on block edges
+    // so the AOT_COMPARE harness can stop chaining; iOS libs compile it out.
     script << "BLOCK_CFLAGS=\"-Os -flto=thin -arch arm64 -mcpu=apple-a14 -moutline"
-              " -fwrapv -fno-strict-aliasing\"\n";
+              " -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1\"\n";
     script << "DISPATCH_CFLAGS=\"-O2 -flto=thin -arch arm64 -mcpu=apple-a14"
-              " -fwrapv -fno-strict-aliasing\"\n";
+              " -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1\"\n";
     // Bounded parallelism: hundreds of block files with one clang each swamps
     // the machine. xargs -P instead of `wait -n` — macOS ships bash 3.2.
     script << "JOBS=\"${AOT_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}\"\n\n";

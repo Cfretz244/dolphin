@@ -256,6 +256,18 @@ std::unique_ptr<VertexLoaderBase> VertexLoaderBase::CreateVertexLoader(const TVt
           return aot_loader;
         // In compare mode, fall through to create a native/software loader to compare against
       }
+      else
+      {
+        // Diagnostic: this game HAS AOT loaders but this format wasn't in the traces —
+        // it runs on the (much slower) fallback path. Loaders are cached per format, so
+        // this fires once per missed format; a burst of these in a heavy area explains
+        // stutter and means the traces should be extended through that content.
+        fprintf(stderr,
+                "VtxAOT: format miss for %s (%08x %08x %08x %08x %08x) — using fallback "
+                "loader\n",
+                SConfig::GetInstance().GetGameID().c_str(), key[0], key[1], key[2], key[3],
+                key[4]);
+      }
     }
   }
 

@@ -121,6 +121,17 @@ extern "C"
 // Init — cache RAM pointer and size to avoid repeated global lookups
 // ============================================================================
 
+// RAM fast-path descriptor exported to generated code: the header template inlines
+// the RAM fast path into every block (see AOT_RUNTIME_HEADER in AotCommand.cpp) and
+// calls the aot_*_slow functions below for everything else. Layout must match the
+// template's `typedef struct { uint8_t* ram; uint32_t size; } AotFastMem;`.
+struct AotFastMem
+{
+  u8* ram;
+  u32 size;
+};
+AotFastMem aot_fast_mem = {nullptr, 0};
+
 void aot_init_fast_mem()
 {
   s_system = &Core::System::GetInstance();
@@ -128,109 +139,59 @@ void aot_init_fast_mem()
   s_mmu = &s_system->GetMMU();
   s_ram_ptr = s_system->GetMemory().GetRAM();
   s_ram_size = s_system->GetMemory().GetRamSizeReal();
+  aot_fast_mem.ram = s_ram_ptr;
+  aot_fast_mem.size = s_ram_size;
 }
 
 // ============================================================================
-// Memory access — fast path for RAM, slow path for MMIO/other
+// Memory access — slow paths only (MMIO, EFB, locked cache, gather pipe).
+// The RAM fast path is inlined into generated code by the header template; these
+// delegate to Dolphin's general memory path, which also handles RAM correctly,
+// so a pre-init call (aot_fast_mem.size == 0) degrades to correct-but-slow.
 // ============================================================================
 
-uint32_t aot_read_u8(AOTState* s, uint32_t addr)
+uint32_t aot_read_u8_slow(AOTState* s, uint32_t addr)
 {
-  if (__builtin_expect(IsRAMAddress(addr), 1))
-    return s_ram_ptr[addr & 0x3FFFFFFF];
   return PowerPC::ReadFromJit<u8>(GetMMU(), addr);
 }
 
-uint32_t aot_read_u16(AOTState* s, uint32_t addr)
+uint32_t aot_read_u16_slow(AOTState* s, uint32_t addr)
 {
-  if (__builtin_expect(IsRAMAddress(addr), 1))
-  {
-    u16 val;
-    std::memcpy(&val, &s_ram_ptr[addr & 0x3FFFFFFF], sizeof(u16));
-    return Common::swap16(val);
-  }
   return PowerPC::ReadFromJit<u16>(GetMMU(), addr);
 }
 
-uint32_t aot_read_u16_se(AOTState* s, uint32_t addr)
+uint32_t aot_read_u32_slow(AOTState* s, uint32_t addr)
 {
-  return static_cast<uint32_t>(static_cast<int32_t>(
-      static_cast<int16_t>(aot_read_u16(s, addr))));
-}
-
-uint32_t aot_read_u32(AOTState* s, uint32_t addr)
-{
-  if (__builtin_expect(IsRAMAddress(addr), 1))
-  {
-    u32 val;
-    std::memcpy(&val, &s_ram_ptr[addr & 0x3FFFFFFF], sizeof(u32));
-    return Common::swap32(val);
-  }
   return PowerPC::ReadFromJit<u32>(GetMMU(), addr);
 }
 
-uint64_t aot_read_u64(AOTState* s, uint32_t addr)
+uint64_t aot_read_u64_slow(AOTState* s, uint32_t addr)
 {
-  if (__builtin_expect(IsRAMAddress(addr), 1))
-  {
-    u64 val;
-    std::memcpy(&val, &s_ram_ptr[addr & 0x3FFFFFFF], sizeof(u64));
-    return Common::swap64(val);
-  }
   return PowerPC::ReadFromJit<u64>(GetMMU(), addr);
 }
 
-void aot_write_u8(AOTState* s, uint32_t val, uint32_t addr)
+void aot_write_u8_slow(AOTState* s, uint32_t val, uint32_t addr)
 {
-  if (__builtin_expect(IsRAMAddress(addr), 1))
-  {
-    s_ram_ptr[addr & 0x3FFFFFFF] = static_cast<u8>(val);
-    return;
-  }
   PowerPC::WriteFromJit<u8>(GetMMU(), static_cast<u8>(val), addr);
 }
 
-void aot_write_u16(AOTState* s, uint32_t val, uint32_t addr)
+void aot_write_u16_slow(AOTState* s, uint32_t val, uint32_t addr)
 {
-  if (__builtin_expect(IsRAMAddress(addr), 1))
-  {
-    u16 swapped = Common::swap16(static_cast<u16>(val));
-    std::memcpy(&s_ram_ptr[addr & 0x3FFFFFFF], &swapped, sizeof(u16));
-    return;
-  }
   PowerPC::WriteFromJit<u16>(GetMMU(), static_cast<u16>(val), addr);
 }
 
-void aot_write_u16_br(AOTState* s, uint32_t val, uint32_t addr)
+void aot_write_u16_br_slow(AOTState* s, uint32_t val, uint32_t addr)
 {
-  if (__builtin_expect(IsRAMAddress(addr), 1))
-  {
-    u16 raw = static_cast<u16>(val);  // no swap — byte-reversed store
-    std::memcpy(&s_ram_ptr[addr & 0x3FFFFFFF], &raw, sizeof(u16));
-    return;
-  }
   GetMMU().Write_U16_Swap(val, addr);
 }
 
-void aot_write_u32(AOTState* s, uint32_t val, uint32_t addr)
+void aot_write_u32_slow(AOTState* s, uint32_t val, uint32_t addr)
 {
-  if (__builtin_expect(IsRAMAddress(addr), 1))
-  {
-    u32 swapped = Common::swap32(val);
-    std::memcpy(&s_ram_ptr[addr & 0x3FFFFFFF], &swapped, sizeof(u32));
-    return;
-  }
   PowerPC::WriteFromJit<u32>(GetMMU(), val, addr);
 }
 
-void aot_write_u64(AOTState* s, uint64_t val, uint32_t addr)
+void aot_write_u64_slow(AOTState* s, uint64_t val, uint32_t addr)
 {
-  if (__builtin_expect(IsRAMAddress(addr), 1))
-  {
-    u64 swapped = Common::swap64(val);
-    std::memcpy(&s_ram_ptr[addr & 0x3FFFFFFF], &swapped, sizeof(u64));
-    return;
-  }
   PowerPC::WriteFromJit<u64>(GetMMU(), val, addr);
 }
 

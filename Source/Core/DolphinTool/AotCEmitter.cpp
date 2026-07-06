@@ -1012,7 +1012,7 @@ void AOTCEmitter::EmitBranchTo(std::string& out, u32 target, u32 current_pc,
     // timing/interrupt delivery (matches pre-optimization behavior and upstream
     // JIT practice; forward-edge batching can be revisited with A/B perf data).
     out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
-    out += fmt::format("    if(s->downcount<=0||aot_single_block_mode){{ s->pc={}; return; }}\n", pc_expr);
+    out += fmt::format("    if(s->downcount<=0 AOT_EDGE_STOP){{ s->pc={}; return; }}\n", pc_expr);
     out += fmt::format("    [[clang::musttail]] return {}(s);\n", BlockFn(target, dol_target));
   }
   else
