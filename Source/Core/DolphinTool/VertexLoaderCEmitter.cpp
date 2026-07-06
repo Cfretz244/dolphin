@@ -3,6 +3,8 @@
 
 #include "DolphinTool/VertexLoaderCEmitter.h"
 
+#include <cstdlib>
+
 #include <fmt/format.h>
 
 namespace DolphinTool
@@ -147,7 +149,9 @@ void VertexLoaderCEmitter::ParseConfig()
   m_tex_frac[3] = (g1 >> 22) & 0x1F;
   m_tex_elements[4] = (g1 >> 27) & 1;
   m_tex_format[4] = (g1 >> 28) & 7;
-  m_tex_frac[4] = ((g1 >> 31) & 1) | (((g2 >> 0) & 0xF) << 1);
+  // Tex4Frac lives entirely in g2 bits 0-4 (CPMemory.h UVAT_group2 BitField<0,5>);
+  // g1 bit 31 is VCacheEnhance (always 1), NOT part of the frac field.
+  m_tex_frac[4] = (g2 >> 0) & 0x1F;
 
   m_tex_elements[5] = (g2 >> 5) & 1;
   m_tex_format[5] = (g2 >> 6) & 7;
@@ -384,6 +388,10 @@ std::string VertexLoaderCEmitter::GenerateLoaderFunction(const std::string& func
                         "adata", 0, cur_dst,
                         "zf->position_cache[remaining]", "remaining < 3 && !vertex_skip");
       out += "    }\n";
+      // Keep the compile-time offset in sync with the runtime src_ofs: the index
+      // read consumed 1-2 bytes of the vertex stream, and any later DIRECT
+      // attribute bakes its offset from cur_src.
+      cur_src += (m_pos_vcf == VCF_INDEX8) ? 1 : 2;
     }
     else
     {
@@ -455,6 +463,10 @@ std::string VertexLoaderCEmitter::GenerateLoaderFunction(const std::string& func
         emit_normal_group(2, load_bytes * 2, "binormal_cache");
       }
       out += "    }\n";
+      // Sync cur_src past the index bytes: one index read normally, three for
+      // NTB with NormalIndex3 (matching the EmitIndexRead calls above).
+      int num_index_reads = (m_nrm_elements == 1 && m_normal_index3) ? 3 : 1;
+      cur_src += ((m_nrm_vcf == VCF_INDEX8) ? 1 : 2) * num_index_reads;
     }
     else
     {
@@ -536,6 +548,7 @@ std::string VertexLoaderCEmitter::GenerateLoaderFunction(const std::string& func
         EmitIndexRead(out, m_col_vcf[i], color_array, false, "src_ofs");
         emit_color("adata", 0);
         out += "    }\n";
+        cur_src += (m_col_vcf[i] == VCF_INDEX8) ? 1 : 2;  // sync past index bytes
       }
       else
       {
@@ -578,6 +591,7 @@ std::string VertexLoaderCEmitter::GenerateLoaderFunction(const std::string& func
           out += fmt::format("    write_float(dst + {}, 0.0f);\n", cur_dst + tc_elements * 4);
         }
         out += "    }\n";
+        cur_src += (m_tex_vcf[i] == VCF_INDEX8) ? 1 : 2;  // sync past index bytes
       }
       else
       {
@@ -624,6 +638,18 @@ std::string VertexLoaderCEmitter::GenerateLoaderFunction(const std::string& func
   }
 
   m_dst_ofs = cur_dst;
+
+  // Generation-time invariant: the compile-time source cursor must land exactly on
+  // the vertex size ComputeLayout derived independently — any drift means a direct
+  // attribute somewhere baked a stale offset (the pre-2026-07 indexed-attribute bug).
+  if (cur_src != m_src_ofs)
+  {
+    fmt::print(stderr,
+               "FATAL: VertexLoaderCEmitter offset drift in {}: cur_src={} != vertex "
+               "size {} — generated loader would read misaligned vertex data\n",
+               func_name, cur_src, m_src_ofs);
+    std::abort();
+  }
 
   // ---- Advance pointers ----
   out += fmt::format("    src += {};\n", m_src_ofs);
