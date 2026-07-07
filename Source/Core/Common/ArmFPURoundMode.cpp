@@ -48,8 +48,17 @@ void SetSIMDMode(RoundMode rounding_mode, bool non_ieee_mode)
   // On CPUs with FEAT_AFP support, setting AH = 1, FZ = 1, FIZ = 0 emulates the GC/Wii CPU's
   // "non-IEEE mode". Unfortunately, FEAT_AFP didn't exist until 2020, so we can't count on setting
   // AH actually doing anything. But flushing both inputs and outputs seems to cause less problems
-  // than flushing nothing, so let's just set FZ and AH and roll with whatever behavior we get.
-  const u32 flush_to_zero_bits = (non_ieee_mode ? FZ | AH : 0);
+  // than flushing nothing, so let's just set FZ and roll with whatever behavior we get.
+  //
+  // AOT FORK: never set AH. FPCR.AH changes the semantics of scalar FNEG/FABS on NaNs, which
+  // breaks ordinary compiler-generated host code that runs on this thread under the AOT core:
+  // clang materializes 64-bit constants with NaN bit patterns via `movi + fneg` (e.g. the
+  // 0x7FFFFFFF00000000 divisor pair in Wind Waker's TRandom_enough_::get()), and under AH=1 the
+  // fneg silently no-ops on the NaN pattern. That corrupted the RNG modulus, poisoning its state
+  // table and spraying out-of-bounds writes over g_mDoCPd_gamePad (the July 2026 WW input
+  // soft-lock). Without AH we get the same input+output flushing every pre-FEAT_AFP CPU gets —
+  // the explicitly supported fallback path above.
+  const u32 flush_to_zero_bits = (non_ieee_mode ? FZ : 0);
   static bool afp_warning_shown = false;
   if (!afp_warning_shown && !cpu_info.bAFP && non_ieee_mode)
   {
