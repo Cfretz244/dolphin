@@ -302,6 +302,21 @@ void AOTCore::Run()
     fmt::print(stderr, "AOT_LOAD_STATE: Loading {}...\n", load_state_path);
     State::LoadAs(m_system, std::string(load_state_path));
     fmt::print(stderr, "AOT_LOAD_STATE: Loaded, PC={:#010x}\n", m_ppc_state.pc);
+
+    // AOT_DUMP_ON_LOAD=<file> dumps RAM immediately after the state load, without
+    // waiting for a VI frame — usable even when the loaded state's video is wedged
+    // (AOT_DUMP_FRAME's XFB-change trigger never fires on such states).
+    if (const char* dump_on_load = std::getenv("AOT_DUMP_ON_LOAD"))
+    {
+      auto& mem = m_system.GetMemory();
+      if (FILE* df = std::fopen(dump_on_load, "wb"))
+      {
+        std::fwrite(mem.GetRAM(), 1, mem.GetRamSizeReal(), df);
+        std::fclose(df);
+        fmt::print(stderr, "AOT_DUMP_ON_LOAD: Dumped {} bytes to {}\n", mem.GetRamSizeReal(),
+                   dump_on_load);
+      }
+    }
   }
 
   // AOT_SWITCH_AT=N runs interpreter for first N dispatches, then switches to AOT.
