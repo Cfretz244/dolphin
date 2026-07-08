@@ -7,6 +7,8 @@
 
 #pragma once
 
+#ifdef DOLPHIN_AOT_HARNESS
+
 #include <cstdint>
 #include <vector>
 
@@ -31,3 +33,5 @@ inline void MMIOCaptureRecord(uint32_t addr, uint32_t value, uint32_t size)
   if (g_mmio_capture_active)
     g_mmio_capture_log.push_back({addr, value, size});
 }
+
+#endif  // DOLPHIN_AOT_HARNESS

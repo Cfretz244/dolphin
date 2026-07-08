@@ -3,7 +3,7 @@
 
 // dolphin-tool diff — Block-level comparison of AOT-translated code vs. interpreter.
 // Boots the emulator headlessly with AOT core (CPUCore=6) and diff mode enabled.
-// AOTCore::Run() detects the diff config and runs the comparison loop.
+// AotHarness (via AOTCore::Run) detects the diff config and runs the comparison loop.
 
 #include "DolphinTool/DiffCommand.h"
 
@@ -28,7 +28,7 @@
 #include "Core/BootManager.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
-#include "Core/PowerPC/AOT/AOTCore.h"
+#include "Core/PowerPC/AOT/AotHarness.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
@@ -36,13 +36,15 @@
 
 namespace DolphinTool
 {
+#ifdef DOLPHIN_AOT_HARNESS
+
 
 static std::atomic<bool> s_diff_shutdown_requested{false};
 
 static void DiffSignalHandler(int)
 {
   s_diff_shutdown_requested.store(true);
-  AOTCore::s_shutdown_requested.store(true);
+  AotHarness::RequestShutdown();
 }
 
 int DiffCommand(const std::vector<std::string>& args)
@@ -188,7 +190,7 @@ int DiffCommand(const std::vector<std::string>& args)
   }
 
   // Main loop — dispatch host jobs until emulation stops.
-  // AOTCore::RunDiff() will call cpu.Break() when comparison is done.
+  // AotHarness::RunDiff() will call cpu.Break() when comparison is done.
   while (Core::IsRunningOrStarting(system))
   {
     Core::HostDispatchJobs(system);
@@ -207,5 +209,16 @@ int DiffCommand(const std::vector<std::string>& args)
   fmt::println(std::cerr, "AOT Diff: Done.");
   return EXIT_SUCCESS;
 }
+
+#else  // !DOLPHIN_AOT_HARNESS
+
+int DiffCommand(const std::vector<std::string>&)
+{
+  std::cerr << "dolphin-tool diff requires a build with the AOT harness "
+               "(configure with AOT libraries on a desktop platform).\n";
+  return EXIT_FAILURE;
+}
+
+#endif  // DOLPHIN_AOT_HARNESS
 
 }  // namespace DolphinTool

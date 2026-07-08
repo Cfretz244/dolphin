@@ -96,6 +96,7 @@ void RescanModules()
     const u32 num_sections = rd32(cur + 0x0C);
     const u32 section_info = rd32(cur + 0x10);
 
+#ifdef DOLPHIN_AOT_HARNESS
     // Bisection aids: AOT_NO_MODULES=1 disables all table activation;
     // AOT_ONLY_MODULE=<id> activates a single module's tables.
     static const bool no_modules = std::getenv("AOT_NO_MODULES") != nullptr;
@@ -103,6 +104,9 @@ void RescanModules()
     static const u32 only_id = only_env ? static_cast<u32>(std::strtoul(only_env, nullptr, 0)) : 0;
     const auto it =
         (no_modules || (only_env && id != only_id)) ? s_by_id.end() : s_by_id.find(id);
+#else
+    const auto it = s_by_id.find(id);
+#endif
     if (it != s_by_id.end())
     {
       const AotModuleDesc& desc = *it->second;
@@ -121,7 +125,11 @@ void RescanModules()
       }
       if (ok)
       {
+#ifdef DOLPHIN_AOT_HARNESS
         static const bool debug_dump = std::getenv("AOT_MODULE_DEBUG") != nullptr;
+#else
+        constexpr bool debug_dump = false;
+#endif
         for (u32 i = 0; i < num_sections; i++)
         {
           const u32 raw = rd32(section_info + i * 8);
@@ -187,8 +195,12 @@ void Init(const AotModuleDesc* modules, u32 count)
   s_last_active_count = 0;
   s_dirty = true;
 
+#ifdef DOLPHIN_AOT_HARNESS
+  // Debug override for games whose OS module queue head deviates from the SDK
+  // default; a game that needs this permanently should get a real config knob.
   if (const char* env = std::getenv("AOT_MODULE_QUEUE_ADDR"))
     s_queue_head_addr = static_cast<u32>(std::strtoul(env, nullptr, 0));
+#endif
 
   if (count > 0)
   {

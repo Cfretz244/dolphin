@@ -70,6 +70,10 @@
 #include "Core/PowerPC/GDBStub.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PowerPC.h"
+
+#ifdef DOLPHIN_AOT_HARNESS
+#include "Core/PowerPC/AOT/AotHarness.h"
+#endif
 #include "Core/State.h"
 #include "Core/System.h"
 #include "Core/WiiRoot.h"
@@ -873,25 +877,10 @@ void Callback_FramePresented(const PresentInfo& present_info)
 // Called from VideoInterface::Update (CPU thread) at emulated field boundaries
 void Callback_NewField(Core::System& system)
 {
-  // AOT_FRAME_SAVESTATE=<path>: circular buffer of save states at every field boundary.
-  // Keeps the last N saves (default 20, configurable via AOT_FRAME_SAVESTATE_SLOTS).
-  // On crash, feed all of them into `dolphin-tool diff` in parallel to find the divergence.
-  // Files: <path>_00.sav, <path>_01.sav, ..., <path>_19.sav (circular)
-  static const char* frame_savestate_path = std::getenv("AOT_FRAME_SAVESTATE");
-  if (frame_savestate_path)
-  {
-    static const char* slots_str = std::getenv("AOT_FRAME_SAVESTATE_SLOTS");
-    static const u64 num_slots = slots_str ? std::strtoull(slots_str, nullptr, 10) : 20;
-    static u64 field_count = 0;
-    const u64 slot = field_count % num_slots;
-    field_count++;
-    std::string path = fmt::format("{}_{:02d}.sav", frame_savestate_path, slot);
-    if (field_count % 120 == 1)
-      fmt::print(stderr, "AOT_FRAME_SAVESTATE: field {}, slot {}/{}, PC={:#010x}\n",
-                 field_count, slot, num_slots, system.GetPowerPC().GetPPCState().pc);
-    ::State::Flush();
-    ::State::SaveAs(system, std::move(path));
-  }
+#ifdef DOLPHIN_AOT_HARNESS
+  // Optional AOT-debugging savestate ring (AOT_FRAME_SAVESTATE env var).
+  AotHarness::OnNewField(system);
+#endif
 
   if (s_frame_step)
   {

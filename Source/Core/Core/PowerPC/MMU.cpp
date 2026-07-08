@@ -51,7 +51,9 @@
 #include "Core/HW/Memmap.h"
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/PowerPC/GDBStub.h"
+#ifdef DOLPHIN_AOT_HARNESS
 #include "Core/PowerPC/AOT/AotMmioCapture.h"
+#endif
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -351,7 +353,9 @@ void MMU::WriteToHardware(u32 em_address, const u32 data, const u32 size)
 
   // Capture MMIO writes for diff harness comparison
   if (flag == XCheckTLBFlag::Write && (em_address & 0xF8000000) == 0x08000000)
+#ifdef DOLPHIN_AOT_HARNESS
     MMIOCaptureRecord(em_address, data, size);
+#endif
 
   // Check for a gather pipe write (which are not implemented through the MMIO system).
   //
@@ -366,7 +370,9 @@ void MMU::WriteToHardware(u32 em_address, const u32 data, const u32 size)
   if (flag == XCheckTLBFlag::Write &&
       (em_address & 0xFFFFF000) == GPFifo::GATHER_PIPE_PHYSICAL_ADDRESS)
   {
+#ifdef DOLPHIN_AOT_HARNESS
     MMIOCaptureRecord(em_address, data, size);  // Capture GP FIFO writes too
+#endif
     switch (size)
     {
     case 1:

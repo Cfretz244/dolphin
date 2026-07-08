@@ -556,16 +556,6 @@ add_library(core
   PowerPC/PPCAnalyst.h
   PowerPC/PPCCache.cpp
   PowerPC/PPCCache.h
-  PowerPC/AOT/AOTCore.cpp
-  PowerPC/AOT/AOTCore.h
-  PowerPC/AOT/AotMmioCapture.h
-  PowerPC/AOT/AotModuleTracker.cpp
-  PowerPC/AOT/AotModuleTracker.h
-  PowerPC/AOT/AotRegistry.cpp
-  PowerPC/AOT/AotRegistry.h
-  PowerPC/AOT/AotRuntime.cpp
-  PowerPC/AOT/AotState.h
-  PowerPC/AOT/aot_runtime.h
   PowerPC/TraceCollector.cpp
   PowerPC/TraceCollector.h
   PowerPC/PPCSymbolDB.cpp
@@ -871,6 +861,34 @@ endif()
 
 if(ALL_AOT_LIBS)
   target_compile_definitions(core PUBLIC DOLPHIN_HAS_AOT)
+  target_sources(core PRIVATE
+    PowerPC/AOT/AOTCore.cpp
+    PowerPC/AOT/AOTCore.h
+    PowerPC/AOT/AotModuleTracker.cpp
+    PowerPC/AOT/AotModuleTracker.h
+    PowerPC/AOT/AotRegistry.cpp
+    PowerPC/AOT/AotRegistry.h
+    PowerPC/AOT/AotRuntime.cpp
+    PowerPC/AOT/AotState.h
+    PowerPC/AOT/aot_runtime.h
+  )
+
+  # Compare/diff harness (AOT_COMPARE, dolphin-tool diff, AOT_* debug switches).
+  # Desktop AOT builds default ON; iOS builds ship the pure fast loop only.
+  if(DOLPHIN_IOS_BUILD)
+    set(_aot_harness_default OFF)
+  else()
+    set(_aot_harness_default ON)
+  endif()
+  option(DOLPHIN_AOT_HARNESS "Compile the AOT compare/diff harness" ${_aot_harness_default})
+  if(DOLPHIN_AOT_HARNESS)
+    target_sources(core PRIVATE
+      PowerPC/AOT/AotHarness.cpp
+      PowerPC/AOT/AotHarness.h
+      PowerPC/AOT/AotMmioCapture.h
+    )
+    target_compile_definitions(core PUBLIC DOLPHIN_AOT_HARNESS)
+  endif()
   # Game AOT payloads link into the executables (see dolphin_aot_games consumers),
   # NOT into core: linking them here would drag every game's dispatch tables into
   # all core consumers, including unittests, whose process never boots a game.
