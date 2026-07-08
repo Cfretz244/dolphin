@@ -37,8 +37,13 @@ public:
   void RecordStaticEdge(u32 from_addr, u32 to_addr, bool is_call);
   void OnICacheInvalidation(u32 address, u32 length);
 
-  // Record a block's metadata. Called at JIT compile time (FinalizeBlock).
-  void RecordBlock(u32 ppc_addr, u32 block_size);
+  // Record a block's metadata and instruction bytes. Called at JIT compile time
+  // (FinalizeBlock). instruction_words points to block_size PPC instruction words as
+  // fetched from guest memory. Snapshots are CRC32-deduplicated per address; every call
+  // (including dedup hits) appends the current event counter to the matching snapshot's
+  // epoch list, giving offline clustering co-residency evidence on the same timeline as
+  // SMC events.
+  void RecordBlock(u32 ppc_addr, u32 block_size, const u32* instruction_words);
 
   // Record a unique vertex loader format configuration.
   // Called from VertexLoaderManager when a new format is first seen during tracing.
@@ -52,10 +57,21 @@ public:
   void Clear();
 
 private:
+  struct InstructionSnapshot
+  {
+    std::vector<u32> instructions;
+    u32 crc32;
+    // Event-counter values at each (re)compile that observed this content. Shares the
+    // timeline with SMCRecord::event_counter; sessions are rebased to disjoint ranges
+    // on merge so co-residency evidence never spans sessions.
+    std::vector<u64> epochs;
+  };
+
   struct BlockRecord
   {
     u32 ppc_addr;
     u32 block_size;
+    std::vector<InstructionSnapshot> snapshots;
   };
 
   struct EdgeRecord
@@ -74,7 +90,7 @@ private:
 
   // Binary file format constants
   static constexpr u32 MAGIC = 0x54485044;  // "DPHT" little-endian
-  static constexpr u32 FORMAT_VERSION = 3;
+  static constexpr u32 FORMAT_VERSION = 4;
 
   struct FileHeader
   {
@@ -83,12 +99,16 @@ private:
     u32 block_count;
     u32 edge_count;
     u32 smc_count;
-    u32 vtx_format_count;
+    u32 vtx_format_count;         // v3+
+    u32 snapshot_section_offset;  // v4+: byte offset from file start to snapshot section
   };
 
+  // Block addresses are always 4-byte aligned, so the low two bits of `to` are free to
+  // carry the edge type (three values). The previous scheme XORed type<<62 into the low
+  // half, which lands in `from`'s bits and let distinct edge types collide on one key.
   static u64 MakeEdgeKey(u32 from, u32 to, EdgeType type)
   {
-    return (u64(from) << 32) | ((u64(to) & 0xFFFFFFFF) ^ (u64(type) << 62));
+    return (u64(from) << 32) | u64(to) | u64(type);
   }
 
   bool m_active = false;
