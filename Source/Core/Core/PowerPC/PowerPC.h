@@ -297,6 +297,9 @@ public:
   void WriteFullTimeBaseValue(u64 value);
 
   void MSRUpdated();
+  // MSRUpdated minus the JIT membase update — for callers (the AOT runtime)
+  // that access RAM without the JIT's fastmem base.
+  void MSRUpdatedInternal();
 
   PowerPCState& GetPPCState() { return m_ppc_state; }
   const PowerPCState& GetPPCState() const { return m_ppc_state; }

@@ -27,6 +27,8 @@
 #include "Core/PowerPC/Interpreter/Interpreter.h"
 #include "Core/PowerPC/AOT/AotModuleTracker.h"
 #include "Core/PowerPC/Interpreter/Interpreter_FPUtils.h"
+#include "Core/PowerPC/Interpreter/Interpreter_PairedTables.h"
+#include "Core/PowerPC/Interpreter/Interpreter_PairedUtils.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/AOT/AotState.h"
 #include "Core/PowerPC/MMU.h"
@@ -420,15 +422,9 @@ int aot_check_fpu(AOTState* s, uint32_t pc)
 
 void aot_msr_updated(AOTState* s)
 {
-  // Lightweight MSR update for AOT — update feature flags and page table,
-  // but skip JitInterface::UpdateMembase() which triggers expensive BAT
-  // remapping that the AOT doesn't use (it accesses RAM via GetRAMPtr()).
-  auto& ppc_state = GetPPCState(s);
-  ppc_state.feature_flags = static_cast<CPUEmuFeatureFlags>(
-      (ppc_state.feature_flags & FEATURE_FLAG_PERFMON) | ((ppc_state.msr.Hex >> 4) & 0x3));
-
-  if (ppc_state.msr.DR && ppc_state.pagetable_update_pending)
-    GetSystem().GetMMU().PageTableUpdated();
+  // MSRUpdated minus JitInterface::UpdateMembase() — the AOT runtime accesses
+  // RAM through aot_fast_mem, not the JIT's fastmem base.
+  GetSystem().GetPowerPC().MSRUpdatedInternal();
 }
 
 void aot_rfi(AOTState* s)
@@ -789,240 +785,81 @@ void aot_mcrfs(AOTState* s, int crfd, int crfs)
 // Paired singles
 // ============================================================================
 
-// PS arithmetic — transcribed from Interpreter_Paired.cpp, dropping only the
-// interpreter-method dispatch and UGeckoInstruction reconstruction. The Rc=1
-// (UpdateCR1) branch is omitted because these wrappers always passed Rc=0;
-// keep that in sync with the emitter. div/res/rsqrte stay delegated — they're
-// rare and their exception logic is more involved.
+// PS arithmetic — thin wrappers over the op cores in Interpreter_PairedUtils.h
+// (the same functions the interpreter's ps_* handlers execute). The Rc=1
+// (UpdateCR1) branch is omitted because the emitter always passes Rc=0.
+// div/res/rsqrte stay delegated to the interpreter methods — they're rare and
+// their exception logic is more involved.
 void aot_ps_add(AOTState* s, int fd, int fa, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  const auto& a = ppc_state.ps[fa];
-  const auto& b = ppc_state.ps[fb];
-
-  const float ps0 =
-      ForceSingle(ppc_state.fpscr, NI_add(ppc_state, a.PS0AsDouble(), b.PS0AsDouble()).value);
-  const float ps1 =
-      ForceSingle(ppc_state.fpscr, NI_add(ppc_state, a.PS1AsDouble(), b.PS1AsDouble()).value);
-
-  ppc_state.ps[fd].SetBoth(ps0, ps1);
-  ppc_state.UpdateFPRFSingle(ps0);
+  PS_Add(GetPPCState(s), fd, fa, fb);
 }
 
 void aot_ps_sub(AOTState* s, int fd, int fa, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  const auto& a = ppc_state.ps[fa];
-  const auto& b = ppc_state.ps[fb];
-
-  const float ps0 =
-      ForceSingle(ppc_state.fpscr, NI_sub(ppc_state, a.PS0AsDouble(), b.PS0AsDouble()).value);
-  const float ps1 =
-      ForceSingle(ppc_state.fpscr, NI_sub(ppc_state, a.PS1AsDouble(), b.PS1AsDouble()).value);
-
-  ppc_state.ps[fd].SetBoth(ps0, ps1);
-  ppc_state.UpdateFPRFSingle(ps0);
+  PS_Sub(GetPPCState(s), fd, fa, fb);
 }
 
 void aot_ps_mul(AOTState* s, int fd, int fa, int fc)
 {
-  auto& ppc_state = GetPPCState(s);
-  const auto& a = ppc_state.ps[fa];
-  const auto& c = ppc_state.ps[fc];
-
-  const double c0 = Force25Bit(c.PS0AsDouble());
-  const double c1 = Force25Bit(c.PS1AsDouble());
-
-  const float ps0 = ForceSingle(ppc_state.fpscr, NI_mul(ppc_state, a.PS0AsDouble(), c0).value);
-  const float ps1 = ForceSingle(ppc_state.fpscr, NI_mul(ppc_state, a.PS1AsDouble(), c1).value);
-
-  ppc_state.ps[fd].SetBoth(ps0, ps1);
-  ppc_state.UpdateFPRFSingle(ps0);
+  PS_Mul(GetPPCState(s), fd, fa, fc);
 }
 
 FP_IMPL_3(aot_ps_div, ps_div)
 
 void aot_ps_madd(AOTState* s, int fd, int fa, int fc, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  const auto& a = ppc_state.ps[fa];
-  const auto& b = ppc_state.ps[fb];
-  const auto& c = ppc_state.ps[fc];
-
-  const float ps0 = ForceSingle(
-      ppc_state.fpscr,
-      NI_madd<true>(ppc_state, a.PS0AsDouble(), c.PS0AsDouble(), b.PS0AsDouble()).value);
-  const float ps1 = ForceSingle(
-      ppc_state.fpscr,
-      NI_madd<true>(ppc_state, a.PS1AsDouble(), c.PS1AsDouble(), b.PS1AsDouble()).value);
-
-  ppc_state.ps[fd].SetBoth(ps0, ps1);
-  ppc_state.UpdateFPRFSingle(ps0);
+  PS_Madd(GetPPCState(s), fd, fa, fc, fb);
 }
 
 void aot_ps_msub(AOTState* s, int fd, int fa, int fc, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  const auto& a = ppc_state.ps[fa];
-  const auto& b = ppc_state.ps[fb];
-  const auto& c = ppc_state.ps[fc];
-
-  const float ps0 = ForceSingle(
-      ppc_state.fpscr,
-      NI_msub<true>(ppc_state, a.PS0AsDouble(), c.PS0AsDouble(), b.PS0AsDouble()).value);
-  const float ps1 = ForceSingle(
-      ppc_state.fpscr,
-      NI_msub<true>(ppc_state, a.PS1AsDouble(), c.PS1AsDouble(), b.PS1AsDouble()).value);
-
-  ppc_state.ps[fd].SetBoth(ps0, ps1);
-  ppc_state.UpdateFPRFSingle(ps0);
+  PS_Msub(GetPPCState(s), fd, fa, fc, fb);
 }
 
 void aot_ps_nmadd(AOTState* s, int fd, int fa, int fc, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  const auto& a = ppc_state.ps[fa];
-  const auto& b = ppc_state.ps[fb];
-  const auto& c = ppc_state.ps[fc];
-
-  const float tmp0 = ForceSingle(
-      ppc_state.fpscr,
-      NI_madd<true>(ppc_state, a.PS0AsDouble(), c.PS0AsDouble(), b.PS0AsDouble()).value);
-  const float tmp1 = ForceSingle(
-      ppc_state.fpscr,
-      NI_madd<true>(ppc_state, a.PS1AsDouble(), c.PS1AsDouble(), b.PS1AsDouble()).value);
-
-  const float ps0 = std::isnan(tmp0) ? tmp0 : -tmp0;
-  const float ps1 = std::isnan(tmp1) ? tmp1 : -tmp1;
-
-  ppc_state.ps[fd].SetBoth(ps0, ps1);
-  ppc_state.UpdateFPRFSingle(ps0);
+  PS_Nmadd(GetPPCState(s), fd, fa, fc, fb);
 }
 
 void aot_ps_nmsub(AOTState* s, int fd, int fa, int fc, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  const auto& a = ppc_state.ps[fa];
-  const auto& b = ppc_state.ps[fb];
-  const auto& c = ppc_state.ps[fc];
-
-  const float tmp0 = ForceSingle(
-      ppc_state.fpscr,
-      NI_msub<true>(ppc_state, a.PS0AsDouble(), c.PS0AsDouble(), b.PS0AsDouble()).value);
-  const float tmp1 = ForceSingle(
-      ppc_state.fpscr,
-      NI_msub<true>(ppc_state, a.PS1AsDouble(), c.PS1AsDouble(), b.PS1AsDouble()).value);
-
-  const float ps0 = std::isnan(tmp0) ? tmp0 : -tmp0;
-  const float ps1 = std::isnan(tmp1) ? tmp1 : -tmp1;
-
-  ppc_state.ps[fd].SetBoth(ps0, ps1);
-  ppc_state.UpdateFPRFSingle(ps0);
+  PS_Nmsub(GetPPCState(s), fd, fa, fc, fb);
 }
 
 void aot_ps_sum0(AOTState* s, int fd, int fa, int fc, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  const auto& a = ppc_state.ps[fa];
-  const auto& b = ppc_state.ps[fb];
-  const auto& c = ppc_state.ps[fc];
-
-  const float ps0 =
-      ForceSingle(ppc_state.fpscr, NI_add(ppc_state, a.PS0AsDouble(), b.PS1AsDouble()).value);
-  const float ps1 = ForceSingle(ppc_state.fpscr, c.PS1AsDouble());
-
-  ppc_state.ps[fd].SetBoth(ps0, ps1);
-  ppc_state.UpdateFPRFSingle(ps0);
+  PS_Sum0(GetPPCState(s), fd, fa, fc, fb);
 }
 
 void aot_ps_sum1(AOTState* s, int fd, int fa, int fc, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  const auto& a = ppc_state.ps[fa];
-  const auto& b = ppc_state.ps[fb];
-  const auto& c = ppc_state.ps[fc];
-
-  const float ps0 = ForceSingle(ppc_state.fpscr, c.PS0AsDouble());
-  const float ps1 =
-      ForceSingle(ppc_state.fpscr, NI_add(ppc_state, a.PS0AsDouble(), b.PS1AsDouble()).value);
-
-  ppc_state.ps[fd].SetBoth(ps0, ps1);
-  ppc_state.UpdateFPRFSingle(ps1);
+  PS_Sum1(GetPPCState(s), fd, fa, fc, fb);
 }
 
 void aot_ps_muls0(AOTState* s, int fd, int fa, int fc)
 {
-  auto& ppc_state = GetPPCState(s);
-  const auto& a = ppc_state.ps[fa];
-  const auto& c = ppc_state.ps[fc];
-
-  const double c0 = Force25Bit(c.PS0AsDouble());
-  const float ps0 = ForceSingle(ppc_state.fpscr, NI_mul(ppc_state, a.PS0AsDouble(), c0).value);
-  const float ps1 = ForceSingle(ppc_state.fpscr, NI_mul(ppc_state, a.PS1AsDouble(), c0).value);
-
-  ppc_state.ps[fd].SetBoth(ps0, ps1);
-  ppc_state.UpdateFPRFSingle(ps0);
+  PS_Muls0(GetPPCState(s), fd, fa, fc);
 }
 
 void aot_ps_muls1(AOTState* s, int fd, int fa, int fc)
 {
-  auto& ppc_state = GetPPCState(s);
-  const auto& a = ppc_state.ps[fa];
-  const auto& c = ppc_state.ps[fc];
-
-  const double c1 = Force25Bit(c.PS1AsDouble());
-  const float ps0 = ForceSingle(ppc_state.fpscr, NI_mul(ppc_state, a.PS0AsDouble(), c1).value);
-  const float ps1 = ForceSingle(ppc_state.fpscr, NI_mul(ppc_state, a.PS1AsDouble(), c1).value);
-
-  ppc_state.ps[fd].SetBoth(ps0, ps1);
-  ppc_state.UpdateFPRFSingle(ps0);
+  PS_Muls1(GetPPCState(s), fd, fa, fc);
 }
 
 void aot_ps_madds0(AOTState* s, int fd, int fa, int fc, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  const auto& a = ppc_state.ps[fa];
-  const auto& b = ppc_state.ps[fb];
-  const auto& c = ppc_state.ps[fc];
-
-  const float ps0 = ForceSingle(
-      ppc_state.fpscr,
-      NI_madd<true>(ppc_state, a.PS0AsDouble(), c.PS0AsDouble(), b.PS0AsDouble()).value);
-  const float ps1 = ForceSingle(
-      ppc_state.fpscr,
-      NI_madd<true>(ppc_state, a.PS1AsDouble(), c.PS0AsDouble(), b.PS1AsDouble()).value);
-
-  ppc_state.ps[fd].SetBoth(ps0, ps1);
-  ppc_state.UpdateFPRFSingle(ps0);
+  PS_Madds0(GetPPCState(s), fd, fa, fc, fb);
 }
 
 void aot_ps_madds1(AOTState* s, int fd, int fa, int fc, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  const auto& a = ppc_state.ps[fa];
-  const auto& b = ppc_state.ps[fb];
-  const auto& c = ppc_state.ps[fc];
-
-  const float ps0 = ForceSingle(
-      ppc_state.fpscr,
-      NI_madd<true>(ppc_state, a.PS0AsDouble(), c.PS1AsDouble(), b.PS0AsDouble()).value);
-  const float ps1 = ForceSingle(
-      ppc_state.fpscr,
-      NI_madd<true>(ppc_state, a.PS1AsDouble(), c.PS1AsDouble(), b.PS1AsDouble()).value);
-
-  ppc_state.ps[fd].SetBoth(ps0, ps1);
-  ppc_state.UpdateFPRFSingle(ps0);
+  PS_Madds1(GetPPCState(s), fd, fa, fc, fb);
 }
 
 void aot_ps_sel(AOTState* s, int fd, int fa, int fc, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  const auto& a = ppc_state.ps[fa];
-  const auto& b = ppc_state.ps[fb];
-  const auto& c = ppc_state.ps[fc];
-
-  ppc_state.ps[fd].SetBoth(a.PS0AsDouble() >= -0.0 ? c.PS0AsDouble() : b.PS0AsDouble(),
-                           a.PS1AsDouble() >= -0.0 ? c.PS1AsDouble() : b.PS1AsDouble());
+  PS_Sel(GetPPCState(s), fd, fa, fc, fb);
 }
 
 FP_IMPL_2(aot_ps_res, ps_res)
@@ -1031,51 +868,40 @@ FP_IMPL_2(aot_ps_rsqrte, ps_rsqrte)
 // PS moves — must operate on BOTH ps0 AND ps1 (unlike scalar fneg/fabs/fnabs)
 void aot_ps_neg(AOTState* s, int fd, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  ppc_state.ps[fd].SetBoth(ppc_state.ps[fb].PS0AsU64() ^ (UINT64_C(1) << 63),
-                            ppc_state.ps[fb].PS1AsU64() ^ (UINT64_C(1) << 63));
+  PS_Neg(GetPPCState(s), fd, fb);
 }
 
 void aot_ps_mr(AOTState* s, int fd, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  ppc_state.ps[fd] = ppc_state.ps[fb];
+  PS_Mr(GetPPCState(s), fd, fb);
 }
 
 void aot_ps_abs(AOTState* s, int fd, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  ppc_state.ps[fd].SetBoth(ppc_state.ps[fb].PS0AsU64() & ~(UINT64_C(1) << 63),
-                            ppc_state.ps[fb].PS1AsU64() & ~(UINT64_C(1) << 63));
+  PS_Abs(GetPPCState(s), fd, fb);
 }
 
 void aot_ps_nabs(AOTState* s, int fd, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  ppc_state.ps[fd].SetBoth(ppc_state.ps[fb].PS0AsU64() | (UINT64_C(1) << 63),
-                            ppc_state.ps[fb].PS1AsU64() | (UINT64_C(1) << 63));
+  PS_Nabs(GetPPCState(s), fd, fb);
 }
 
 // PS merge
 void aot_ps_merge00(AOTState* s, int fd, int fa, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  ppc_state.ps[fd].SetBoth(ppc_state.ps[fa].PS0AsU64(), ppc_state.ps[fb].PS0AsU64());
+  PS_Merge00(GetPPCState(s), fd, fa, fb);
 }
 void aot_ps_merge01(AOTState* s, int fd, int fa, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  ppc_state.ps[fd].SetBoth(ppc_state.ps[fa].PS0AsU64(), ppc_state.ps[fb].PS1AsU64());
+  PS_Merge01(GetPPCState(s), fd, fa, fb);
 }
 void aot_ps_merge10(AOTState* s, int fd, int fa, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  ppc_state.ps[fd].SetBoth(ppc_state.ps[fa].PS1AsU64(), ppc_state.ps[fb].PS0AsU64());
+  PS_Merge10(GetPPCState(s), fd, fa, fb);
 }
 void aot_ps_merge11(AOTState* s, int fd, int fa, int fb)
 {
-  auto& ppc_state = GetPPCState(s);
-  ppc_state.ps[fd].SetBoth(ppc_state.ps[fa].PS1AsU64(), ppc_state.ps[fb].PS1AsU64());
+  PS_Merge11(GetPPCState(s), fd, fa, fb);
 }
 
 // PS comparison
@@ -1100,8 +926,6 @@ FP_CMP(aot_ps_cmpo1, ps_cmpo1)
 // implementation.
 // ============================================================================
 
-extern const float m_dequantizeTable[];  // defined in Interpreter_LoadStorePaired.cpp
-extern const float m_quantizeTable[];
 
 namespace
 {
@@ -1164,16 +988,6 @@ inline void FastWritePair(U val1, U val2, u8* p)
     FastWrite<u64>((u64{val1} << 32) | u64{val2}, p);
 }
 
-template <typename SType>
-SType FastScaleAndClamp(double ps, u32 st_scale)
-{
-  const float conv_ps = float(ps) * m_quantizeTable[st_scale];
-  constexpr float min = float(std::numeric_limits<SType>::min());
-  constexpr float max = float(std::numeric_limits<SType>::max());
-
-  return SType(std::clamp(conv_ps, min, max));
-}
-
 template <typename T>
 std::pair<double, double> FastLoadAndDequantize(const u8* p, u32 instW, u32 ld_scale)
 {
@@ -1183,14 +997,14 @@ std::pair<double, double> FastLoadAndDequantize(const u8* p, u32 instW, u32 ld_s
   if (instW != 0)
   {
     const U value = FastRead<U>(p);
-    ps0 = float(T(value)) * m_dequantizeTable[ld_scale];
+    ps0 = float(T(value)) * PowerPC::DEQUANTIZE_TABLE[ld_scale];
     ps1 = 1.0f;
   }
   else
   {
     const auto [first, second] = FastReadPair<U>(p);
-    ps0 = float(T(first)) * m_dequantizeTable[ld_scale];
-    ps1 = float(T(second)) * m_dequantizeTable[ld_scale];
+    ps0 = float(T(first)) * PowerPC::DEQUANTIZE_TABLE[ld_scale];
+    ps1 = float(T(second)) * PowerPC::DEQUANTIZE_TABLE[ld_scale];
   }
   // ps0 and ps1 always contain finite and normal numbers, so casting to double is safe
   return {static_cast<double>(ps0), static_cast<double>(ps1)};
@@ -1201,14 +1015,14 @@ void FastQuantizeAndStore(double ps0, double ps1, u8* p, u32 instW, u32 st_scale
 {
   using U = std::make_unsigned_t<T>;
 
-  const U conv_ps0 = U(FastScaleAndClamp<T>(ps0, st_scale));
+  const U conv_ps0 = U(PowerPC::ScaleAndClamp<T>(ps0, st_scale));
   if (instW != 0)
   {
     FastWrite<U>(conv_ps0, p);
   }
   else
   {
-    const U conv_ps1 = U(FastScaleAndClamp<T>(ps1, st_scale));
+    const U conv_ps1 = U(PowerPC::ScaleAndClamp<T>(ps1, st_scale));
     FastWritePair<U>(conv_ps0, conv_ps1, p);
   }
 }

@@ -13,63 +13,11 @@
 #include "Common/CommonTypes.h"
 #include "Core/PowerPC/Interpreter/ExceptionUtils.h"
 #include "Core/PowerPC/Interpreter/Interpreter_FPUtils.h"
+#include "Core/PowerPC/Interpreter/Interpreter_PairedTables.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
-// dequantize table
-// extern (not internal) linkage: AotRuntime.cpp's psq fast paths reference these
-// tables so their scaling stays bit-identical to the interpreter's.
-extern const float m_dequantizeTable[];
-const float m_dequantizeTable[] = {
-    1.0 / (1ULL << 0),  1.0 / (1ULL << 1),  1.0 / (1ULL << 2),  1.0 / (1ULL << 3),
-    1.0 / (1ULL << 4),  1.0 / (1ULL << 5),  1.0 / (1ULL << 6),  1.0 / (1ULL << 7),
-    1.0 / (1ULL << 8),  1.0 / (1ULL << 9),  1.0 / (1ULL << 10), 1.0 / (1ULL << 11),
-    1.0 / (1ULL << 12), 1.0 / (1ULL << 13), 1.0 / (1ULL << 14), 1.0 / (1ULL << 15),
-    1.0 / (1ULL << 16), 1.0 / (1ULL << 17), 1.0 / (1ULL << 18), 1.0 / (1ULL << 19),
-    1.0 / (1ULL << 20), 1.0 / (1ULL << 21), 1.0 / (1ULL << 22), 1.0 / (1ULL << 23),
-    1.0 / (1ULL << 24), 1.0 / (1ULL << 25), 1.0 / (1ULL << 26), 1.0 / (1ULL << 27),
-    1.0 / (1ULL << 28), 1.0 / (1ULL << 29), 1.0 / (1ULL << 30), 1.0 / (1ULL << 31),
-    (1ULL << 32),       (1ULL << 31),       (1ULL << 30),       (1ULL << 29),
-    (1ULL << 28),       (1ULL << 27),       (1ULL << 26),       (1ULL << 25),
-    (1ULL << 24),       (1ULL << 23),       (1ULL << 22),       (1ULL << 21),
-    (1ULL << 20),       (1ULL << 19),       (1ULL << 18),       (1ULL << 17),
-    (1ULL << 16),       (1ULL << 15),       (1ULL << 14),       (1ULL << 13),
-    (1ULL << 12),       (1ULL << 11),       (1ULL << 10),       (1ULL << 9),
-    (1ULL << 8),        (1ULL << 7),        (1ULL << 6),        (1ULL << 5),
-    (1ULL << 4),        (1ULL << 3),        (1ULL << 2),        (1ULL << 1),
-};
-
-// quantize table
-extern const float m_quantizeTable[];  // see m_dequantizeTable above
-const float m_quantizeTable[] = {
-    (1ULL << 0),        (1ULL << 1),        (1ULL << 2),        (1ULL << 3),
-    (1ULL << 4),        (1ULL << 5),        (1ULL << 6),        (1ULL << 7),
-    (1ULL << 8),        (1ULL << 9),        (1ULL << 10),       (1ULL << 11),
-    (1ULL << 12),       (1ULL << 13),       (1ULL << 14),       (1ULL << 15),
-    (1ULL << 16),       (1ULL << 17),       (1ULL << 18),       (1ULL << 19),
-    (1ULL << 20),       (1ULL << 21),       (1ULL << 22),       (1ULL << 23),
-    (1ULL << 24),       (1ULL << 25),       (1ULL << 26),       (1ULL << 27),
-    (1ULL << 28),       (1ULL << 29),       (1ULL << 30),       (1ULL << 31),
-    1.0 / (1ULL << 32), 1.0 / (1ULL << 31), 1.0 / (1ULL << 30), 1.0 / (1ULL << 29),
-    1.0 / (1ULL << 28), 1.0 / (1ULL << 27), 1.0 / (1ULL << 26), 1.0 / (1ULL << 25),
-    1.0 / (1ULL << 24), 1.0 / (1ULL << 23), 1.0 / (1ULL << 22), 1.0 / (1ULL << 21),
-    1.0 / (1ULL << 20), 1.0 / (1ULL << 19), 1.0 / (1ULL << 18), 1.0 / (1ULL << 17),
-    1.0 / (1ULL << 16), 1.0 / (1ULL << 15), 1.0 / (1ULL << 14), 1.0 / (1ULL << 13),
-    1.0 / (1ULL << 12), 1.0 / (1ULL << 11), 1.0 / (1ULL << 10), 1.0 / (1ULL << 9),
-    1.0 / (1ULL << 8),  1.0 / (1ULL << 7),  1.0 / (1ULL << 6),  1.0 / (1ULL << 5),
-    1.0 / (1ULL << 4),  1.0 / (1ULL << 3),  1.0 / (1ULL << 2),  1.0 / (1ULL << 1),
-};
-
-template <typename SType>
-SType ScaleAndClamp(double ps, u32 st_scale)
-{
-  const float conv_ps = float(ps) * m_quantizeTable[st_scale];
-  constexpr float min = float(std::numeric_limits<SType>::min());
-  constexpr float max = float(std::numeric_limits<SType>::max());
-
-  return SType(std::clamp(conv_ps, min, max));
-}
 
 template <typename T>
 static T ReadUnpaired(PowerPC::MMU& mmu, u32 addr)
@@ -133,14 +81,14 @@ void QuantizeAndStore(PowerPC::MMU& mmu, double ps0, double ps1, u32 addr, u32 i
 {
   using U = std::make_unsigned_t<T>;
 
-  const U conv_ps0 = U(ScaleAndClamp<T>(ps0, st_scale));
+  const U conv_ps0 = U(PowerPC::ScaleAndClamp<T>(ps0, st_scale));
   if (instW)
   {
     WriteUnpaired<U>(mmu, conv_ps0, addr);
   }
   else
   {
-    const U conv_ps1 = U(ScaleAndClamp<T>(ps1, st_scale));
+    const U conv_ps1 = U(PowerPC::ScaleAndClamp<T>(ps1, st_scale));
     WritePair<U>(mmu, conv_ps0, conv_ps1, addr);
   }
 }
@@ -209,14 +157,14 @@ std::pair<double, double> LoadAndDequantize(PowerPC::MMU& mmu, u32 addr, u32 ins
   if (instW != 0)
   {
     const U value = ReadUnpaired<U>(mmu, addr);
-    ps0 = float(T(value)) * m_dequantizeTable[ld_scale];
+    ps0 = float(T(value)) * PowerPC::DEQUANTIZE_TABLE[ld_scale];
     ps1 = 1.0f;
   }
   else
   {
     const auto [first, second] = ReadPair<U>(mmu, addr);
-    ps0 = float(T(first)) * m_dequantizeTable[ld_scale];
-    ps1 = float(T(second)) * m_dequantizeTable[ld_scale];
+    ps0 = float(T(first)) * PowerPC::DEQUANTIZE_TABLE[ld_scale];
+    ps1 = float(T(second)) * PowerPC::DEQUANTIZE_TABLE[ld_scale];
   }
   // ps0 and ps1 always contain finite and normal numbers. So we can just cast them to double
   return {static_cast<double>(ps0), static_cast<double>(ps1)};

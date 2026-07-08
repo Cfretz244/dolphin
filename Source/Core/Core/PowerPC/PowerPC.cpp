@@ -706,7 +706,7 @@ bool PowerPCManager::CheckAndHandleBreakPoints()
   return false;
 }
 
-void PowerPCManager::MSRUpdated()
+void PowerPCManager::MSRUpdatedInternal()
 {
   static_assert(UReg_MSR{}.DR.StartBit() == 4);
   static_assert(UReg_MSR{}.IR.StartBit() == 5);
@@ -718,7 +718,11 @@ void PowerPCManager::MSRUpdated()
 
   if (m_ppc_state.msr.DR && m_ppc_state.pagetable_update_pending)
     m_system.GetMMU().PageTableUpdated();
+}
 
+void PowerPCManager::MSRUpdated()
+{
+  MSRUpdatedInternal();
   m_system.GetJitInterface().UpdateMembase();
 }
 
