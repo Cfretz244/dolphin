@@ -51,7 +51,7 @@
 #include "Core/HW/Memmap.h"
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/PowerPC/GDBStub.h"
-#include "Core/PowerPC/MMIOCapture.h"
+#include "Core/PowerPC/AOT/AotMmioCapture.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"

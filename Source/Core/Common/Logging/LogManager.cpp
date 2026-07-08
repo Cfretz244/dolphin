@@ -97,6 +97,7 @@ LogManager::LogManager()
   // create log containers
   m_log[LogType::ACHIEVEMENTS] = {"RetroAchievements", "Achievements"};
   m_log[LogType::ACTIONREPLAY] = {"ActionReplay", "Action Replay"};
+  m_log[LogType::AOT] = {"AOT", "AOT Recompiler"};
   m_log[LogType::AUDIO] = {"Audio", "Audio Emulator"};
   m_log[LogType::AUDIO_INTERFACE] = {"AI", "Audio Interface"};
   m_log[LogType::BOOT] = {"BOOT", "Boot"};

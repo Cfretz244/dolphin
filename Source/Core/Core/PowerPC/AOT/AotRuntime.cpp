@@ -24,7 +24,7 @@
 #include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/Interpreter/ExceptionUtils.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
-#include "Core/PowerPC/AotModuleTracker.h"
+#include "Core/PowerPC/AOT/AotModuleTracker.h"
 #include "Core/PowerPC/Interpreter/Interpreter_FPUtils.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/MMU.h"
@@ -169,6 +169,24 @@ void aot_init_fast_mem()
   s_l1_size = s_system->GetMemory().GetL1CacheSize();
   aot_fast_mem.ram = s_ram_ptr;
   aot_fast_mem.size = s_ram_size;
+}
+
+// Counterpart to aot_init_fast_mem, called from AOTCore::Shutdown. The RAM/L1
+// buffers are reallocated on the next boot, so the cached pointers must not
+// survive into a second game's session.
+void aot_shutdown()
+{
+  s_system = nullptr;
+  s_interpreter = nullptr;
+  s_mmu = nullptr;
+  s_ram_ptr = nullptr;
+  s_ram_size = 0;
+  s_l1_ptr = nullptr;
+  s_l1_size = 0;
+  aot_fast_mem.ram = nullptr;
+  aot_fast_mem.size = 0;
+  s_track_fallbacks = false;
+  s_fallback_counts.clear();
 }
 
 // ============================================================================

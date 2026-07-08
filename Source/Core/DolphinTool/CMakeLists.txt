@@ -44,6 +44,7 @@ endif()
 target_link_libraries(dolphin-tool
 PRIVATE
   core
+  $<$<TARGET_EXISTS:dolphin_aot_games>:dolphin_aot_games>
   discio
   uicommon
   cpp-optparse

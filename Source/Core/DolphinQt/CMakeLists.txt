@@ -452,6 +452,7 @@ PRIVATE
 target_link_libraries(dolphin-emu
 PRIVATE
   core
+  $<$<TARGET_EXISTS:dolphin_aot_games>:dolphin_aot_games>
   Qt6::Widgets
   uicommon
   imgui

@@ -1,9 +1,10 @@
 // Copyright 2026 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "Core/PowerPC/AotModuleTracker.h"
+#include "Core/PowerPC/AOT/AotModuleTracker.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
@@ -13,7 +14,7 @@
 #include "Common/Logging/Log.h"
 #include "Common/Swap.h"
 #include "Core/HW/Memmap.h"
-#include "Core/PowerPC/AotRegistry.h"
+#include "Core/PowerPC/AOT/AotRegistry.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
@@ -46,7 +47,7 @@ u32 s_module_count = 0;
 std::unordered_map<u32, const AotModuleDesc*> s_by_id;
 std::vector<ActiveRange> s_ranges;  // sorted by base
 const ActiveRange* s_last_range = nullptr;
-volatile int s_dirty = 0;
+std::atomic<bool> s_dirty{false};
 u32 s_queue_head_addr = DEFAULT_QUEUE_HEAD_ADDR;
 std::unordered_set<u32> s_warned_ids;
 u32 s_last_active_count = 0;
@@ -131,7 +132,7 @@ void RescanModules()
             s_ranges.push_back({base, desc.sections[i].size, desc.sections[i].table, id, i});
           if (debug_dump && desc.sections[i].size > 0)
           {
-            WARN_LOG_FMT(POWERPC, "  module {} section {}: base={:#010x} size={:#x} exec={}", id,
+            WARN_LOG_FMT(AOT, "  module {} section {}: base={:#010x} size={:#x} exec={}", id,
                          i, base, desc.sections[i].size, desc.sections[i].executable);
           }
         }
@@ -139,7 +140,7 @@ void RescanModules()
       }
       else if (s_warned_ids.insert(id).second)
       {
-        WARN_LOG_FMT(POWERPC,
+        WARN_LOG_FMT(AOT,
                      "AotModuleTracker: module {} layout mismatch (sections {} vs {}), "
                      "leaving on interpreter",
                      id, num_sections, desc.num_sections);
@@ -156,7 +157,7 @@ void RescanModules()
 
   if (active != s_last_active_count)
   {
-    INFO_LOG_FMT(POWERPC, "AotModuleTracker: {} modules active ({} table ranges)", active,
+    INFO_LOG_FMT(AOT, "AotModuleTracker: {} modules active ({} table ranges)", active,
                  s_ranges.size());
     s_last_active_count = active;
   }
@@ -185,14 +186,14 @@ void Init(const AotModuleDesc* modules, u32 count)
   s_last_range = nullptr;
   s_warned_ids.clear();
   s_last_active_count = 0;
-  s_dirty = 1;
+  s_dirty = true;
 
   if (const char* env = std::getenv("AOT_MODULE_QUEUE_ADDR"))
     s_queue_head_addr = static_cast<u32>(std::strtoul(env, nullptr, 0));
 
   if (count > 0)
   {
-    INFO_LOG_FMT(POWERPC, "AotModuleTracker: {} compiled modules, queue head {:#010x}", count,
+    INFO_LOG_FMT(AOT, "AotModuleTracker: {} compiled modules, queue head {:#010x}", count,
                  s_queue_head_addr);
   }
 }
@@ -210,16 +211,13 @@ void Shutdown()
 
 void MarkDirty()
 {
-  s_dirty = 1;
+  s_dirty = true;
 }
 
 bool LookupBlock(u32 pc, AOTBlockFunc* fn, u32* module_id, u32* section, u32* offset)
 {
-  if (s_dirty)
-  {
-    s_dirty = 0;
+  if (s_dirty.exchange(false))
     RescanModules();
-  }
   const ActiveRange* r = LookupRange(pc);
   if (!r)
     return false;
@@ -242,11 +240,8 @@ extern "C" void aot_module_dispatch(AOTState* s)
   // PowerPCState — static_asserted in AotRuntime.cpp.)
   if (reinterpret_cast<const PowerPC::PowerPCState*>(s)->downcount <= 0)
     return;
-  if (s_dirty)
-  {
-    s_dirty = 0;
+  if (s_dirty.exchange(false))
     RescanModules();
-  }
   // pc is the first AOTState field; read it without needing the full layout.
   const u32 pc = *reinterpret_cast<const u32*>(s);
   const ActiveRange* r =

@@ -556,13 +556,14 @@ add_library(core
   PowerPC/PPCAnalyst.h
   PowerPC/PPCCache.cpp
   PowerPC/PPCCache.h
-  PowerPC/AOTCore.cpp
-  PowerPC/AOTCore.h
-  PowerPC/AotModuleTracker.cpp
-  PowerPC/AotModuleTracker.h
-  PowerPC/AotRegistry.cpp
-  PowerPC/AotRegistry.h
-  PowerPC/AotRuntime.cpp
+  PowerPC/AOT/AOTCore.cpp
+  PowerPC/AOT/AOTCore.h
+  PowerPC/AOT/AotMmioCapture.h
+  PowerPC/AOT/AotModuleTracker.cpp
+  PowerPC/AOT/AotModuleTracker.h
+  PowerPC/AOT/AotRegistry.cpp
+  PowerPC/AOT/AotRegistry.h
+  PowerPC/AOT/AotRuntime.cpp
   PowerPC/TraceCollector.cpp
   PowerPC/TraceCollector.h
   PowerPC/PPCSymbolDB.cpp
@@ -869,13 +870,17 @@ endif()
 
 if(ALL_AOT_LIBS)
   target_compile_definitions(core PUBLIC DOLPHIN_HAS_AOT)
+  # Game AOT payloads link into the executables (see dolphin_aot_games consumers),
+  # NOT into core: linking them here would drag every game's dispatch tables into
+  # all core consumers, including unittests, whose process never boots a game.
+  add_library(dolphin_aot_games INTERFACE)
   foreach(lib IN LISTS ALL_AOT_LIBS)
     if(NOT EXISTS "${lib}")
       message(FATAL_ERROR "AOT library not found: ${lib}")
     endif()
     # Whole-archive link: ensures __attribute__((constructor)) registration runs
     # even though Dolphin no longer references game-specific symbols directly.
-    target_link_libraries(core PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,${lib}>")
+    target_link_libraries(dolphin_aot_games INTERFACE "$<LINK_LIBRARY:WHOLE_ARCHIVE,${lib}>")
   endforeach()
   list(LENGTH ALL_AOT_LIBS _aot_lib_count)
   message(STATUS "AOT support enabled with ${_aot_lib_count} library(ies): ${ALL_AOT_LIBS}")

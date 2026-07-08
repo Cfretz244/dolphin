@@ -13,6 +13,7 @@
 
 #include "Common/Assert.h"
 #include "Common/CommonTypes.h"
+#include "Common/Logging/Log.h"
 #include "Common/MsgHandler.h"
 
 #include "Core/ConfigManager.h"
@@ -26,7 +27,13 @@
 #include "VideoCommon/VertexLoader_TextCoord.h"
 #include "VideoCommon/VideoConfig.h"
 
+#ifdef __APPLE__
 #include <TargetConditionals.h>
+#endif
+#if !defined(TARGET_OS_IOS)
+#define TARGET_OS_IOS 0
+#endif
+
 #ifdef _M_X86_64
 #include "VideoCommon/VertexLoaderX64.h"
 #elif defined(_M_ARM_64) && !TARGET_OS_IOS
@@ -241,15 +248,18 @@ std::unique_ptr<VertexLoaderBase> VertexLoaderBase::CreateVertexLoader(const TVt
 {
   const VertexLoaderType loader_type = g_ActiveConfig.vertex_loader_type;
 
-  // Try AOT vertex loader first (critical for iOS, also works on desktop for validation)
-  if (loader_type != VertexLoaderType::Software)
+  // Try AOT vertex loader first (critical for iOS, also works on desktop for validation).
+  // The HasEntries() check must come first: it keeps this path from touching SConfig in
+  // processes that never boot a game (unit tests) and in builds with no vtx AOT linked.
+  if (loader_type != VertexLoaderType::Software && VertexLoaderAotRegistry::Instance().HasEntries())
   {
     auto& registry = VertexLoaderAotRegistry::Instance();
-    if (registry.HasEntriesForGame(SConfig::GetInstance().GetGameID()))
+    const std::string& game_id = SConfig::GetInstance().GetGameID();
+    if (registry.HasEntriesForGame(game_id))
     {
       VertexLoaderAotRegistry::Key key = {vtx_desc.low.Hex, vtx_desc.high.Hex, vtx_attr.g0.Hex,
                                           vtx_attr.g1.Hex, vtx_attr.g2.Hex};
-      if (auto* entry = registry.Find(SConfig::GetInstance().GetGameID(), key))
+      if (auto* entry = registry.Find(game_id, key))
       {
         auto aot_loader = std::make_unique<VertexLoaderAOT>(vtx_desc, vtx_attr, *entry);
         if (loader_type != VertexLoaderType::Compare)
@@ -262,11 +272,10 @@ std::unique_ptr<VertexLoaderBase> VertexLoaderBase::CreateVertexLoader(const TVt
         // it runs on the (much slower) fallback path. Loaders are cached per format, so
         // this fires once per missed format; a burst of these in a heavy area explains
         // stutter and means the traces should be extended through that content.
-        fprintf(stderr,
-                "VtxAOT: format miss for %s (%08x %08x %08x %08x %08x) — using fallback "
-                "loader\n",
-                SConfig::GetInstance().GetGameID().c_str(), key[0], key[1], key[2], key[3],
-                key[4]);
+        WARN_LOG_FMT(VIDEO,
+                     "VtxAOT: format miss for {} ({:08x} {:08x} {:08x} {:08x} {:08x}) — using "
+                     "fallback loader",
+                     game_id, key[0], key[1], key[2], key[3], key[4]);
       }
     }
   }

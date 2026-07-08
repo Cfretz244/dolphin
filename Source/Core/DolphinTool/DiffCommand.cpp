@@ -29,7 +29,7 @@
 #include "Core/BootManager.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
-#include "Core/PowerPC/AOTCore.h"
+#include "Core/PowerPC/AOT/AOTCore.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 

@@ -1,7 +1,7 @@
 // Copyright 2024 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "Core/PowerPC/AotRegistry.h"
+#include "Core/PowerPC/AOT/AotRegistry.h"
 
 #include "Common/Logging/Log.h"
 
@@ -18,7 +18,7 @@ void AotRegistry::Register(const std::string& game_id, AOTDispatchFunc dispatch,
   {
     // This would only happen if two libraries provide the same game ID.
     // Last registration wins; this is a build misconfiguration.
-    WARN_LOG_FMT(POWERPC, "AotRegistry: Duplicate registration for game {}, overwriting", game_id);
+    WARN_LOG_FMT(AOT, "AotRegistry: Duplicate registration for game {}, overwriting", game_id);
   }
   auto& entry = m_games[game_id];
   entry.game_id = game_id;

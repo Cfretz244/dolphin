@@ -1,7 +1,7 @@
 // Copyright 2024 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "Core/PowerPC/AOTCore.h"
+#include "Core/PowerPC/AOT/AOTCore.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -29,9 +29,9 @@
 #include "Core/State.h"
 #include "VideoCommon/CommandProcessor.h"
 #include "Core/ConfigManager.h"
-#include "Core/PowerPC/AotModuleTracker.h"
-#include "Core/PowerPC/AotRegistry.h"
-#include "Core/PowerPC/MMIOCapture.h"
+#include "Core/PowerPC/AOT/AotModuleTracker.h"
+#include "Core/PowerPC/AOT/AotRegistry.h"
+#include "Core/PowerPC/AOT/AotMmioCapture.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -127,6 +127,7 @@ AOTCore::~AOTCore()
 
 extern "C" void aot_interpreter_single_step(AOTState* s);
 extern "C" void aot_init_fast_mem();
+extern "C" void aot_shutdown();
 extern "C" void aot_enable_fallback_tracking();
 extern "C" void aot_dump_fallback_stats();
 
@@ -153,7 +154,7 @@ void AOTCore::Init()
     m_dispatch = entry->dispatch;
     m_lookup_block = entry->lookup_block;
     AotModuleTracker::Init(entry->modules, entry->module_count);
-    INFO_LOG_FMT(POWERPC, "AOTCore: Found AOT library for game {} ({} REL modules)", game_id,
+    INFO_LOG_FMT(AOT, "AOTCore: Found AOT library for game {} ({} REL modules)", game_id,
                  entry->module_count);
   }
   else
@@ -168,7 +169,7 @@ void AOTCore::Init()
         available += ", ";
       available += registered[i];
     }
-    WARN_LOG_FMT(POWERPC,
+    WARN_LOG_FMT(AOT,
                  "AOTCore: No AOT library for game {}. Available: [{}]. "
                  "Falling back to interpreter.",
                  game_id, available);
@@ -178,7 +179,7 @@ void AOTCore::Init()
   if (!s_diff_block_sizes.empty())
   {
     m_block_sizes = s_diff_block_sizes;  // copy, not move — may be reused
-    INFO_LOG_FMT(POWERPC, "AOTCore: Loaded {} block boundaries", m_block_sizes.size());
+    INFO_LOG_FMT(AOT, "AOTCore: Loaded {} block boundaries", m_block_sizes.size());
   }
 
   // Load diff mode settings
@@ -186,7 +187,7 @@ void AOTCore::Init()
   {
     if (m_block_sizes.empty())
     {
-      ERROR_LOG_FMT(POWERPC, "AOTDiff: No block sizes loaded — call SetDiffBlockSizes() before boot");
+      ERROR_LOG_FMT(AOT, "AOTDiff: No block sizes loaded — call SetDiffBlockSizes() before boot");
       return;
     }
 
@@ -238,13 +239,13 @@ void AOTCore::Init()
           sqlite3_finalize(stmt);
         }
         sqlite3_close(db);
-        INFO_LOG_FMT(POWERPC, "AOT_COMPARE: Loaded {} block boundaries (+{} module blocks) from {}",
+        INFO_LOG_FMT(AOT, "AOT_COMPARE: Loaded {} block boundaries (+{} module blocks) from {}",
                      m_block_sizes.size(), m_module_block_sizes.size(), cfg_path);
       }
     }
     else
     {
-      WARN_LOG_FMT(POWERPC, "AOT_COMPARE: Set -C Dolphin.Debug.AOTCfgDbPath=<path> for block sizes");
+      WARN_LOG_FMT(AOT, "AOT_COMPARE: Set -C Dolphin.Debug.AOTCfgDbPath=<path> for block sizes");
     }
   }
 }
@@ -260,6 +261,7 @@ void AOTCore::Shutdown()
   m_ram_shadow = nullptr;
   std::free(m_ram_shadow_aot);
   m_ram_shadow_aot = nullptr;
+  aot_shutdown();
 }
 
 void AOTCore::ClearCache()
@@ -1030,7 +1032,7 @@ void AOTCore::RunDiff()
     log = std::fopen(log_path.c_str(), "w");
     if (!log)
     {
-      ERROR_LOG_FMT(POWERPC, "AOTDiff: Cannot open log file: {}", log_path);
+      ERROR_LOG_FMT(AOT, "AOTDiff: Cannot open log file: {}", log_path);
       log = stdout;
     }
   }

@@ -13,6 +13,7 @@ enum class LogType : int
 {
   ACHIEVEMENTS,
   ACTIONREPLAY,
+  AOT,
   AUDIO,
   AUDIO_INTERFACE,
   BOOT,

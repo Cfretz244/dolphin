@@ -19,7 +19,7 @@
 #include "Core/PowerPC/ConditionRegister.h"
 #include "Core/PowerPC/Gekko.h"
 #ifdef DOLPHIN_HAS_AOT
-#include "Core/PowerPC/AOTCore.h"
+#include "Core/PowerPC/AOT/AOTCore.h"
 #endif
 #include "Core/PowerPC/PPCCache.h"
 #include "Core/PowerPC/PPCSymbolDB.h"
