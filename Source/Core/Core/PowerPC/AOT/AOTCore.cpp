@@ -19,6 +19,13 @@
 #include "Core/PowerPC/AOT/AotHarness.h"
 #endif
 
+#include "Core/PowerPC/AOT/AotEmbedding.h"
+
+static_assert(static_cast<int>(PowerPC::CPUCore::AOT) == 6,
+              "CPUCore::AOT is frozen at 6 for deployed-config compatibility "
+              "(update AotEmbedding.h consumers if this ever changes)");
+extern "C" const int kDolphinCPUCoreAOT = static_cast<int>(PowerPC::CPUCore::AOT);
+
 extern "C" void aot_init_fast_mem();
 extern "C" void aot_shutdown();
 extern "C" void aot_dump_fallback_stats();

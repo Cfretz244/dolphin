@@ -866,6 +866,7 @@ if(ALL_AOT_LIBS)
   target_sources(core PRIVATE
     PowerPC/AOT/AOTCore.cpp
     PowerPC/AOT/AOTCore.h
+    PowerPC/AOT/AotEmbedding.h
     PowerPC/AOT/AotModuleTracker.cpp
     PowerPC/AOT/AotModuleTracker.h
     PowerPC/AOT/AotRegistry.cpp

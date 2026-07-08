@@ -2,6 +2,7 @@ add_library(videometal
   MRCHelpers.h
   MTLBoundingBox.mm
   MTLBoundingBox.h
+  MTLCaptureInterface.h
   MTLGfx.mm
   MTLGfx.h
   MTLMain.mm
