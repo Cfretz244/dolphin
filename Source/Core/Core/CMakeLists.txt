@@ -564,6 +564,8 @@ add_library(core
   PowerPC/AOT/AotRegistry.cpp
   PowerPC/AOT/AotRegistry.h
   PowerPC/AOT/AotRuntime.cpp
+  PowerPC/AOT/AotState.h
+  PowerPC/AOT/aot_runtime.h
   PowerPC/TraceCollector.cpp
   PowerPC/TraceCollector.h
   PowerPC/PPCSymbolDB.cpp

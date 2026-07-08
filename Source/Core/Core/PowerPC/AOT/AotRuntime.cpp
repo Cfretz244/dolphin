@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -27,24 +28,55 @@
 #include "Core/PowerPC/AOT/AotModuleTracker.h"
 #include "Core/PowerPC/Interpreter/Interpreter_FPUtils.h"
 #include "Core/PowerPC/JitInterface.h"
+#include "Core/PowerPC/AOT/AotState.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PPCTables.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
-// Single-block mode flag for diff harness: when set, dispatch returns
-// immediately without calling any block. Defined here as the single
-// authoritative definition — AOT libraries declare it as extern.
-extern "C" int aot_single_block_mode;
-int aot_single_block_mode = 0;
+// Layout contract between AOTState (aot_runtime.h, compiled into every AOT
+// library) and PowerPCState. Generated code reads and writes CPU state through
+// AOTState, so every field it can touch must sit at the PowerPCState offset.
+// If any of these fail, AOT code would silently corrupt state.
+#define AOT_ASSERT_FIELD(field, aot_field)                                                         \
+  static_assert(offsetof(PowerPC::PowerPCState, field) == offsetof(AOTState, aot_field),          \
+                #field " offset mismatch between PowerPCState and AOTState")
+AOT_ASSERT_FIELD(pc, pc);
+AOT_ASSERT_FIELD(npc, npc);
+AOT_ASSERT_FIELD(stored_stack_pointer, stored_stack_pointer);
+AOT_ASSERT_FIELD(gather_pipe_ptr, gather_pipe_ptr);
+AOT_ASSERT_FIELD(gather_pipe_base_ptr, gather_pipe_base_ptr);
+AOT_ASSERT_FIELD(gpr, gpr);
+AOT_ASSERT_FIELD(ps, ps);
+AOT_ASSERT_FIELD(cr, cr_fields);
+AOT_ASSERT_FIELD(msr, msr);
+AOT_ASSERT_FIELD(fpscr, fpscr);
+AOT_ASSERT_FIELD(feature_flags, feature_flags);
+AOT_ASSERT_FIELD(Exceptions, exceptions);
+AOT_ASSERT_FIELD(downcount, downcount);
+AOT_ASSERT_FIELD(xer_ca, xer_ca);
+AOT_ASSERT_FIELD(xer_so_ov, xer_so_ov);
+AOT_ASSERT_FIELD(xer_stringctrl, xer_stringctrl);
+AOT_ASSERT_FIELD(reserve_address, reserve_address);
+AOT_ASSERT_FIELD(reserve, reserve);
+AOT_ASSERT_FIELD(pagetable_update_pending, pagetable_update_pending);
+AOT_ASSERT_FIELD(m_enable_dcache, m_enable_dcache);
+AOT_ASSERT_FIELD(sr, sr);
+AOT_ASSERT_FIELD(spr, spr);
+#undef AOT_ASSERT_FIELD
+// AOTState is deliberately a prefix view: PowerPCState continues with fields
+// generated code never touches (TLBs, caches, ...), so no sizeof() equality.
+static_assert(sizeof(AOTState) <= sizeof(PowerPC::PowerPCState),
+              "AOTState must not extend beyond PowerPCState");
 
-// The AOTState struct is layout-compatible with PowerPCState.
-// At runtime, we cast between them.
-struct AOTState;
+// Single-block mode flag for diff harness: when set, dispatch returns
+// immediately without calling any block. Declared in aot_runtime.h; defined
+// here as the single authoritative definition.
+int aot_single_block_mode = 0;
 
 static PowerPC::PowerPCState& GetPPCState(AOTState* s)
 {
-  return *reinterpret_cast<PowerPC::PowerPCState*>(s);
+  return FromAot(s);
 }
 
 // Cached singleton pointers, filled in aot_init_fast_mem() (called from AOTCore::Init()
@@ -147,15 +179,9 @@ extern "C"
 // Init — cache RAM pointer and size to avoid repeated global lookups
 // ============================================================================
 
-// RAM fast-path descriptor exported to generated code: the header template inlines
-// the RAM fast path into every block (see AOT_RUNTIME_HEADER in AotCommand.cpp) and
-// calls the aot_*_slow functions below for everything else. Layout must match the
-// template's `typedef struct { uint8_t* ram; uint32_t size; } AotFastMem;`.
-struct AotFastMem
-{
-  u8* ram;
-  u32 size;
-};
+// RAM fast-path descriptor exported to generated code: aot_runtime.h inlines
+// the RAM fast path into every block and calls the aot_*_slow functions below
+// for everything else. AotFastMem itself is defined in aot_runtime.h.
 AotFastMem aot_fast_mem = {nullptr, 0};
 
 void aot_init_fast_mem()

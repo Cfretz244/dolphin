@@ -32,6 +32,23 @@ add_executable(dolphin-tool
   ToolMain.cpp
 )
 
+# The translate command emits a verbatim copy of the checked-in AOT runtime
+# header into every generated aot-src tree. Embed the header's bytes at build
+# time so the emitted copy can never drift from the file the runtime compiles.
+set(AOT_RUNTIME_HEADER "${CMAKE_SOURCE_DIR}/Source/Core/Core/PowerPC/AOT/aot_runtime.h")
+set(AOT_RUNTIME_HEADER_GEN "${CMAKE_CURRENT_BINARY_DIR}/AotRuntimeHeaderGen.cpp")
+add_custom_command(
+  OUTPUT "${AOT_RUNTIME_HEADER_GEN}"
+  COMMAND ${CMAKE_COMMAND}
+          -DINPUT=${AOT_RUNTIME_HEADER}
+          -DOUTPUT=${AOT_RUNTIME_HEADER_GEN}
+          -DVARIABLE=s_aot_runtime_header
+          -P ${CMAKE_SOURCE_DIR}/CMake/StringifyHeader.cmake
+  DEPENDS "${AOT_RUNTIME_HEADER}" "${CMAKE_SOURCE_DIR}/CMake/StringifyHeader.cmake"
+  COMMENT "Embedding aot_runtime.h into dolphin-tool"
+)
+target_sources(dolphin-tool PRIVATE "${AOT_RUNTIME_HEADER_GEN}")
+
 if (WIN32)
   target_sources(dolphin-tool PRIVATE DolphinTool.exe.manifest DolphinTool.rc)
 

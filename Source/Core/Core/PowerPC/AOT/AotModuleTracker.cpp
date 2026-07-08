@@ -15,10 +15,9 @@
 #include "Common/Swap.h"
 #include "Core/HW/Memmap.h"
 #include "Core/PowerPC/AOT/AotRegistry.h"
+#include "Core/PowerPC/AOT/AotState.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
-
-extern "C" void aot_interpreter_single_step(AOTState* s);
 
 namespace AotModuleTracker
 {
@@ -236,14 +235,12 @@ extern "C" void aot_module_dispatch(AOTState* s)
   // sits behind that check already, but per-site indirect probes make this
   // entry point reachable on its own — it must be self-sufficient as the bound
   // on pure-indirect cycles. pc is always set before dispatch, so a plain
-  // return resumes the Run loop. (AOTState is layout-compatible with
-  // PowerPCState — static_asserted in AotRuntime.cpp.)
-  if (reinterpret_cast<const PowerPC::PowerPCState*>(s)->downcount <= 0)
+  // return resumes the Run loop.
+  if (s->downcount <= 0)
     return;
   if (s_dirty.exchange(false))
     RescanModules();
-  // pc is the first AOTState field; read it without needing the full layout.
-  const u32 pc = *reinterpret_cast<const u32*>(s);
+  const u32 pc = s->pc;
   const ActiveRange* r =
       (s_last_range && pc - s_last_range->base < s_last_range->size) ? s_last_range :
                                                                        LookupRange(pc);

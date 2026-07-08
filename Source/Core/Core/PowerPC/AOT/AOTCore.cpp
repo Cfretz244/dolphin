@@ -32,78 +32,16 @@
 #include "Core/PowerPC/AOT/AotModuleTracker.h"
 #include "Core/PowerPC/AOT/AotRegistry.h"
 #include "Core/PowerPC/AOT/AotMmioCapture.h"
+#include "Core/PowerPC/AOT/AotState.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
 #ifdef DOLPHIN_HAS_AOT
 
-// AOTState definition — must be layout-compatible with PowerPCState.
-// This is the struct that AOT-generated C code operates on.
-// Defined here for the static_assert checks; the actual definition used by
-// generated code is in the emitted aot_runtime.h header.
-struct AOTState
-{
-  uint32_t pc;
-  uint32_t npc;
-  void* stored_stack_pointer;
-  void* gather_pipe_ptr;
-  void* gather_pipe_base_ptr;
-  uint32_t gpr[32];
-  struct
-  {
-    uint64_t ps0;
-    uint64_t ps1;
-  } ps[32] __attribute__((aligned(16)));
-  uint64_t cr_fields[8];
-  uint32_t msr;
-  uint32_t fpscr;
-  uint32_t feature_flags;
-  uint32_t exceptions;
-  int32_t downcount;
-  uint8_t xer_ca;
-  uint8_t xer_so_ov;
-  uint16_t xer_stringctrl;
-  uint32_t reserve_address;
-  uint8_t reserve;
-  uint8_t pagetable_update_pending;
-  uint8_t m_enable_dcache;
-  uint8_t _pad0;
-  uint32_t sr[16];
-  uint32_t spr[1024] __attribute__((aligned(8)));
-};
+// AOTState (aot_runtime.h) is the generated code's view of PowerPCState;
+// the layout contract is static_asserted in AotRuntime.cpp.
 
-// Verify layout compatibility between PowerPCState and AOTState.
-// If any of these fail, the AOT code will silently corrupt state.
-static_assert(offsetof(PowerPC::PowerPCState, pc) == offsetof(AOTState, pc),
-              "pc offset mismatch");
-static_assert(offsetof(PowerPC::PowerPCState, gather_pipe_ptr) == offsetof(AOTState, gather_pipe_ptr),
-              "gather_pipe_ptr offset mismatch");
-static_assert(offsetof(PowerPC::PowerPCState, gather_pipe_base_ptr) ==
-                  offsetof(AOTState, gather_pipe_base_ptr),
-              "gather_pipe_base_ptr offset mismatch");
-static_assert(offsetof(PowerPC::PowerPCState, gpr) == offsetof(AOTState, gpr),
-              "gpr offset mismatch");
-static_assert(offsetof(PowerPC::PowerPCState, downcount) == offsetof(AOTState, downcount),
-              "downcount offset mismatch");
-static_assert(offsetof(PowerPC::PowerPCState, xer_ca) == offsetof(AOTState, xer_ca),
-              "xer_ca offset mismatch");
-static_assert(offsetof(PowerPC::PowerPCState, spr) == offsetof(AOTState, spr),
-              "spr offset mismatch");
-static_assert(offsetof(PowerPC::PowerPCState, ps) == offsetof(AOTState, ps),
-              "ps offset mismatch");
-static_assert(offsetof(PowerPC::PowerPCState, cr) == offsetof(AOTState, cr_fields),
-              "cr offset mismatch");
-static_assert(offsetof(PowerPC::PowerPCState, msr) == offsetof(AOTState, msr),
-              "msr offset mismatch");
-static_assert(offsetof(PowerPC::PowerPCState, Exceptions) == offsetof(AOTState, exceptions),
-              "exceptions offset mismatch");
-static_assert(offsetof(PowerPC::PowerPCState, fpscr) == offsetof(AOTState, fpscr),
-              "fpscr offset mismatch");
-
-// Single-block mode: when set, dispatch returns immediately without chaining.
-// Defined in AotRuntime.cpp; declared here for diff/compare mode usage.
-extern "C" int aot_single_block_mode;
 
 // Static storage for diff block sizes (set by DiffCommand before boot)
 std::unordered_map<u32, u32> AOTCore::s_diff_block_sizes;
@@ -125,7 +63,6 @@ AOTCore::~AOTCore()
   std::free(m_ram_shadow_aot);
 }
 
-extern "C" void aot_interpreter_single_step(AOTState* s);
 extern "C" void aot_init_fast_mem();
 extern "C" void aot_shutdown();
 extern "C" void aot_enable_fallback_tracking();
