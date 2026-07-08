@@ -37,6 +37,12 @@
 
 extern "C" void aot_enable_fallback_tracking();
 
+// GameCube MMIO register window (CP/PE/VI/PI/MI/DSP/DVD/SI/EXI/AI/GP, see
+// ProcessorInterface / the 0x0C00xxxx map in HW/). The heuristics below treat
+// any pointer into this window as hardware access.
+constexpr u32 MMIO_RANGE_START = 0xCC000000;
+constexpr u32 MMIO_RANGE_END = 0xCD000000;
+
 std::atomic<bool> AotHarness::s_shutdown_requested{false};
 
 AotHarness::AotHarness(Core::System& system, DispatchFunc dispatch, DispatchFunc interp_dispatch)
@@ -427,7 +433,7 @@ void AotHarness::Run()
             for (int gi = 0; gi < 32; gi++)
             {
               const u32 av = aot_result.gpr[gi];
-              if (av >= 0xCC000000 && av < 0xCD000000 && av == interp_result.gpr[gi])
+              if (av >= MMIO_RANGE_START && av < MMIO_RANGE_END && av == interp_result.gpr[gi])
               {
                 fmt::print(stderr,
                            "NOTE: r{} = {:#010x} points into the MMIO range — this block "
@@ -714,7 +720,7 @@ bool AotHarness::BlockAccessesMMIO(const PPCSnapshot& pre, u32 block_addr, u32 n
   for (int i = 0; i < 32; i++)
   {
     u32 v = pre.gpr[i];
-    if (v >= 0xCC000000 && v < 0xCD000000)
+    if (v >= MMIO_RANGE_START && v < MMIO_RANGE_END)
       return true;
   }
 
@@ -735,7 +741,7 @@ bool AotHarness::BlockAccessesMMIO(const PPCSnapshot& pre, u32 block_addr, u32 n
       if (ra == 0)
       {
         u32 val = static_cast<u32>(imm) << 16;
-        if (val >= 0xCC000000 && val < 0xCD000000)
+        if (val >= MMIO_RANGE_START && val < MMIO_RANGE_END)
           return true;
       }
     }

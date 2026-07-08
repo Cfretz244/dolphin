@@ -153,7 +153,7 @@ static inline bool IsRAMAddress(u32 addr)
   // Low-memory (0x0xxxxxxx) and 0x4xxxxxxx accesses must take the slow path:
   // with MSR.DR=1 the interpreter raises a DSI for them (BAT miss), so the fast
   // path must not silently satisfy them from RAM.
-  return ((addr & ~0x40000000u) - 0x80000000u) < s_ram_size;
+  return ((addr & ~AOT_MEM_UNCACHED_BIT) - AOT_MEM_CACHED_BASE) < s_ram_size;
 }
 
 // Resolve an effective address to a host pointer for fast-path access: main RAM
@@ -166,7 +166,7 @@ static inline bool IsRAMAddress(u32 addr)
 static inline u8* FastMemHostPtr(u32 addr)
 {
   if (IsRAMAddress(addr))
-    return s_ram_ptr + (addr & 0x3FFFFFFFu);
+    return s_ram_ptr + (addr & AOT_MEM_OFFSET_MASK);
   // The +8 guard keeps the largest fast-path access (paired u32) inside the
   // small L1 buffer; the final few bytes fall back to the checked slow path.
   if (s_l1_ptr != nullptr && (addr >> 28) == 0xE && addr + 8 <= 0xE0000000u + s_l1_size)

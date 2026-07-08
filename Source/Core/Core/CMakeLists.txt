@@ -530,6 +530,8 @@ add_library(core
   PowerPC/Interpreter/Interpreter_LoadStore.cpp
   PowerPC/Interpreter/Interpreter_LoadStorePaired.cpp
   PowerPC/Interpreter/Interpreter_Paired.cpp
+  PowerPC/Interpreter/Interpreter_PairedTables.h
+  PowerPC/Interpreter/Interpreter_PairedUtils.h
   PowerPC/Interpreter/Interpreter_SystemRegisters.cpp
   PowerPC/Interpreter/Interpreter_Tables.cpp
   PowerPC/Interpreter/Interpreter.cpp
