@@ -23,7 +23,10 @@
 #define CIFACE_USE_XLIB
 #endif
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_OSX
 #define CIFACE_USE_OSX
+#endif
 #endif
 #if defined(HAVE_LIBEVDEV) && defined(HAVE_LIBUDEV)
 #define CIFACE_USE_EVDEV
