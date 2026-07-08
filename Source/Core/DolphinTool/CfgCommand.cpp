@@ -28,6 +28,7 @@
 #include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/PPCTables.h"
 
+#include "DolphinTool/OverlayImages.h"
 #include "DolphinTool/PPCMemoryImage.h"
 #include "DolphinTool/RelModules.h"
 
@@ -75,6 +76,11 @@ struct TraceData
     u32 vtx_desc_low, vtx_desc_high, vat_g0, vat_g1, vat_g2;
   };
   std::vector<VertexFormat> vertex_formats;
+
+  // Instruction snapshots + counter-stamped invalidation events (v4+), consumed by the
+  // overlay-image clustering.
+  std::vector<TraceSnapshotBlock> snapshot_blocks;
+  std::vector<TraceSmcEvent> smc_events;
 };
 
 static bool ReadTraceFile(const std::string& path, TraceData& out)
@@ -86,14 +92,14 @@ static bool ReadTraceFile(const std::string& path, TraceData& out)
     return false;
   }
 
-  // Read the common header fields first (v2 has 5 fields, v3 has 6)
+  // Read the common header fields first (v2 has 5 fields, v3 has 6, v4 has 7)
   u32 magic, version, block_count, edge_count, smc_count;
   if (!file.ReadBytes(&magic, 4) || !file.ReadBytes(&version, 4) ||
       !file.ReadBytes(&block_count, 4) || !file.ReadBytes(&edge_count, 4) ||
       !file.ReadBytes(&smc_count, 4))
     return false;
 
-  if (magic != 0x54485044 || (version != 2 && version != 3))
+  if (magic != 0x54485044 || version < 2 || version > 4)
   {
     fmt::println(std::cerr, "Error: Invalid trace file (magic={:#x}, version={})", magic, version);
     return false;
@@ -103,6 +109,13 @@ static bool ReadTraceFile(const std::string& path, TraceData& out)
   if (version >= 3)
   {
     if (!file.ReadBytes(&vtx_format_count, 4))
+      return false;
+  }
+
+  u32 snapshot_section_offset = 0;
+  if (version >= 4)
+  {
+    if (!file.ReadBytes(&snapshot_section_offset, 4))
       return false;
   }
 
@@ -133,6 +146,7 @@ static bool ReadTraceFile(const std::string& path, TraceData& out)
         !file.ReadBytes(&counter, 8))
       return false;
     out.smc_regions.push_back(smc);
+    out.smc_events.push_back({smc.addr, smc.length, counter});
   }
 
   // Read vertex format records (v3+)
@@ -144,6 +158,37 @@ static bool ReadTraceFile(const std::string& path, TraceData& out)
         !file.ReadBytes(&fmt.vat_g0, 4) || !file.ReadBytes(&fmt.vat_g1, 4) ||
         !file.ReadBytes(&fmt.vat_g2, 4))
       return false;
+  }
+
+  // Read instruction snapshots (v4+)
+  if (version >= 4 && snapshot_section_offset > 0)
+  {
+    file.Seek(snapshot_section_offset, File::SeekOrigin::Begin);
+    const u64 file_size = file.GetSize();
+    while (file.Tell() < file_size)
+    {
+      TraceSnapshotBlock sb{};
+      u32 num_snapshots;
+      if (!file.ReadBytes(&sb.addr, 4) || !file.ReadBytes(&num_snapshots, 4))
+        break;
+      for (u32 si = 0; si < num_snapshots; si++)
+      {
+        TraceSnapshot snap{};
+        snap.addr = sb.addr;
+        u32 num_instructions, num_epochs;
+        if (!file.ReadBytes(&num_instructions, 4) || !file.ReadBytes(&snap.crc32, 4) ||
+            !file.ReadBytes(&num_epochs, 4))
+          return false;
+        snap.epochs.resize(num_epochs);
+        if (!file.ReadBytes(snap.epochs.data(), num_epochs * sizeof(u64)))
+          return false;
+        snap.words.resize(num_instructions);
+        if (!file.ReadBytes(snap.words.data(), num_instructions * sizeof(u32)))
+          return false;
+        sb.snapshots.push_back(std::move(snap));
+      }
+      out.snapshot_blocks.push_back(std::move(sb));
+    }
   }
 
   return true;
@@ -868,6 +913,170 @@ static bool WriteModuleDatabase(const std::string& path, const std::vector<RelFi
 }
 
 // ============================================================================
+// Overlay-image CFGs (trace-captured code; absolute fixed addresses)
+// ============================================================================
+
+struct OverlayCfg
+{
+  std::map<u32, CFGBlock> blocks;  // keyed by absolute PPC address
+  u32 captured_bytes = 0;
+  u32 covered_bytes = 0;
+};
+
+// Overlay bytes are already-linked code at a fixed base: absolute addressing, ordinary
+// branch decoding, no relocation map. Descent is bounded to the captured ranges by
+// PPCMemoryImage::IsCodeAddress, so untraced neighborhoods simply stay uncovered.
+static OverlayCfg BuildOverlayCfg(const OverlayImage& image, const TraceData& trace)
+{
+  OverlayCfg cfg;
+
+  PPCMemoryImage memory;
+  for (const auto& range : image.ranges)
+  {
+    memory.AddSection(range.addr, range.bytes.data(), static_cast<u32>(range.bytes.size()));
+    cfg.captured_bytes += static_cast<u32>(range.bytes.size());
+  }
+
+  TraceData synth;
+  synth.seed_addresses = image.member_blocks;
+  for (const auto& edge : trace.edges)
+  {
+    if (edge.to >= image.base && edge.to < image.end)
+      synth.edges.push_back(edge);
+    if (edge.type == 1 && edge.from >= image.base && edge.from < image.end)
+      synth.dynamic_targets.emplace(edge.from, edge.to);
+  }
+
+  std::vector<CFGEdge> edges;  // decoded again at translate time; not persisted
+  RunDisassembly(memory, synth, cfg.blocks, edges, false);
+
+  for (const auto& [addr, block] : cfg.blocks)
+    cfg.covered_bytes += block.num_instructions * 4;
+  return cfg;
+}
+
+static bool WriteOverlayDatabase(const std::string& path,
+                                 const std::vector<OverlayImage>& images,
+                                 const std::vector<OverlayCfg>& cfgs, u32 gap_threshold)
+{
+  sqlite3* db = nullptr;
+  if (sqlite3_open(path.c_str(), &db) != SQLITE_OK)
+  {
+    fmt::println(std::cerr, "Error: Cannot open database: {}", path);
+    return false;
+  }
+
+  const char* schema = R"(
+    CREATE TABLE IF NOT EXISTS overlay_images (
+      image_id INTEGER PRIMARY KEY,
+      base INTEGER NOT NULL,
+      end INTEGER NOT NULL,
+      full_crc32 INTEGER NOT NULL,
+      prefix_crc32 INTEGER NOT NULL,
+      num_ranges INTEGER NOT NULL,
+      captured_bytes INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS overlay_ranges (
+      image_id INTEGER NOT NULL,
+      addr INTEGER NOT NULL,
+      size INTEGER NOT NULL,
+      bytes BLOB NOT NULL,
+      PRIMARY KEY (image_id, addr)
+    );
+    CREATE TABLE IF NOT EXISTS overlay_blocks (
+      image_id INTEGER NOT NULL,
+      addr INTEGER NOT NULL,
+      num_instructions INTEGER NOT NULL,
+      is_translatable INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY (image_id, addr)
+    );
+  )";
+
+  char* err = nullptr;
+  sqlite3_exec(db, schema, nullptr, nullptr, &err);
+  if (err)
+  {
+    fmt::println(std::cerr, "SQL error: {}", err);
+    sqlite3_free(err);
+    sqlite3_close(db);
+    return false;
+  }
+
+  sqlite3_exec(db, "BEGIN TRANSACTION", nullptr, nullptr, nullptr);
+  // Regenerating from a merged trace can reshape images entirely; replace wholesale.
+  sqlite3_exec(db, "DELETE FROM overlay_images; DELETE FROM overlay_ranges; "
+                   "DELETE FROM overlay_blocks;",
+               nullptr, nullptr, nullptr);
+
+  sqlite3_stmt* stmt = nullptr;
+  sqlite3_prepare_v2(db, "INSERT INTO overlay_images VALUES (?, ?, ?, ?, ?, ?, ?)", -1, &stmt,
+                     nullptr);
+  for (size_t i = 0; i < images.size(); i++)
+  {
+    const auto& img = images[i];
+    u32 captured = 0;
+    for (const auto& r : img.ranges)
+      captured += static_cast<u32>(r.bytes.size());
+    sqlite3_bind_int(stmt, 1, static_cast<int>(i));
+    sqlite3_bind_int64(stmt, 2, img.base);
+    sqlite3_bind_int64(stmt, 3, img.end);
+    sqlite3_bind_int64(stmt, 4, img.full_crc32);
+    sqlite3_bind_int64(stmt, 5, img.prefix_crc32);
+    sqlite3_bind_int(stmt, 6, static_cast<int>(img.ranges.size()));
+    sqlite3_bind_int64(stmt, 7, captured);
+    sqlite3_step(stmt);
+    sqlite3_reset(stmt);
+  }
+  sqlite3_finalize(stmt);
+
+  sqlite3_prepare_v2(db, "INSERT INTO overlay_ranges VALUES (?, ?, ?, ?)", -1, &stmt, nullptr);
+  for (size_t i = 0; i < images.size(); i++)
+  {
+    for (const auto& r : images[i].ranges)
+    {
+      sqlite3_bind_int(stmt, 1, static_cast<int>(i));
+      sqlite3_bind_int64(stmt, 2, r.addr);
+      sqlite3_bind_int64(stmt, 3, static_cast<s64>(r.bytes.size()));
+      sqlite3_bind_blob(stmt, 4, r.bytes.data(), static_cast<int>(r.bytes.size()),
+                        SQLITE_STATIC);
+      sqlite3_step(stmt);
+      sqlite3_reset(stmt);
+    }
+  }
+  sqlite3_finalize(stmt);
+
+  sqlite3_prepare_v2(db, "INSERT INTO overlay_blocks VALUES (?, ?, ?, ?)", -1, &stmt, nullptr);
+  for (size_t i = 0; i < images.size(); i++)
+  {
+    for (const auto& [addr, block] : cfgs[i].blocks)
+    {
+      sqlite3_bind_int(stmt, 1, static_cast<int>(i));
+      sqlite3_bind_int64(stmt, 2, addr);
+      sqlite3_bind_int(stmt, 3, block.num_instructions);
+      sqlite3_bind_int(stmt, 4, 1);
+      sqlite3_step(stmt);
+      sqlite3_reset(stmt);
+    }
+  }
+  sqlite3_finalize(stmt);
+
+  sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO metadata VALUES (?, ?)", -1, &stmt, nullptr);
+  auto insert_meta = [&](const char* key, const std::string& value) {
+    sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, value.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt);
+    sqlite3_reset(stmt);
+  };
+  insert_meta("overlay_image_count", fmt::format("{}", images.size()));
+  insert_meta("overlay_gap", fmt::format("{}", gap_threshold));
+  sqlite3_finalize(stmt);
+
+  sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
+  sqlite3_close(db);
+  return true;
+}
+
+// ============================================================================
 // SQLite output
 // ============================================================================
 
@@ -1116,6 +1325,19 @@ int CfgCommand(const std::vector<std::string>& args)
   parser.add_option("--no-rels")
       .action("store_true")
       .help("Skip discovery and CFG extraction of .rel relocatable modules");
+  parser.add_option("--overlay-gap")
+      .action("store")
+      .set_default("65536")
+      .help("Max address gap (bytes) between co-resident snapshots clustered into one "
+            "overlay image (default: %default)");
+  parser.add_option("--overlay-max-versions")
+      .action("store")
+      .set_default("8")
+      .help("Exclude arena addresses with more than this many content versions as "
+            "genuine self-modifying code (default: %default)");
+  parser.add_option("--no-overlays")
+      .action("store_true")
+      .help("Skip overlay-image clustering of v4 instruction snapshots");
 
   const optparse::Values options = parser.parse_args(args);
 
@@ -1130,6 +1352,10 @@ int CfgCommand(const std::vector<std::string>& args)
   const std::string output_path = options["output"];
   const bool verbose = options.is_set("verbose");
   const bool no_rels = options.is_set("no_rels");
+  const bool no_overlays = options.is_set("no_overlays");
+  const u32 overlay_gap = static_cast<u32>(std::strtoul(options["overlay_gap"].c_str(), nullptr, 0));
+  const u32 overlay_max_versions =
+      static_cast<u32>(std::strtoul(options["overlay_max_versions"].c_str(), nullptr, 0));
 
   // 1. Open disc and extract DOL
   auto volume = DiscIO::CreateDisc(iso_path);
@@ -1318,7 +1544,64 @@ int CfgCommand(const std::vector<std::string>& args)
     }
   }
 
-  // 7. Write output
+  // 7. Overlay images from v4 instruction snapshots: cluster the arena (non-DOL)
+  // captures into content-hashed images and build a CFG per image.
+  std::vector<OverlayImage> overlay_images;
+  std::vector<OverlayCfg> overlay_cfgs;
+  if (!no_overlays && !trace.snapshot_blocks.empty())
+  {
+    std::vector<TraceSnapshotBlock> arena_blocks;
+    for (auto& sb : trace.snapshot_blocks)
+    {
+      if (!memory.IsCodeAddress(sb.addr))
+        arena_blocks.push_back(std::move(sb));
+    }
+
+    if (!arena_blocks.empty())
+    {
+      OverlayBuildStats ostats{};
+      overlay_images = BuildOverlayImages(arena_blocks, trace.smc_events, overlay_gap,
+                                          overlay_max_versions, verbose, &ostats);
+
+      u64 total_captured = 0, total_covered = 0, total_extent = 0, total_blocks = 0;
+      for (const auto& img : overlay_images)
+      {
+        OverlayCfg cfg = BuildOverlayCfg(img, trace);
+        total_captured += cfg.captured_bytes;
+        total_covered += cfg.covered_bytes;
+        total_extent += img.end - img.base;
+        total_blocks += cfg.blocks.size();
+        if (verbose)
+        {
+          fmt::println(std::cerr,
+                       "  overlay {:3d}: {:#010x}-{:#010x} ({:5.1f} KB captured, {} ranges, "
+                       "{} blocks, crc {:08x})",
+                       overlay_cfgs.size(), img.base, img.end, cfg.captured_bytes / 1024.0,
+                       img.ranges.size(), cfg.blocks.size(), img.full_crc32);
+        }
+        overlay_cfgs.push_back(std::move(cfg));
+      }
+
+      fmt::println(std::cerr, "Overlay images: {} images, {} blocks", overlay_images.size(),
+                   total_blocks);
+      fmt::println(std::cerr,
+                   "  Arena snapshots: {} blocks, {} versions ({} hyper-mutable excluded)",
+                   ostats.snapshot_blocks, ostats.snapshots, ostats.hyper_mutable_blocks);
+      fmt::println(std::cerr,
+                   "  Generation kills: {} by invalidation, {} by byte conflict "
+                   "({} conflict-triggered captures — may be transitional mixes); "
+                   "{} multi-base duplicates",
+                   ostats.smc_kills, ostats.conflict_kills, ostats.conflict_captures,
+                   ostats.multi_base_duplicates);
+      fmt::println(std::cerr,
+                   "  Captured {:.1f} KB, CFG-covered {:.1f} KB; dispatch-table forecast "
+                   "{:.1f} MB (2 B per extent byte per image)",
+                   total_captured / 1024.0, total_covered / 1024.0,
+                   total_extent * 2.0 / (1024.0 * 1024.0));
+    }
+  }
+
+  // 8. Write output
   if (!WriteCFGDatabase(output_path, blocks, edges, functions, trace.smc_regions,
                         trace.vertex_formats, trace.seed_addresses, dol.GetEntryPoint()))
   {
@@ -1326,6 +1609,11 @@ int CfgCommand(const std::vector<std::string>& args)
   }
   if (!modules.empty() && !WriteModuleDatabase(output_path, modules, module_cfgs))
     return EXIT_FAILURE;
+  if (!overlay_images.empty() &&
+      !WriteOverlayDatabase(output_path, overlay_images, overlay_cfgs, overlay_gap))
+  {
+    return EXIT_FAILURE;
+  }
 
   fmt::println(std::cerr, "Output written to {}", output_path);
   return EXIT_SUCCESS;

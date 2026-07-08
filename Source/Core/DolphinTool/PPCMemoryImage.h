@@ -26,30 +26,18 @@ public:
 
   std::optional<u32> ReadInstruction(u32 addr) const
   {
-    for (const auto& sec : m_sections)
-    {
-      if (addr >= sec.base && addr < sec.base + sec.size)
-      {
-        u32 offset = addr - sec.base;
-        if (offset + 4 > sec.size)
-          return std::nullopt;
-        u32 raw;
-        std::memcpy(&raw, sec.data + offset, sizeof(u32));
-        return Common::swap32(raw);
-      }
-    }
-    return std::nullopt;
+    const Section* sec = FindSection(addr);
+    if (!sec)
+      return std::nullopt;
+    u32 offset = addr - sec->base;
+    if (offset + 4 > sec->size)
+      return std::nullopt;
+    u32 raw;
+    std::memcpy(&raw, sec->data + offset, sizeof(u32));
+    return Common::swap32(raw);
   }
 
-  bool IsCodeAddress(u32 addr) const
-  {
-    for (const auto& sec : m_sections)
-    {
-      if (addr >= sec.base && addr < sec.base + sec.size)
-        return true;
-    }
-    return false;
-  }
+  bool IsCodeAddress(u32 addr) const { return FindSection(addr) != nullptr; }
 
 private:
   struct Section
@@ -58,5 +46,18 @@ private:
     u32 size;
     const u8* data;
   };
+
+  // Sections are sorted by base and non-overlapping (overlay images can have hundreds
+  // of ranges, so lookups binary-search instead of scanning).
+  const Section* FindSection(u32 addr) const
+  {
+    auto it = std::upper_bound(m_sections.begin(), m_sections.end(), addr,
+                               [](u32 a, const Section& s) { return a < s.base; });
+    if (it == m_sections.begin())
+      return nullptr;
+    --it;
+    return (addr >= it->base && addr < it->base + it->size) ? &*it : nullptr;
+  }
+
   std::vector<Section> m_sections;
 };

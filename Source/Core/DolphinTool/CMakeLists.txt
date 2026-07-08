@@ -8,6 +8,8 @@ add_executable(dolphin-tool
   CfgCommand.h
   DiffCommand.cpp
   DiffCommand.h
+  OverlayImages.cpp
+  OverlayImages.h
   PPCMemoryImage.h
   RarcReader.cpp
   RarcReader.h
