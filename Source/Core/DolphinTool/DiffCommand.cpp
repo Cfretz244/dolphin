@@ -19,7 +19,6 @@
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 
-#include <sqlite3.h>
 #include <unordered_map>
 
 #include "Common/CommonTypes.h"
@@ -52,11 +51,6 @@ int DiffCommand(const std::vector<std::string>& args)
       "Compare AOT-translated PPC blocks against the interpreter, block by block.");
 
   parser.add_option("--iso").action("store").metavar("<path>").help("Path to game ISO (required)");
-
-  parser.add_option("--cfg")
-      .action("store")
-      .metavar("<path>")
-      .help("Path to CFG SQLite database for block boundaries (required)");
 
   parser.add_option("--max-blocks")
       .action("store")
@@ -107,17 +101,10 @@ int DiffCommand(const std::vector<std::string>& args)
   const optparse::Values options = parser.parse_args(args);
 
   const std::string iso_path = options["iso"];
-  const std::string cfg_path = options["cfg"];
 
   if (iso_path.empty())
   {
     fmt::println(std::cerr, "Error: --iso is required");
-    parser.print_help();
-    return EXIT_FAILURE;
-  }
-  if (cfg_path.empty())
-  {
-    fmt::println(std::cerr, "Error: --cfg is required");
     parser.print_help();
     return EXIT_FAILURE;
   }
@@ -156,7 +143,6 @@ int DiffCommand(const std::vector<std::string>& args)
   Config::SetCurrent(Config::MAIN_DEBUG_AOT_SELF_DIFF, self_diff);
   Config::SetCurrent(Config::MAIN_DEBUG_AOT_COMPARE_RAM,
                            static_cast<int>(options.get("compare_ram")) != 0);
-  Config::SetCurrent(Config::MAIN_DEBUG_AOT_CFG_DB_PATH, cfg_path);
   Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_MAX_BLOCKS, max_blocks_val);
   Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_MAX_DIVERGENCES, max_div_val);
   Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_FILTER_MIN, filter_min);
@@ -169,32 +155,6 @@ int DiffCommand(const std::vector<std::string>& args)
   const std::string savestate_path = options["savestate"];
   if (!savestate_path.empty())
     Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_SAVESTATE_PATH, savestate_path);
-
-  // Load block sizes from CFG database and pass to AOTCore
-  {
-    std::unordered_map<u32, u32> block_sizes;
-    sqlite3* db = nullptr;
-    if (sqlite3_open_v2(cfg_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK)
-    {
-      fmt::println(std::cerr, "Error: Cannot open CFG database: {}", cfg_path);
-      return EXIT_FAILURE;
-    }
-    sqlite3_stmt* stmt = nullptr;
-    const char* sql = "SELECT ppc_addr, num_instructions FROM blocks WHERE is_translatable = 1";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK)
-    {
-      while (sqlite3_step(stmt) == SQLITE_ROW)
-      {
-        u32 addr = static_cast<u32>(sqlite3_column_int64(stmt, 0));
-        u32 num_instr = static_cast<u32>(sqlite3_column_int64(stmt, 1));
-        block_sizes[addr] = num_instr;
-      }
-      sqlite3_finalize(stmt);
-    }
-    sqlite3_close(db);
-    fmt::println(std::cerr, "AOT Diff: Loaded {} block boundaries", block_sizes.size());
-    AOTCore::SetDiffBlockSizes(std::move(block_sizes));
-  }
 
   // Create boot parameters
   auto boot = BootParameters::GenerateFromFile(iso_path);
@@ -212,7 +172,6 @@ int DiffCommand(const std::vector<std::string>& args)
   });
 
   fmt::println(std::cerr, "AOT Diff: Booting {}...", iso_path);
-  fmt::println(std::cerr, "AOT Diff: CFG database: {}", cfg_path);
   fmt::println(std::cerr, "AOT Diff: Max blocks: {}, Max divergences: {}", max_blocks_val,
                max_div_val);
   if (self_diff)

@@ -9,7 +9,6 @@
 #include <unordered_set>
 
 #include <fmt/format.h>
-#include <sqlite3.h>
 
 #include "Common/ChunkFile.h"
 #include "Common/CommonTypes.h"
@@ -43,14 +42,7 @@
 // the layout contract is static_asserted in AotRuntime.cpp.
 
 
-// Static storage for diff block sizes (set by DiffCommand before boot)
-std::unordered_map<u32, u32> AOTCore::s_diff_block_sizes;
 std::atomic<bool> AOTCore::s_shutdown_requested{false};
-
-void AOTCore::SetDiffBlockSizes(std::unordered_map<u32, u32> sizes)
-{
-  s_diff_block_sizes = std::move(sizes);
-}
 
 AOTCore::AOTCore(Core::System& system)
     : m_system(system), m_ppc_state(system.GetPPCState())
@@ -112,11 +104,23 @@ void AOTCore::Init()
                  game_id, available);
   }
 
-  // Load block sizes if available (needed for both diff mode and compare mode)
-  if (!s_diff_block_sizes.empty())
+  // Block boundary metadata for the compare/diff harness, registered by the
+  // library itself in AOT_HARNESS builds (aot_register_block_sizes).
+  const bool wants_block_sizes =
+      Config::Get(Config::MAIN_DEBUG_AOT_DIFF_MODE) || std::getenv("AOT_COMPARE");
+  if (wants_block_sizes && entry)
   {
-    m_block_sizes = s_diff_block_sizes;  // copy, not move — may be reused
-    INFO_LOG_FMT(AOT, "AOTCore: Loaded {} block boundaries", m_block_sizes.size());
+    for (u32 i = 0; i < entry->block_size_count; i++)
+      m_block_sizes[entry->block_sizes[i].addr] = entry->block_sizes[i].num_instructions;
+    for (u32 i = 0; i < entry->module_block_size_count; i++)
+    {
+      const AotModuleBlockSize& mb = entry->module_block_sizes[i];
+      m_module_block_sizes[(static_cast<u64>(mb.module_id) << 32) |
+                           (static_cast<u64>(mb.section) << 24) | mb.offset] =
+          mb.num_instructions;
+    }
+    INFO_LOG_FMT(AOT, "AOTCore: Loaded {} block boundaries (+{} module blocks) from the registry",
+                 m_block_sizes.size(), m_module_block_sizes.size());
   }
 
   // Load diff mode settings
@@ -124,7 +128,8 @@ void AOTCore::Init()
   {
     if (m_block_sizes.empty())
     {
-      ERROR_LOG_FMT(AOT, "AOTDiff: No block sizes loaded — call SetDiffBlockSizes() before boot");
+      ERROR_LOG_FMT(AOT, "AOTDiff: No block sizes — the AOT library must be built with "
+                         "AOT_HARNESS=1 (stack.sh aot-macos)");
       return;
     }
 
@@ -136,54 +141,6 @@ void AOTCore::Init()
     // Allocate full state buffer for HW state save/restore (used for MMIO blocks)
     // Initial size estimate — will grow if needed
     m_state_buffer.resize(64 * 1024 * 1024);  // 64 MB should be plenty
-  }
-
-  // AOT_COMPARE mode: load block sizes from CFG DB if not already loaded
-  if (m_block_sizes.empty() && std::getenv("AOT_COMPARE"))
-  {
-    const std::string cfg_path = Config::Get(Config::MAIN_DEBUG_AOT_CFG_DB_PATH);
-    if (!cfg_path.empty())
-    {
-      sqlite3* db = nullptr;
-      if (sqlite3_open_v2(cfg_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK)
-      {
-        sqlite3_stmt* stmt = nullptr;
-        const char* sql = "SELECT ppc_addr, num_instructions FROM blocks WHERE is_translatable = 1";
-        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK)
-        {
-          while (sqlite3_step(stmt) == SQLITE_ROW)
-          {
-            u32 addr = static_cast<u32>(sqlite3_column_int64(stmt, 0));
-            u32 num_instr = static_cast<u32>(sqlite3_column_int64(stmt, 1));
-            m_block_sizes[addr] = num_instr;
-          }
-          sqlite3_finalize(stmt);
-        }
-        // Module blocks are keyed by (module, section, offset) — resolved at
-        // runtime via the module tracker since load addresses are dynamic.
-        const char* mod_sql = "SELECT module_id, section_idx, offset, num_instructions "
-                              "FROM module_blocks WHERE is_translatable = 1";
-        if (sqlite3_prepare_v2(db, mod_sql, -1, &stmt, nullptr) == SQLITE_OK)
-        {
-          while (sqlite3_step(stmt) == SQLITE_ROW)
-          {
-            const u64 mid = static_cast<u64>(sqlite3_column_int64(stmt, 0));
-            const u64 sect = static_cast<u64>(sqlite3_column_int(stmt, 1));
-            const u64 off = static_cast<u64>(sqlite3_column_int64(stmt, 2));
-            const u32 num_instr = static_cast<u32>(sqlite3_column_int64(stmt, 3));
-            m_module_block_sizes[(mid << 32) | (sect << 24) | off] = num_instr;
-          }
-          sqlite3_finalize(stmt);
-        }
-        sqlite3_close(db);
-        INFO_LOG_FMT(AOT, "AOT_COMPARE: Loaded {} block boundaries (+{} module blocks) from {}",
-                     m_block_sizes.size(), m_module_block_sizes.size(), cfg_path);
-      }
-    }
-    else
-    {
-      WARN_LOG_FMT(AOT, "AOT_COMPARE: Set -C Dolphin.Debug.AOTCfgDbPath=<path> for block sizes");
-    }
   }
 }
 
@@ -1498,8 +1455,6 @@ void AOTCore::LogDivergence(u32, u32, const PPCSnapshot&, const PPCSnapshot&, co
 bool AOTCore::BlockAccessesMMIO(const PPCSnapshot&, u32, u32) { return false; }
 int AOTCore::RunInterpreterBlock(Interpreter&, u32, u32, bool, u32) { return 0; }
 void AOTCore::RunInterpreterDispatch(Interpreter&) {}
-std::unordered_map<u32, u32> AOTCore::s_diff_block_sizes;
 std::atomic<bool> AOTCore::s_shutdown_requested{false};
-void AOTCore::SetDiffBlockSizes(std::unordered_map<u32, u32>) {}
 
 #endif  // DOLPHIN_HAS_AOT

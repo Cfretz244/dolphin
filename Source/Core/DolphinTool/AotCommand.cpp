@@ -553,7 +553,6 @@ int AotCommand(const std::vector<std::string>& args)
       std::ofstream file(filename);
       file << "#include \"aot_runtime.h\"\n";
       file << fmt::format("#include \"{}_forward_decls.h\"\n\n", prefix);
-      file << "typedef void (*AOTBlockFunc)(AOTState*);\n\n";
       // Runtime section bases, written by the module tracker on (un)load.
       // Zero-initialized = module not resident.
       file << fmt::format("uint32_t {}_base[{}];\n\n", mp, rel.sections.size());
@@ -621,8 +620,6 @@ int AotCommand(const std::vector<std::string>& args)
     file << "#include \"aot_runtime.h\"\n";
     file << fmt::format("#include \"{}_forward_decls.h\"\n\n", prefix);
 
-    file << "typedef void (*AOTBlockFunc)(AOTState*);\n\n";
-
     // Emit the flat lookup table. Non-static: block TUs probe it directly at
     // blr/bctr sites (declared in the forward-decls header; TABLE_BASE/SIZE
     // defines live there too). Read-only after link.
@@ -648,10 +645,6 @@ int AotCommand(const std::vector<std::string>& args)
         file << "    0,\n";
     }
     file << "};\n\n";
-
-    // Single-block mode flag — defined in Dolphin's AotRuntime.cpp.
-    // Declared extern here to avoid multiple-definition errors with multi-game builds.
-    file << "extern int aot_single_block_mode;\n\n";
 
     // Emit the fast dispatch function — O(1) array lookup
     file << fmt::format("__attribute__((noinline)) void {}_dispatch(AOTState* s) {{\n", prefix);
@@ -679,7 +672,6 @@ int AotCommand(const std::vector<std::string>& args)
     {
       // Module-aware fallback: consults the runtime tracker's active-module
       // ranges before degrading to the interpreter.
-      file << "    extern void aot_module_dispatch(AOTState*);\n";
       file << "    [[clang::musttail]] return aot_module_dispatch(s);\n";
     }
     file << "}\n\n";
@@ -698,18 +690,6 @@ int AotCommand(const std::vector<std::string>& args)
     // when the game loads/unloads modules.
     if (!mods.empty())
     {
-      file << "typedef struct AotModuleSectionDesc {\n";
-      file << "    uint32_t size;\n";
-      file << "    uint32_t executable;\n";
-      file << "    const AOTBlockFunc* table;  /* NULL for non-executable sections */\n";
-      file << "    uint32_t* base_slot;        /* runtime section base, 0 = unloaded */\n";
-      file << "} AotModuleSectionDesc;\n";
-      file << "typedef struct AotModuleDesc {\n";
-      file << "    uint32_t module_id;\n";
-      file << "    uint32_t num_sections;\n";
-      file << "    const AotModuleSectionDesc* sections;\n";
-      file << "} AotModuleDesc;\n\n";
-
       for (const auto& m : mods)
       {
         const std::string mp = fmt::format("{}_m{:03d}", prefix, m.dense);
@@ -739,20 +719,60 @@ int AotCommand(const std::vector<std::string>& args)
       file << "};\n\n";
     }
 
+    // Block boundary metadata for the AOT_COMPARE/diff harness. Guarded by
+    // AOT_HARNESS so production/iOS builds carry no tables.
+    file << "#if AOT_HARNESS\n";
+    file << fmt::format("static const AotBlockSize {}_block_sizes[] = {{\n", prefix);
+    u32 block_size_count = 0;
+    for (const auto& b : cfg_blocks)
+    {
+      if (!b.is_translatable)
+        continue;
+      file << fmt::format("    {{ {:#010x}u, {}u }},\n", b.ppc_addr, b.num_instructions);
+      block_size_count++;
+    }
+    file << "};\n";
+    u32 module_block_size_count = 0;
+    for (const auto& m : mods)
+      module_block_size_count += static_cast<u32>(m.blocks.size());
+    if (module_block_size_count > 0)
+    {
+      file << fmt::format("static const AotModuleBlockSize {}_module_block_sizes[] = {{\n",
+                          prefix);
+      for (const auto& m : mods)
+      {
+        for (const auto& [key, ni] : m.blocks)
+        {
+          file << fmt::format("    {{ {}u, {}u, {:#x}u, {}u }},\n", m.module_id, key >> 24,
+                              key & 0xFFFFFFu, ni);
+        }
+      }
+      file << "};\n";
+    }
+    file << "#endif  // AOT_HARNESS\n\n";
+
     // Emit self-registration constructor — runs before main() to register
-    // this game's dispatch/lookup with Dolphin's AotRegistry.
+    // this game's dispatch/lookup with Dolphin's AotRegistry. AOT_ABI_VERSION
+    // is baked in from the aot_runtime.h this library was generated against;
+    // the registry rejects mismatches.
     file << "__attribute__((constructor))\n";
     file << fmt::format("static void aot_register_{}(void) {{\n", prefix);
-    file << "    extern void aot_register_game(const char*,"
-            " void (*)(AOTState*), AOTBlockFunc (*)(uint32_t));\n";
-    file << fmt::format("    aot_register_game(\"{}\", {}_dispatch, {}_lookup_block);\n", prefix,
-                        prefix, prefix);
+    file << fmt::format(
+        "    aot_register_game(\"{}\", {}_dispatch, {}_lookup_block, AOT_ABI_VERSION);\n",
+        prefix, prefix, prefix);
     if (!mods.empty())
     {
-      file << "    extern void aot_register_game_modules(const char*, const void*, uint32_t);\n";
       file << fmt::format("    aot_register_game_modules(\"{}\", {}_modules, {}u);\n", prefix,
                           prefix, mods.size());
     }
+    file << "#if AOT_HARNESS\n";
+    file << fmt::format("    aot_register_block_sizes(\"{}\", {}_block_sizes, {}u, {}, {}u);\n",
+                        prefix, prefix, block_size_count,
+                        module_block_size_count > 0 ?
+                            fmt::format("{}_module_block_sizes", prefix) :
+                            "(const AotModuleBlockSize*)0",
+                        module_block_size_count);
+    file << "#endif  // AOT_HARNESS\n";
     file << "}\n";
   }
 

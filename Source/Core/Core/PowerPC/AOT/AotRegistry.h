@@ -9,29 +9,13 @@
 #include <unordered_map>
 #include <vector>
 
-struct AOTState;
+// Shared C ABI types (AOTState, AOTBlockFunc, AotModuleDesc, AotBlockSize,
+// registration entry points) — the same header the generated code compiles
+// against.
+#include "Core/PowerPC/AOT/aot_runtime.h"
 
-using AOTBlockFunc = void (*)(AOTState*);
 using AOTDispatchFunc = void (*)(AOTState*);
 using AOTLookupFunc = AOTBlockFunc (*)(uint32_t);
-
-// Mirrors the AotModuleSectionDesc/AotModuleDesc structs emitted into each AOT
-// library's dispatch.c — per-REL-module dispatch tables and runtime section
-// base slots, activated by the module tracker when the game loads a module.
-struct AotModuleSectionDesc
-{
-  uint32_t size;
-  uint32_t executable;
-  const AOTBlockFunc* table;  // nullptr for non-executable sections
-  uint32_t* base_slot;        // runtime section base address, 0 = unloaded
-};
-
-struct AotModuleDesc
-{
-  uint32_t module_id;
-  uint32_t num_sections;
-  const AotModuleSectionDesc* sections;
-};
 
 struct AotGameEntry
 {
@@ -40,24 +24,36 @@ struct AotGameEntry
   AOTLookupFunc lookup_block;
   const AotModuleDesc* modules = nullptr;
   uint32_t module_count = 0;
+  // Block boundary metadata for the compare/diff harness; only present in
+  // AOT_HARNESS builds of the game library (empty otherwise).
+  const AotBlockSize* block_sizes = nullptr;
+  uint32_t block_size_count = 0;
+  const AotModuleBlockSize* module_block_sizes = nullptr;
+  uint32_t module_block_size_count = 0;
 };
 
-// Called by __attribute__((constructor)) in each AOT static library before main().
-extern "C" void aot_register_game(const char* game_id, AOTDispatchFunc dispatch,
-                                  AOTLookupFunc lookup);
-extern "C" void aot_register_game_modules(const char* game_id, const void* modules,
-                                          uint32_t count);
-
+// Multi-game registry, populated before main() by each linked AOT library's
+// __attribute__((constructor)) via the aot_register_* entry points declared
+// in aot_runtime.h. AOTCore::Init selects the entry matching the loaded game.
 class AotRegistry
 {
 public:
   static AotRegistry& Instance();
 
-  void Register(const std::string& game_id, AOTDispatchFunc dispatch, AOTLookupFunc lookup);
+  void Register(const std::string& game_id, AOTDispatchFunc dispatch, AOTLookupFunc lookup,
+                uint32_t abi_version);
   void RegisterModules(const std::string& game_id, const AotModuleDesc* modules, uint32_t count);
+  void RegisterBlockSizes(const std::string& game_id, const AotBlockSize* blocks, uint32_t count,
+                          const AotModuleBlockSize* module_blocks, uint32_t module_count);
   std::optional<AotGameEntry> Find(const std::string& game_id) const;
   std::vector<std::string> GetRegisteredGameIDs() const;
 
 private:
+  // Games whose library was built against a different AOT_ABI_VERSION are
+  // rejected at registration (the game falls back to the interpreter) — a
+  // stale .a must never run against a runtime with a different ABI.
+  bool IsRejected(const std::string& game_id) const;
+
   std::unordered_map<std::string, AotGameEntry> m_games;
+  std::vector<std::string> m_rejected;
 };

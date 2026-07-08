@@ -8,12 +8,8 @@
 // aot_runtime.h is the single source of truth for the C ABI between the AOT
 // runtime and generated game code: the translate step emits a verbatim copy of
 // it into every aot-src tree, and dolphin-tool embeds its bytes at build time
-// (StringifyHeader.cmake). It is a plain C header without extern "C" guards of
-// its own, so C++ consumers pull it in through this wrapper.
-extern "C"
-{
+// (StringifyHeader.cmake).
 #include "Core/PowerPC/AOT/aot_runtime.h"
-}
 
 #include "Core/PowerPC/PowerPC.h"
 

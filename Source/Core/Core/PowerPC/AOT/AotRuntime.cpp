@@ -623,23 +623,43 @@ void aot_mtcrf(AOTState* s, uint32_t mask, uint32_t rs_reg)
   }
 }
 
-void aot_cr_logical(AOTState* s, int crbD, int crbA, int crbB, const char* op)
+void aot_cr_logical(AOTState* s, int crbD, int crbA, int crbB, AotCrOp op)
 {
   auto& ppc_state = GetPPCState(s);
   u32 a = ppc_state.cr.GetBit(crbA);
   u32 b = ppc_state.cr.GetBit(crbB);
   u32 result;
 
-  // Decode the operation string
-  if (op[0] == '&' && op[1] == 0) result = a & b;
-  else if (op[0] == '|' && op[1] == 0) result = a | b;
-  else if (op[0] == '^' && op[1] == 0) result = a ^ b;
-  else if (op[0] == '~' && op[1] == '^') result = ~(a ^ b) & 1;  // creqv (XNOR)
-  else if (op[0] == '&' && op[1] == '~') result = a & (~b & 1);  // crandc
-  else if (op[0] == '|' && op[1] == '~') result = a | (~b & 1);  // crorc
-  else if (op[0] == '~' && op[1] == '&') result = ~(a & b) & 1;  // crnand
-  else if (op[0] == '~' && op[1] == '|') result = ~(a | b) & 1;  // crnor
-  else result = 0;
+  switch (op)
+  {
+  case AOT_CR_AND:
+    result = a & b;
+    break;
+  case AOT_CR_OR:
+    result = a | b;
+    break;
+  case AOT_CR_XOR:
+    result = a ^ b;
+    break;
+  case AOT_CR_EQV:
+    result = ~(a ^ b) & 1;
+    break;
+  case AOT_CR_ANDC:
+    result = a & (~b & 1);
+    break;
+  case AOT_CR_ORC:
+    result = a | (~b & 1);
+    break;
+  case AOT_CR_NAND:
+    result = ~(a & b) & 1;
+    break;
+  case AOT_CR_NOR:
+    result = ~(a | b) & 1;
+    break;
+  default:
+    result = 0;
+    break;
+  }
 
   ppc_state.cr.SetBit(crbD, result & 1);
 }

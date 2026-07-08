@@ -638,14 +638,14 @@ bool AOTCEmitter::EmitTable19(std::string& out, UGeckoInstruction inst, u32 pc)
   case 528: EmitBcctrx(out, inst, pc); return true;
   case 16:  EmitBclrx(out, inst, pc); return true;
   case 0:   EmitMcrf(out, inst); return true;
-  case 33:  EmitCrLogical(out, inst, "~|"); return true; // crnor
-  case 129: EmitCrLogical(out, inst, "&~"); return true; // crandc
-  case 225: EmitCrLogical(out, inst, "~&"); return true; // crnand
-  case 193: EmitCrLogical(out, inst, "^"); return true;  // crxor
-  case 257: EmitCrLogical(out, inst, "&"); return true;  // crand
-  case 289: EmitCrLogical(out, inst, "~^"); return true; // creqv (XNOR)
-  case 417: EmitCrLogical(out, inst, "|~"); return true; // crorc
-  case 449: EmitCrLogical(out, inst, "|"); return true;  // cror
+  case 33:  EmitCrLogical(out, inst, "AOT_CR_NOR"); return true;   // crnor
+  case 129: EmitCrLogical(out, inst, "AOT_CR_ANDC"); return true;  // crandc
+  case 225: EmitCrLogical(out, inst, "AOT_CR_NAND"); return true;  // crnand
+  case 193: EmitCrLogical(out, inst, "AOT_CR_XOR"); return true;   // crxor
+  case 257: EmitCrLogical(out, inst, "AOT_CR_AND"); return true;   // crand
+  case 289: EmitCrLogical(out, inst, "AOT_CR_EQV"); return true;   // creqv (XNOR)
+  case 417: EmitCrLogical(out, inst, "AOT_CR_ORC"); return true;   // crorc
+  case 449: EmitCrLogical(out, inst, "AOT_CR_OR"); return true;    // cror
   case 150: return true; // isync (no-op)
   case 50:  out += "    aot_rfi(s); return;\n"; return true; // rfi
   default:  return false;
@@ -1350,8 +1350,8 @@ void AOTCEmitter::EmitCrLogical(std::string& out, UGeckoInstruction inst, const 
   u32 crbA = I(inst.RA);  // actually crbA
   u32 crbB = I(inst.RB);  // actually crbB
 
-  // Use runtime helper for simplicity
-  out += fmt::format("    aot_cr_logical(s,{},{},{},\"{}\");\n", crbD, crbA, crbB, op);
+  // op is an AotCrOp enumerator name from aot_runtime.h
+  out += fmt::format("    aot_cr_logical(s,{},{},{},{});\n", crbD, crbA, crbB, op);
 }
 
 void AOTCEmitter::EmitMcrf(std::string& out, UGeckoInstruction inst)

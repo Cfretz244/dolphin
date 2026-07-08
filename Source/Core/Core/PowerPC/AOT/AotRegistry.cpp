@@ -3,6 +3,8 @@
 
 #include "Core/PowerPC/AOT/AotRegistry.h"
 
+#include <algorithm>
+
 #include "Common/Logging/Log.h"
 
 AotRegistry& AotRegistry::Instance()
@@ -11,9 +13,25 @@ AotRegistry& AotRegistry::Instance()
   return instance;
 }
 
-void AotRegistry::Register(const std::string& game_id, AOTDispatchFunc dispatch,
-                           AOTLookupFunc lookup)
+bool AotRegistry::IsRejected(const std::string& game_id) const
 {
+  return std::find(m_rejected.begin(), m_rejected.end(), game_id) != m_rejected.end();
+}
+
+void AotRegistry::Register(const std::string& game_id, AOTDispatchFunc dispatch,
+                           AOTLookupFunc lookup, uint32_t abi_version)
+{
+  if (abi_version != AOT_ABI_VERSION)
+  {
+    // A library generated against a different aot_runtime.h. Running it would
+    // silently corrupt state; the game runs on the interpreter instead.
+    ERROR_LOG_FMT(AOT,
+                  "AotRegistry: {} was built against AOT ABI v{}, runtime is v{} — rejecting "
+                  "library. Re-run `stack.sh translate {}` and rebuild.",
+                  game_id, abi_version, AOT_ABI_VERSION, game_id);
+    m_rejected.push_back(game_id);
+    return;
+  }
   if (m_games.contains(game_id))
   {
     // This would only happen if two libraries provide the same game ID.
@@ -29,11 +47,28 @@ void AotRegistry::Register(const std::string& game_id, AOTDispatchFunc dispatch,
 void AotRegistry::RegisterModules(const std::string& game_id, const AotModuleDesc* modules,
                                   uint32_t count)
 {
+  if (IsRejected(game_id))
+    return;
   auto& entry = m_games[game_id];
   if (entry.game_id.empty())
     entry.game_id = game_id;
   entry.modules = modules;
   entry.module_count = count;
+}
+
+void AotRegistry::RegisterBlockSizes(const std::string& game_id, const AotBlockSize* blocks,
+                                     uint32_t count, const AotModuleBlockSize* module_blocks,
+                                     uint32_t module_count)
+{
+  if (IsRejected(game_id))
+    return;
+  auto& entry = m_games[game_id];
+  if (entry.game_id.empty())
+    entry.game_id = game_id;
+  entry.block_sizes = blocks;
+  entry.block_size_count = count;
+  entry.module_block_sizes = module_blocks;
+  entry.module_block_size_count = module_count;
 }
 
 std::optional<AotGameEntry> AotRegistry::Find(const std::string& game_id) const
@@ -54,14 +89,20 @@ std::vector<std::string> AotRegistry::GetRegisteredGameIDs() const
 }
 
 extern "C" void aot_register_game(const char* game_id, AOTDispatchFunc dispatch,
-                                  AOTLookupFunc lookup)
+                                  AOTLookupFunc lookup, uint32_t abi_version)
 {
-  AotRegistry::Instance().Register(game_id, dispatch, lookup);
+  AotRegistry::Instance().Register(game_id, dispatch, lookup, abi_version);
 }
 
-extern "C" void aot_register_game_modules(const char* game_id, const void* modules,
+extern "C" void aot_register_game_modules(const char* game_id, const AotModuleDesc* modules,
                                           uint32_t count)
 {
-  AotRegistry::Instance().RegisterModules(game_id,
-                                          static_cast<const AotModuleDesc*>(modules), count);
+  AotRegistry::Instance().RegisterModules(game_id, modules, count);
+}
+
+extern "C" void aot_register_block_sizes(const char* game_id, const AotBlockSize* blocks,
+                                         uint32_t count, const AotModuleBlockSize* module_blocks,
+                                         uint32_t module_count)
+{
+  AotRegistry::Instance().RegisterBlockSizes(game_id, blocks, count, module_blocks, module_count);
 }

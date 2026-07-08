@@ -2,7 +2,25 @@
 #ifndef AOT_RUNTIME_H
 #define AOT_RUNTIME_H
 
+// C ABI between Dolphin's AOT runtime and the generated per-game code.
+//
+// This checked-in file is the single source of truth: dolphin-tool embeds its
+// bytes at build time (CMake/StringifyHeader.cmake) and `translate` emits a
+// verbatim copy into every generated aot-src tree, where the generated .c
+// files include it. The C++ runtime (AotRuntime.cpp and friends) compiles
+// against this same file via AotState.h.
+//
+// ANY change to this header is an ABI break: bump AOT_ABI_VERSION and
+// re-translate + rebuild every game's AOT library. AotRegistry rejects
+// libraries built against a different version (they fall back to the
+// interpreter instead of corrupting state).
+#define AOT_ABI_VERSION 2
+
 #include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 // AOTState is layout-compatible with Dolphin's PowerPCState.
 // At runtime, a PowerPCState* is cast to AOTState*.
@@ -38,6 +56,8 @@ typedef struct AOTState {
     uint32_t spr[1024] __attribute__((aligned(8)));
 } AOTState;
 
+typedef void (*AOTBlockFunc)(AOTState*);
+
 // ============================================================================
 // Memory access — RAM fast path inlined into blocks; slow path (MMIO, EFB,
 // locked cache, gather pipe) stays in the Dolphin runtime harness, which is the
@@ -49,6 +69,14 @@ typedef struct AOTState {
 // the interpreter raises a DSI for them (BAT miss), so the fast path must not
 // silently satisfy them from RAM.
 // ============================================================================
+
+// Effective-address layout of the mirror pair (see MMU.cpp IsRAMAddress):
+// 0x80000000+ is cached RAM, 0xC0000000+ its uncached mirror. Clearing the
+// mirror bit folds both onto the cached range; masking to the low 30 bits
+// yields the offset into the host RAM buffer.
+#define AOT_MEM_CACHED_BASE  0x80000000u
+#define AOT_MEM_UNCACHED_BIT 0x40000000u
+#define AOT_MEM_OFFSET_MASK  0x3FFFFFFFu
 
 typedef struct { uint8_t* ram; uint32_t size; } AotFastMem;
 extern AotFastMem aot_fast_mem;  // filled by aot_init_fast_mem() before any block runs
@@ -64,17 +92,17 @@ extern void aot_write_u32_slow(AOTState* s, uint32_t val, uint32_t addr);
 extern void aot_write_u64_slow(AOTState* s, uint64_t val, uint32_t addr);
 
 static inline int aot_is_ram(uint32_t addr) {
-    return ((addr & ~0x40000000u) - 0x80000000u) < aot_fast_mem.size;
+    return ((addr & ~AOT_MEM_UNCACHED_BIT) - AOT_MEM_CACHED_BASE) < aot_fast_mem.size;
 }
 
 static inline uint32_t aot_read_u8(AOTState* s, uint32_t addr) {
     if (__builtin_expect(aot_is_ram(addr), 1))
-        return aot_fast_mem.ram[addr & 0x3FFFFFFFu];
+        return aot_fast_mem.ram[addr & AOT_MEM_OFFSET_MASK];
     return aot_read_u8_slow(s, addr);
 }
 static inline uint32_t aot_read_u16(AOTState* s, uint32_t addr) {
     if (__builtin_expect(aot_is_ram(addr), 1)) {
-        uint16_t v; __builtin_memcpy(&v, aot_fast_mem.ram + (addr & 0x3FFFFFFFu), 2);
+        uint16_t v; __builtin_memcpy(&v, aot_fast_mem.ram + (addr & AOT_MEM_OFFSET_MASK), 2);
         return __builtin_bswap16(v);
     }
     return aot_read_u16_slow(s, addr);
@@ -84,21 +112,21 @@ static inline uint32_t aot_read_u16_se(AOTState* s, uint32_t addr) {  // sign-ex
 }
 static inline uint32_t aot_read_u32(AOTState* s, uint32_t addr) {
     if (__builtin_expect(aot_is_ram(addr), 1)) {
-        uint32_t v; __builtin_memcpy(&v, aot_fast_mem.ram + (addr & 0x3FFFFFFFu), 4);
+        uint32_t v; __builtin_memcpy(&v, aot_fast_mem.ram + (addr & AOT_MEM_OFFSET_MASK), 4);
         return __builtin_bswap32(v);
     }
     return aot_read_u32_slow(s, addr);
 }
 static inline uint64_t aot_read_u64(AOTState* s, uint32_t addr) {
     if (__builtin_expect(aot_is_ram(addr), 1)) {
-        uint64_t v; __builtin_memcpy(&v, aot_fast_mem.ram + (addr & 0x3FFFFFFFu), 8);
+        uint64_t v; __builtin_memcpy(&v, aot_fast_mem.ram + (addr & AOT_MEM_OFFSET_MASK), 8);
         return __builtin_bswap64(v);
     }
     return aot_read_u64_slow(s, addr);
 }
 static inline void aot_write_u8(AOTState* s, uint32_t val, uint32_t addr) {
     if (__builtin_expect(aot_is_ram(addr), 1)) {
-        aot_fast_mem.ram[addr & 0x3FFFFFFFu] = (uint8_t)val;
+        aot_fast_mem.ram[addr & AOT_MEM_OFFSET_MASK] = (uint8_t)val;
         return;
     }
     aot_write_u8_slow(s, val, addr);
@@ -106,7 +134,7 @@ static inline void aot_write_u8(AOTState* s, uint32_t val, uint32_t addr) {
 static inline void aot_write_u16(AOTState* s, uint32_t val, uint32_t addr) {
     if (__builtin_expect(aot_is_ram(addr), 1)) {
         uint16_t v = __builtin_bswap16((uint16_t)val);
-        __builtin_memcpy(aot_fast_mem.ram + (addr & 0x3FFFFFFFu), &v, 2);
+        __builtin_memcpy(aot_fast_mem.ram + (addr & AOT_MEM_OFFSET_MASK), &v, 2);
         return;
     }
     aot_write_u16_slow(s, val, addr);
@@ -114,7 +142,7 @@ static inline void aot_write_u16(AOTState* s, uint32_t val, uint32_t addr) {
 static inline void aot_write_u16_br(AOTState* s, uint32_t val, uint32_t addr) {
     if (__builtin_expect(aot_is_ram(addr), 1)) {
         uint16_t v = (uint16_t)val;  // no swap — byte-reversed store
-        __builtin_memcpy(aot_fast_mem.ram + (addr & 0x3FFFFFFFu), &v, 2);
+        __builtin_memcpy(aot_fast_mem.ram + (addr & AOT_MEM_OFFSET_MASK), &v, 2);
         return;
     }
     aot_write_u16_br_slow(s, val, addr);
@@ -122,7 +150,7 @@ static inline void aot_write_u16_br(AOTState* s, uint32_t val, uint32_t addr) {
 static inline void aot_write_u32(AOTState* s, uint32_t val, uint32_t addr) {
     if (__builtin_expect(aot_is_ram(addr), 1)) {
         uint32_t v = __builtin_bswap32(val);
-        __builtin_memcpy(aot_fast_mem.ram + (addr & 0x3FFFFFFFu), &v, 4);
+        __builtin_memcpy(aot_fast_mem.ram + (addr & AOT_MEM_OFFSET_MASK), &v, 4);
         return;
     }
     aot_write_u32_slow(s, val, addr);
@@ -130,14 +158,59 @@ static inline void aot_write_u32(AOTState* s, uint32_t val, uint32_t addr) {
 static inline void aot_write_u64(AOTState* s, uint64_t val, uint32_t addr) {
     if (__builtin_expect(aot_is_ram(addr), 1)) {
         uint64_t v = __builtin_bswap64(val);
-        __builtin_memcpy(aot_fast_mem.ram + (addr & 0x3FFFFFFFu), &v, 8);
+        __builtin_memcpy(aot_fast_mem.ram + (addr & AOT_MEM_OFFSET_MASK), &v, 8);
         return;
     }
     aot_write_u64_slow(s, val, addr);
 }
 
+// ============================================================================
+// Registration — each game's dispatch.c registers itself from an
+// __attribute__((constructor)) before main(). The abi_version argument is
+// emitted as the AOT_ABI_VERSION macro, so a library carries the version of
+// the header it was generated against; AotRegistry rejects mismatches.
+// ============================================================================
+
+// Per-REL-module dispatch tables and runtime section base slots, activated by
+// the module tracker when the game loads a module.
+typedef struct AotModuleSectionDesc {
+    uint32_t size;
+    uint32_t executable;
+    const AOTBlockFunc* table;  /* NULL for non-executable sections */
+    uint32_t* base_slot;        /* runtime section base, 0 = unloaded */
+} AotModuleSectionDesc;
+typedef struct AotModuleDesc {
+    uint32_t module_id;
+    uint32_t num_sections;
+    const AotModuleSectionDesc* sections;
+} AotModuleDesc;
+
+// Block boundary metadata for the AOT_COMPARE/diff harness. Only emitted (and
+// only registered) in AOT_HARNESS builds; production and iOS pay nothing.
+typedef struct AotBlockSize {
+    uint32_t addr;              /* DOL block start address */
+    uint32_t num_instructions;
+} AotBlockSize;
+typedef struct AotModuleBlockSize {
+    uint32_t module_id;
+    uint32_t section;
+    uint32_t offset;            /* section-relative block start */
+    uint32_t num_instructions;
+} AotModuleBlockSize;
+
+extern void aot_register_game(const char* game_id, void (*dispatch)(AOTState*),
+                              AOTBlockFunc (*lookup)(uint32_t), uint32_t abi_version);
+extern void aot_register_game_modules(const char* game_id, const AotModuleDesc* modules,
+                                      uint32_t count);
+extern void aot_register_block_sizes(const char* game_id, const AotBlockSize* blocks,
+                                     uint32_t count, const AotModuleBlockSize* module_blocks,
+                                     uint32_t module_count);
+
 // Runtime helpers (implemented in the Dolphin runtime harness)
 extern void aot_interpreter_single_step(AOTState* s);
+// Module-aware terminal dispatch — musttail-called by <ID>_dispatch when the
+// DOL fast table misses and the game has compiled REL modules.
+extern void aot_module_dispatch(AOTState* s);
 extern void aot_sc(AOTState* s);
 extern int aot_check_fpu(AOTState* s, uint32_t pc);
 extern void aot_rfi(AOTState* s);
@@ -155,7 +228,20 @@ extern void aot_msr_updated(AOTState* s);
 extern void aot_mtmsr(AOTState* s, uint32_t val);
 extern void aot_sr_updated(AOTState* s);
 extern int aot_twi(AOTState* s, uint32_t TO, int32_t a, int32_t b);
-extern void aot_cr_logical(AOTState* s, int crbD, int crbA, int crbB, const char* op);
+
+// CR-field logical ops (crand, cror, ...). Operand semantics follow the
+// interpreter's Helper_* implementations in Interpreter_SystemRegisters.cpp.
+typedef enum AotCrOp {
+    AOT_CR_AND,   /* crand:  a & b        */
+    AOT_CR_OR,    /* cror:   a | b        */
+    AOT_CR_XOR,   /* crxor:  a ^ b        */
+    AOT_CR_EQV,   /* creqv:  ~(a ^ b) & 1 */
+    AOT_CR_ANDC,  /* crandc: a & ~b       */
+    AOT_CR_ORC,   /* crorc:  a | ~b       */
+    AOT_CR_NAND,  /* crnand: ~(a & b) & 1 */
+    AOT_CR_NOR    /* crnor:  ~(a | b) & 1 */
+} AotCrOp;
+extern void aot_cr_logical(AOTState* s, int crbD, int crbA, int crbB, AotCrOp op);
 
 // Cache ops
 extern void aot_dcbz(AOTState* s, uint32_t addr);
@@ -293,6 +379,10 @@ static inline uint32_t aot_rotation_mask(int mb, int me) {
 
 // Single-block mode flag (set by compare/diff harness to stop block chaining)
 extern int aot_single_block_mode;
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif
 
 // Block edges test AOT_EDGE_STOP alongside the downcount check. In production the
 // flag can never be set, so the load is compiled out; harness builds (macOS
