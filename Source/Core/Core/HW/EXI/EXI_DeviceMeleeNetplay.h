@@ -12,10 +12,13 @@
 #include <SFML/Network.hpp>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <random>
 #include <thread>
+#include <vector>
 
 #include "Common/CommonTypes.h"
 #include "Common/Flag.h"
@@ -68,6 +71,13 @@ private:
   {
     u8 have_mask = 0;
     std::array<std::array<u8, PAD_BYTES>, 4> pads{};
+    // Testing only: when simulating latency, the remote half of this frame is
+    // withheld from the game until this instant. Delaying *visibility* rather
+    // than sleeping the receive thread is what actually models a network: a
+    // sleeping receiver also throttles throughput, so messages queue up and
+    // the measured stall grows without bound instead of settling at the true
+    // (latency - budget) figure.
+    std::chrono::steady_clock::time_point visible_at{};
   };
 
   void NetThread();
@@ -97,6 +107,23 @@ private:
   std::mutex m_send_lock;
   std::thread m_net_thread;
   Common::Flag m_running;
+
+  // --- simulated network conditions (testing only; 0 = disabled)
+  int m_fake_latency_ms = 0;
+  int m_fake_jitter_ms = 0;
+  std::mt19937 m_jitter_rng{0xC0FFEE};
+
+  // --- lockstep stall statistics (CPU thread only; no lock needed)
+  //
+  // How long the game spins on POLL waiting for the peer IS the playability
+  // metric: at 60fps the pair holds full speed only while stalls stay near
+  // zero. p99 matters more than the mean -- one late frame stalls everyone.
+  std::chrono::steady_clock::time_point m_stall_start{};
+  bool m_stall_active = false;
+  std::vector<u32> m_stall_samples_us;
+  u32 m_stall_report_tick = 0;
+  void RecordStall(u32 micros);
+  void ReportStalls();
 
   // --- CPU-thread transaction state
   u8 m_command = CMD_ID;

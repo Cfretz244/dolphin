@@ -3,7 +3,10 @@
 
 #include "Core/HW/EXI/EXI_DeviceMeleeNetplay.h"
 
+#include <algorithm>
 #include <chrono>
+#include <random>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -72,6 +75,16 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
 
   const int ports_cfg = Config::Get(Config::MAIN_MELEE_NETPLAY_LOCAL_PORTS);
   m_local_mask = ports_cfg != 0 ? static_cast<u8>(ports_cfg) : (m_is_host ? 0x01 : 0x02);
+
+  m_fake_latency_ms = std::max(0, Config::Get(Config::MAIN_MELEE_NETPLAY_FAKE_LATENCY_MS));
+  m_fake_jitter_ms = std::max(0, Config::Get(Config::MAIN_MELEE_NETPLAY_FAKE_JITTER_MS));
+  if (m_fake_latency_ms != 0 || m_fake_jitter_ms != 0)
+  {
+    WARN_LOG_FMT(EXPANSIONINTERFACE,
+                 "MeleeNetplay: SIMULATING {} ms one-way latency (+0..{} ms jitter). "
+                 "Delay window is {} frames ~= {} ms.",
+                 m_fake_latency_ms, m_fake_jitter_ms, m_delay, m_delay * 100 / 6);
+  }
 
   if (m_is_host)
   {
@@ -256,6 +269,7 @@ void CEXIMeleeNetplay::NetThread()
     u8 payload[4 * PAD_BYTES];
     if (len != 0 && !RecvAll(m_socket, payload, len, m_running))
       break;
+
     HandleMessage(type, mask, tick, payload, len);
   }
 
@@ -285,6 +299,13 @@ void CEXIMeleeNetplay::HandleMessage(u8 type, u8 mask, u32 tick, const u8* paylo
       off += PAD_BYTES;
     }
     frame.have_mask |= mask;
+    if (m_fake_latency_ms != 0 || m_fake_jitter_ms != 0)
+    {
+      int hold = m_fake_latency_ms;
+      if (m_fake_jitter_ms > 0)
+        hold += std::uniform_int_distribution<int>(0, m_fake_jitter_ms)(m_jitter_rng);
+      frame.visible_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(hold);
+    }
     break;
   }
   case MSG_CHECKSUM:
@@ -377,12 +398,58 @@ void CEXIMeleeNetplay::SendInputs(u32 tick, const u8* pads)
   SendMessageRaw(MSG_INPUTS, m_local_mask, tick, payload, len);
 }
 
+void CEXIMeleeNetplay::RecordStall(u32 micros)
+{
+  m_stall_samples_us.push_back(micros);
+  // Report once per ~10s of game time (600 ticks at 60Hz).
+  if (m_stall_samples_us.size() >= 600)
+    ReportStalls();
+}
+
+void CEXIMeleeNetplay::ReportStalls()
+{
+  if (m_stall_samples_us.empty())
+    return;
+
+  std::vector<u32> sorted = m_stall_samples_us;
+  std::sort(sorted.begin(), sorted.end());
+  const size_t n = sorted.size();
+  const auto pct = [&](double p) { return sorted[std::min(n - 1, size_t(p * n))]; };
+
+  // A frame budget at 60Hz is 16667us. Ticks whose stall exceeds that cannot
+  // have run at full speed, so this fraction is the "how much slower than
+  // realtime" figure a player would actually feel.
+  const size_t over_budget = std::count_if(sorted.begin(), sorted.end(),
+                                           [](u32 us) { return us > 16667; });
+
+  u64 sum = 0;
+  for (u32 us : sorted)
+    sum += us;
+
+  INFO_LOG_FMT(EXPANSIONINTERFACE,
+               "MeleeNetplay: stalls over {} ticks (us): mean={} p50={} p90={} p99={} max={} "
+               "| over-frame-budget={} ({:.1f}%)",
+               n, sum / n, pct(0.50), pct(0.90), pct(0.99), sorted[n - 1], over_budget,
+               100.0 * double(over_budget) / double(n));
+
+  m_stall_samples_us.clear();
+  m_stall_report_tick = m_serve_tick;
+}
+
 bool CEXIMeleeNetplay::FrameReady(u32 tick)
 {
   const u8 need = m_local_mask | m_remote_mask;
   std::lock_guard lk(m_frames_lock);
   const auto it = m_frames.find(tick);
-  return it != m_frames.end() && (it->second.have_mask & need) == need;
+  if (it == m_frames.end() || (it->second.have_mask & need) != need)
+    return false;
+  // Simulated latency: the bytes are here, but pretend they are still in flight.
+  if (it->second.visible_at.time_since_epoch().count() != 0 &&
+      std::chrono::steady_clock::now() < it->second.visible_at)
+  {
+    return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +470,25 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
   case CMD_POLL:
   {
     if (FrameReady(m_serve_tick))
+    {
+      if (m_stall_active)
+      {
+        const auto waited = std::chrono::steady_clock::now() - m_stall_start;
+        RecordStall(static_cast<u32>(
+            std::chrono::duration_cast<std::chrono::microseconds>(waited).count()));
+        m_stall_active = false;
+      }
+      else
+      {
+        RecordStall(0);  // peer's inputs were already here: zero stall
+      }
       return 1;
+    }
+    if (!m_stall_active)
+    {
+      m_stall_start = std::chrono::steady_clock::now();
+      m_stall_active = true;
+    }
     // Be polite to the host CPU while the game spins on us.
     Common::SleepCurrentThread(1);
     return 0;

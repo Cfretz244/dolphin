@@ -172,6 +172,12 @@ const Info<int> MAIN_MELEE_NETPLAY_PORT{{System::Main, "MeleeNetplay", "Port"}, 
 const Info<int> MAIN_MELEE_NETPLAY_DELAY{{System::Main, "MeleeNetplay", "Delay"}, 2};
 const Info<u32> MAIN_MELEE_NETPLAY_SEED{{System::Main, "MeleeNetplay", "Seed"}, 0};
 const Info<int> MAIN_MELEE_NETPLAY_LOCAL_PORTS{{System::Main, "MeleeNetplay", "LocalPorts"}, 0};
+// Testing knobs: hold inbound input messages to simulate one-way network
+// latency (and jitter on top), so the delay-window headroom can be measured on
+// loopback without a second device or root-level traffic shaping.
+const Info<int> MAIN_MELEE_NETPLAY_FAKE_LATENCY_MS{
+    {System::Main, "MeleeNetplay", "FakeLatencyMs"}, 0};
+const Info<int> MAIN_MELEE_NETPLAY_FAKE_JITTER_MS{{System::Main, "MeleeNetplay", "FakeJitterMs"}, 0};
 
 const Info<SerialInterface::SIDevices>& GetInfoForSIDevice(int channel)
 {
