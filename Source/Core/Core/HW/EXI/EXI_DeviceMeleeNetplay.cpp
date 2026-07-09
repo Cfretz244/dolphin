@@ -365,8 +365,15 @@ void CEXIMeleeNetplay::SendInputs(u32 tick, const u8* pads)
     }
     frame.have_mask |= m_local_mask;
   }
-  DEBUG_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: send tick={} localmask={:#x}", tick,
-                m_local_mask);
+  // Log non-neutral input. A peer whose controller never reaches the exchange
+  // (wrong port mapping, dead input pipe) otherwise looks identical to a peer
+  // whose player is simply holding still.
+  if (len >= 4 && (pads[0] | pads[1] | pads[2] | pads[3]) != 0)
+  {
+    const u32 btn = (u32(pads[0]) << 24) | (u32(pads[1]) << 16) | (u32(pads[2]) << 8) | u32(pads[3]);
+    INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: input tick={} localmask={:#x} button={:#06x}",
+                 tick, m_local_mask, btn);
+  }
   SendMessageRaw(MSG_INPUTS, m_local_mask, tick, payload, len);
 }
 
