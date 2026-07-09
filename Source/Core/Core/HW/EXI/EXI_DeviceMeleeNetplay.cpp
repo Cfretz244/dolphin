@@ -532,7 +532,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       {
         RecordStall(0);  // peer's inputs were already here: zero stall
       }
-      return 1;
+      return u32(POLL_READY) << 24;
     }
     if (!m_stall_active)
     {
@@ -541,7 +541,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
     }
     // Be polite to the host CPU while the game spins on us.
     Common::SleepCurrentThread(1);
-    return 0;
+    return u32(POLL_WAIT) << 24;
   }
   default:
     return 0;
