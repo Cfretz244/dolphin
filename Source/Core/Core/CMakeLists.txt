@@ -213,6 +213,8 @@ add_library(core
   HW/EXI/EXI_DeviceGecko.h
   HW/EXI/EXI_DeviceIPL.cpp
   HW/EXI/EXI_DeviceIPL.h
+  HW/EXI/EXI_DeviceMeleeNetplay.cpp
+  HW/EXI/EXI_DeviceMeleeNetplay.h
   HW/EXI/EXI_DeviceMemoryCard.cpp
   HW/EXI/EXI_DeviceMemoryCard.h
   HW/EXI/EXI_DeviceModem.cpp

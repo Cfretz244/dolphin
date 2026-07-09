@@ -107,6 +107,14 @@ extern const Info<std::string> MAIN_BBA_BUILTIN_DNS;
 extern const Info<std::string> MAIN_BBA_BUILTIN_IP;
 extern const Info<std::string> MAIN_BBA_TAPSERVER_DESTINATION;
 extern const Info<std::string> MAIN_MODEM_TAPSERVER_DESTINATION;
+
+// Main.MeleeNetplay (engine-level Melee lockstep netplay; EXI_DeviceMeleeNetplay)
+extern const Info<bool> MAIN_MELEE_NETPLAY_IS_HOST;
+extern const Info<std::string> MAIN_MELEE_NETPLAY_REMOTE_HOST;
+extern const Info<int> MAIN_MELEE_NETPLAY_PORT;
+extern const Info<int> MAIN_MELEE_NETPLAY_DELAY;
+extern const Info<u32> MAIN_MELEE_NETPLAY_SEED;
+extern const Info<int> MAIN_MELEE_NETPLAY_LOCAL_PORTS;
 const Info<SerialInterface::SIDevices>& GetInfoForSIDevice(int channel);
 const Info<bool>& GetInfoForAdapterRumble(int channel);
 const Info<bool>& GetInfoForSimulateKonga(int channel);

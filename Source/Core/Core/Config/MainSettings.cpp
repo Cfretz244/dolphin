@@ -165,6 +165,14 @@ const Info<std::string> MAIN_MODEM_TAPSERVER_DESTINATION{
     {System::Main, "Core", "MODEM_TAPSERVER_DESTINATION"}, "/tmp/dolphin-modem-tap"};
 const Info<std::string> MAIN_BBA_BUILTIN_IP{{System::Main, "Core", "BBA_BUILTIN_IP"}, ""};
 
+const Info<bool> MAIN_MELEE_NETPLAY_IS_HOST{{System::Main, "MeleeNetplay", "IsHost"}, false};
+const Info<std::string> MAIN_MELEE_NETPLAY_REMOTE_HOST{{System::Main, "MeleeNetplay", "RemoteHost"},
+                                                       "127.0.0.1"};
+const Info<int> MAIN_MELEE_NETPLAY_PORT{{System::Main, "MeleeNetplay", "Port"}, 51441};
+const Info<int> MAIN_MELEE_NETPLAY_DELAY{{System::Main, "MeleeNetplay", "Delay"}, 2};
+const Info<u32> MAIN_MELEE_NETPLAY_SEED{{System::Main, "MeleeNetplay", "Seed"}, 0};
+const Info<int> MAIN_MELEE_NETPLAY_LOCAL_PORTS{{System::Main, "MeleeNetplay", "LocalPorts"}, 0};
+
 const Info<SerialInterface::SIDevices>& GetInfoForSIDevice(int channel)
 {
   static const std::array<const Info<SerialInterface::SIDevices>, 4> infos{
