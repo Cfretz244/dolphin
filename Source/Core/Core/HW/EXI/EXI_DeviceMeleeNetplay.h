@@ -113,15 +113,17 @@ private:
   int m_fake_jitter_ms = 0;
   std::mt19937 m_jitter_rng{0xC0FFEE};
 
-  // --- lockstep stall statistics (CPU thread only; no lock needed)
+  // --- lockstep pacing statistics (CPU thread only; no lock needed)
   //
-  // How long the game spins on POLL waiting for the peer IS the playability
-  // metric: at 60fps the pair holds full speed only while stalls stay near
-  // zero. p99 matters more than the mean -- one late frame stalls everyone.
+  // The playability metric is the ACHIEVED TICK RATE, not the POLL stall. Even
+  // on loopback a peer spends most of each frame waiting for the other peer's
+  // next (throttled, 60Hz) frame, so a large stall is normal and says nothing
+  // about speed. Stall percentiles remain useful for seeing jitter.
   std::chrono::steady_clock::time_point m_stall_start{};
   bool m_stall_active = false;
   std::vector<u32> m_stall_samples_us;
-  u32 m_stall_report_tick = 0;
+  std::chrono::steady_clock::time_point m_rate_window_start{};
+  u32 m_rate_window_tick = 0;
   void RecordStall(u32 micros);
   void ReportStalls();
 

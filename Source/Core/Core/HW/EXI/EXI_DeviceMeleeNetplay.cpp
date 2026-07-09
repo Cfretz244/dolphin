@@ -411,29 +411,40 @@ void CEXIMeleeNetplay::ReportStalls()
   if (m_stall_samples_us.empty())
     return;
 
+  const auto now = std::chrono::steady_clock::now();
+  if (m_rate_window_start.time_since_epoch().count() == 0)
+  {
+    // First window: no elapsed baseline yet, so only arm the counters.
+    m_rate_window_start = now;
+    m_rate_window_tick = m_serve_tick;
+    m_stall_samples_us.clear();
+    return;
+  }
+
   std::vector<u32> sorted = m_stall_samples_us;
   std::sort(sorted.begin(), sorted.end());
   const size_t n = sorted.size();
   const auto pct = [&](double p) { return sorted[std::min(n - 1, size_t(p * n))]; };
 
-  // A frame budget at 60Hz is 16667us. Ticks whose stall exceeds that cannot
-  // have run at full speed, so this fraction is the "how much slower than
-  // realtime" figure a player would actually feel.
-  const size_t over_budget = std::count_if(sorted.begin(), sorted.end(),
-                                           [](u32 us) { return us > 16667; });
-
-  u64 sum = 0;
-  for (u32 us : sorted)
-    sum += us;
+  // THE playability number: ticks actually advanced per wall-clock second.
+  // Lockstep never desyncs under latency, it just runs the whole session
+  // slower -- so achieved rate against 60Hz is exactly what a player feels.
+  //
+  // Note the POLL stall is NOT that number. Even at zero latency a peer waits
+  // most of each frame for the other peer's next throttled frame, so stalls
+  // near a frame budget are normal at full speed.
+  const double elapsed_s =
+      std::chrono::duration_cast<std::chrono::duration<double>>(now - m_rate_window_start).count();
+  const double rate = elapsed_s > 0.0 ? double(m_serve_tick - m_rate_window_tick) / elapsed_s : 0.0;
 
   INFO_LOG_FMT(EXPANSIONINTERFACE,
-               "MeleeNetplay: stalls over {} ticks (us): mean={} p50={} p90={} p99={} max={} "
-               "| over-frame-budget={} ({:.1f}%)",
-               n, sum / n, pct(0.50), pct(0.90), pct(0.99), sorted[n - 1], over_budget,
-               100.0 * double(over_budget) / double(n));
+               "MeleeNetplay: rate={:.1f} ticks/s ({:.0f}% of 60Hz) | stall us over {} ticks: "
+               "p50={} p90={} p99={} max={}",
+               rate, 100.0 * rate / 60.0, n, pct(0.50), pct(0.90), pct(0.99), sorted[n - 1]);
 
   m_stall_samples_us.clear();
-  m_stall_report_tick = m_serve_tick;
+  m_rate_window_start = now;
+  m_rate_window_tick = m_serve_tick;
 }
 
 bool CEXIMeleeNetplay::FrameReady(u32 tick)
