@@ -178,6 +178,13 @@ const Info<int> MAIN_MELEE_NETPLAY_LOCAL_PORTS{{System::Main, "MeleeNetplay", "L
 const Info<int> MAIN_MELEE_NETPLAY_FAKE_LATENCY_MS{
     {System::Main, "MeleeNetplay", "FakeLatencyMs"}, 0};
 const Info<int> MAIN_MELEE_NETPLAY_FAKE_JITTER_MS{{System::Main, "MeleeNetplay", "FakeJitterMs"}, 0};
+// Rare-large-spike model. Uniform jitter is the wrong shape for AWDL/Wi-Fi,
+// which mostly delivers fast and occasionally stalls hard (duty cycling,
+// channel contention). Lockstep stalls on the worst frame, not the mean, so
+// the spike rate and size are what decide playability.
+const Info<int> MAIN_MELEE_NETPLAY_FAKE_SPIKE_PCT{{System::Main, "MeleeNetplay", "FakeSpikePct"},
+                                                  0};
+const Info<int> MAIN_MELEE_NETPLAY_FAKE_SPIKE_MS{{System::Main, "MeleeNetplay", "FakeSpikeMs"}, 0};
 
 const Info<SerialInterface::SIDevices>& GetInfoForSIDevice(int channel)
 {

@@ -111,7 +111,13 @@ private:
   // --- simulated network conditions (testing only; 0 = disabled)
   int m_fake_latency_ms = 0;
   int m_fake_jitter_ms = 0;
+  int m_fake_spike_pct = 0;
+  int m_fake_spike_ms = 0;
   std::mt19937 m_jitter_rng{0xC0FFEE};
+  bool SimulatingNetwork() const
+  {
+    return m_fake_latency_ms != 0 || m_fake_jitter_ms != 0 || m_fake_spike_pct != 0;
+  }
 
   // --- lockstep pacing statistics (CPU thread only; no lock needed)
   //

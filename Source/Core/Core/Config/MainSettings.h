@@ -117,6 +117,8 @@ extern const Info<u32> MAIN_MELEE_NETPLAY_SEED;
 extern const Info<int> MAIN_MELEE_NETPLAY_LOCAL_PORTS;
 extern const Info<int> MAIN_MELEE_NETPLAY_FAKE_LATENCY_MS;
 extern const Info<int> MAIN_MELEE_NETPLAY_FAKE_JITTER_MS;
+extern const Info<int> MAIN_MELEE_NETPLAY_FAKE_SPIKE_PCT;
+extern const Info<int> MAIN_MELEE_NETPLAY_FAKE_SPIKE_MS;
 const Info<SerialInterface::SIDevices>& GetInfoForSIDevice(int channel);
 const Info<bool>& GetInfoForAdapterRumble(int channel);
 const Info<bool>& GetInfoForSimulateKonga(int channel);

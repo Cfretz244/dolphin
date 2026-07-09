@@ -78,12 +78,15 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
 
   m_fake_latency_ms = std::max(0, Config::Get(Config::MAIN_MELEE_NETPLAY_FAKE_LATENCY_MS));
   m_fake_jitter_ms = std::max(0, Config::Get(Config::MAIN_MELEE_NETPLAY_FAKE_JITTER_MS));
-  if (m_fake_latency_ms != 0 || m_fake_jitter_ms != 0)
+  m_fake_spike_pct = std::clamp(Config::Get(Config::MAIN_MELEE_NETPLAY_FAKE_SPIKE_PCT), 0, 100);
+  m_fake_spike_ms = std::max(0, Config::Get(Config::MAIN_MELEE_NETPLAY_FAKE_SPIKE_MS));
+  if (SimulatingNetwork())
   {
     WARN_LOG_FMT(EXPANSIONINTERFACE,
-                 "MeleeNetplay: SIMULATING {} ms one-way latency (+0..{} ms jitter). "
-                 "Delay window is {} frames ~= {} ms.",
-                 m_fake_latency_ms, m_fake_jitter_ms, m_delay, m_delay * 100 / 6);
+                 "MeleeNetplay: SIMULATING {} ms one-way latency (+0..{} ms jitter, "
+                 "{}% of frames +{} ms spike). Delay window is {} frames ~= {} ms.",
+                 m_fake_latency_ms, m_fake_jitter_ms, m_fake_spike_pct, m_fake_spike_ms, m_delay,
+                 m_delay * 100 / 6);
   }
 
   if (m_is_host)
@@ -299,11 +302,16 @@ void CEXIMeleeNetplay::HandleMessage(u8 type, u8 mask, u32 tick, const u8* paylo
       off += PAD_BYTES;
     }
     frame.have_mask |= mask;
-    if (m_fake_latency_ms != 0 || m_fake_jitter_ms != 0)
+    if (SimulatingNetwork())
     {
       int hold = m_fake_latency_ms;
       if (m_fake_jitter_ms > 0)
         hold += std::uniform_int_distribution<int>(0, m_fake_jitter_ms)(m_jitter_rng);
+      if (m_fake_spike_pct > 0 &&
+          std::uniform_int_distribution<int>(1, 100)(m_jitter_rng) <= m_fake_spike_pct)
+      {
+        hold += m_fake_spike_ms;
+      }
       frame.visible_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(hold);
     }
     break;
