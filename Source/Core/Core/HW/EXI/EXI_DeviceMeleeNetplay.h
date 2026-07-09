@@ -45,22 +45,22 @@ private:
   {
     CMD_ID = 0x00,         // EXIGetID probe; ImmRead returns DEVICE_ID
     CMD_HANDSHAKE = 0x01,  // then DMARead 32B handshake blob (blocks for session)
-    CMD_SEND = 0x02,       // then DMAWrite 64B {u32 tick, PADStatus[4], pad}
+    CMD_SEND = 0x02,       // then DMAWrite 288B {u32 tick, HSD_PadStatus[4], pad}
     CMD_POLL = 0x03,       // ImmRead 4B: 1 if serve-tick frame ready
-    CMD_RECV = 0x04,       // then DMARead 64B {PADStatus[4], pad}; advances serve tick
+    CMD_RECV = 0x04,       // then DMARead 288B {HSD_PadStatus[4], pad}; advances serve tick
     CMD_CHECKSUM = 0x05,   // then DMAWrite 32B {u32 tick, u32 crc32, pad}
   };
 
   static constexpr u32 DEVICE_ID = 0x4D4E4554;  // 'MNET'; unknown to CARD -> "no card"
-  static constexpr u8 PROTO_VERSION = 1;
-  static constexpr u32 PAD_BYTES = 12;  // sizeof(SDK PADStatus)
+  static constexpr u8 PROTO_VERSION = 2;
+  static constexpr u32 PAD_BYTES = 0x44;  // sizeof(HSD_PadStatus): full post-transform entry
 
   // Wire message types
   enum : u8
   {
     MSG_HELLO = 0x10,   // host->client {u8 ver, u8 host_mask, u8 delay, u8 pad, u32be seed}
     MSG_HELLO_ACK = 0x11,  // client->host {u8 ver, u8 client_mask}
-    MSG_INPUTS = 0x01,     // {tick} payload: 12B per set mask bit, ascending port order
+    MSG_INPUTS = 0x01,     // {tick} payload: 68B per set mask bit, ascending port order
     MSG_CHECKSUM = 0x02,   // {tick} payload: 4B crc
   };
 
@@ -73,7 +73,7 @@ private:
   void NetThread();
   bool EstablishSession(sf::TcpSocket& sock);
   void HandleMessage(u8 type, u8 mask, u32 tick, const u8* payload, u32 len);
-  void SendInputs(u32 tick, const u8* pads_48b);
+  void SendInputs(u32 tick, const u8* pads);
   void SendMessageRaw(u8 type, u8 mask, u32 tick, const u8* payload, u16 len);
   bool FrameReady(u32 tick);
 

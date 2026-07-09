@@ -248,12 +248,12 @@ void CEXIMeleeNetplay::NetThread()
     const u8 mask = header[1];
     const u16 len = static_cast<u16>((header[2] << 8) | header[3]);
     const u32 tick = ReadBE32(&header[4]);
-    if (len > 64)
+    if (len > 4 * PAD_BYTES)
     {
       ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: oversized message ({} bytes)", len);
       break;
     }
-    u8 payload[64];
+    u8 payload[4 * PAD_BYTES];
     if (len != 0 && !RecvAll(m_socket, payload, len, m_running))
       break;
     HandleMessage(type, mask, tick, payload, len);
@@ -316,7 +316,7 @@ void CEXIMeleeNetplay::HandleMessage(u8 type, u8 mask, u32 tick, const u8* paylo
 
 void CEXIMeleeNetplay::SendMessageRaw(u8 type, u8 mask, u32 tick, const u8* payload, u16 len)
 {
-  u8 buf[8 + 64];
+  u8 buf[8 + 4 * PAD_BYTES];
   buf[0] = type;
   buf[1] = mask;
   buf[2] = u8(len >> 8);
@@ -332,7 +332,7 @@ void CEXIMeleeNetplay::SendMessageRaw(u8 type, u8 mask, u32 tick, const u8* payl
   m_socket.setBlocking(false);
 }
 
-void CEXIMeleeNetplay::SendInputs(u32 tick, const u8* pads_48b)
+void CEXIMeleeNetplay::SendInputs(u32 tick, const u8* pads)
 {
   // Store our own ports locally (loopback) and forward them to the peer.
   u8 payload[4 * PAD_BYTES];
@@ -344,8 +344,8 @@ void CEXIMeleeNetplay::SendInputs(u32 tick, const u8* pads_48b)
     {
       if ((m_local_mask & (1 << port)) == 0)
         continue;
-      std::memcpy(frame.pads[port].data(), pads_48b + port * PAD_BYTES, PAD_BYTES);
-      std::memcpy(payload + len, pads_48b + port * PAD_BYTES, PAD_BYTES);
+      std::memcpy(frame.pads[port].data(), pads + port * PAD_BYTES, PAD_BYTES);
+      std::memcpy(payload + len, pads + port * PAD_BYTES, PAD_BYTES);
       len += PAD_BYTES;
     }
     frame.have_mask |= m_local_mask;
@@ -392,7 +392,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
 void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
 {
   auto& memory = m_system.GetMemory();
-  u8 buf[64];
+  u8 buf[320];
   if (size > sizeof(buf))
   {
     ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: oversized DMAWrite ({} bytes)", size);
@@ -458,7 +458,7 @@ void CEXIMeleeNetplay::DMARead(u32 address, u32 size)
   }
   case CMD_RECV:
   {
-    u8 pads[64] = {};
+    u8 pads[320] = {};
     {
       std::lock_guard lk(m_frames_lock);
       const auto it = m_frames.find(m_serve_tick);
