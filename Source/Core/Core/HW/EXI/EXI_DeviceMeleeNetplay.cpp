@@ -588,6 +588,9 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
     {
       const u32 tick = ReadBE32(buf);
       const u32 crc = ReadBE32(buf + 4);
+      m_game_crc_prev = m_game_crc_seen ? m_game_crc_last : crc;
+      m_game_crc_last = crc;
+      m_game_crc_seen = true;
       for (const auto& watch : m_rollback.Watches())
       {
         INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: watch {}={:08x} tick={}", watch.label,
@@ -631,6 +634,11 @@ void CEXIMeleeNetplay::MaybeTorture()
   if (m_torture == 2 && m_serve_tick >= m_torture_depth &&
       m_serve_tick % m_torture_interval == 0)
   {
+    // Fights only: replaying menu/movie scenes wedges their disc-streaming
+    // state machines (observed: opening movie frozen at chapter 0). Matches
+    // are where rollback matters and where replay is sound.
+    if (!MatchStateEvolving())
+      return;
     const u32 target = m_serve_tick - m_torture_depth;
     // Never roll back across a scene transition — scene loads happen outside
     // the replayable tick body (see MeleeRollbackState::SameScene). Real

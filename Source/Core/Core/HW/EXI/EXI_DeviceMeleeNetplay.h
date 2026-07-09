@@ -151,6 +151,17 @@ private:
   u32 m_torture_interval = 120;
   u32 m_torture_depth = 4;
   u32 m_pending_replay = 0;  // ticks the game must replay; announced via POLL
+  // Match-activity gate: the game's periodic state checksums (CMD_CHECKSUM)
+  // change only while a fight is simulating. Replay is only valid there —
+  // menus/movies stream from disc (DVD/THP state is real-time, outside the
+  // restorable region set) and wedge when re-run.
+  u32 m_game_crc_last = 0;
+  u32 m_game_crc_prev = 0;
+  bool m_game_crc_seen = false;
+  bool MatchStateEvolving() const
+  {
+    return m_game_crc_seen && m_game_crc_last != m_game_crc_prev;
+  }
   void MaybeTorture();
 
   // --- CPU-thread transaction state
