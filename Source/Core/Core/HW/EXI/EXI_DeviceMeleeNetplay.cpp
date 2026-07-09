@@ -303,6 +303,14 @@ void CEXIMeleeNetplay::HandleMessage(u8 type, u8 mask, u32 tick, const u8* paylo
                       tick, local->second, remote_crc);
         Core::DisplayMessage(fmt::format("MeleeNetplay: DESYNC at tick {}", tick), 20000);
       }
+      else
+      {
+        // A matching checksum only demonstrates determinism if the state it
+        // hashes is actually changing: a constant crc means both peers are
+        // parked on a static screen, not that the cores agree under load.
+        INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: checksum ok tick={} crc={:08x}", tick,
+                     remote_crc);
+      }
       m_local_crcs.erase(m_local_crcs.begin(), m_local_crcs.upper_bound(tick));
       m_remote_crcs.erase(m_remote_crcs.begin(), m_remote_crcs.upper_bound(tick));
     }
@@ -334,22 +342,31 @@ void CEXIMeleeNetplay::SendMessageRaw(u8 type, u8 mask, u32 tick, const u8* payl
 
 void CEXIMeleeNetplay::SendInputs(u32 tick, const u8* pads)
 {
-  // Store our own ports locally (loopback) and forward them to the peer.
+  // Each console's player uses its own physical controller port 1 (index 0),
+  // but owns whichever netplay port the handshake assigned (client owns port
+  // 1). So local physical pads map in ascending order onto the owned netplay
+  // ports: physical 0 -> lowest owned port, and so on. For the host (owns port
+  // 0) this is the identity mapping.
   u8 payload[4 * PAD_BYTES];
   u16 len = 0;
   {
     std::lock_guard lk(m_frames_lock);
     Frame& frame = m_frames[tick];
+    u32 physical = 0;
     for (u32 port = 0; port < 4; port++)
     {
       if ((m_local_mask & (1 << port)) == 0)
         continue;
-      std::memcpy(frame.pads[port].data(), pads + port * PAD_BYTES, PAD_BYTES);
-      std::memcpy(payload + len, pads + port * PAD_BYTES, PAD_BYTES);
+      const u8* src = pads + physical * PAD_BYTES;
+      std::memcpy(frame.pads[port].data(), src, PAD_BYTES);
+      std::memcpy(payload + len, src, PAD_BYTES);
       len += PAD_BYTES;
+      physical++;
     }
     frame.have_mask |= m_local_mask;
   }
+  DEBUG_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: send tick={} localmask={:#x}", tick,
+                m_local_mask);
   SendMessageRaw(MSG_INPUTS, m_local_mask, tick, payload, len);
 }
 
