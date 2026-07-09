@@ -185,6 +185,18 @@ const Info<int> MAIN_MELEE_NETPLAY_FAKE_JITTER_MS{{System::Main, "MeleeNetplay",
 const Info<int> MAIN_MELEE_NETPLAY_FAKE_SPIKE_PCT{{System::Main, "MeleeNetplay", "FakeSpikePct"},
                                                   0};
 const Info<int> MAIN_MELEE_NETPLAY_FAKE_SPIKE_MS{{System::Main, "MeleeNetplay", "FakeSpikeMs"}, 0};
+// Rollback (P4). RegionTablePath points at the per-DOL-build snapshot region
+// table from gen-rollback-regions.py; empty disables the snapshot machinery.
+// Torture: 0=off, 1=capture+restore same tick every tick (R0a smoke: must be
+// a perfect no-op), 2=every TortureInterval ticks restore TortureDepth ticks
+// back and direct a replay (R0: restore+replay fidelity vs the peer oracle).
+const Info<std::string> MAIN_MELEE_NETPLAY_REGION_TABLE{
+    {System::Main, "MeleeNetplay", "RegionTablePath"}, ""};
+const Info<int> MAIN_MELEE_NETPLAY_TORTURE{{System::Main, "MeleeNetplay", "Torture"}, 0};
+const Info<int> MAIN_MELEE_NETPLAY_TORTURE_INTERVAL{
+    {System::Main, "MeleeNetplay", "TortureInterval"}, 120};
+const Info<int> MAIN_MELEE_NETPLAY_TORTURE_DEPTH{{System::Main, "MeleeNetplay", "TortureDepth"},
+                                                 4};
 
 const Info<SerialInterface::SIDevices>& GetInfoForSIDevice(int channel)
 {

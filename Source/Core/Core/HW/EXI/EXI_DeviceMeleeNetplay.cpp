@@ -96,6 +96,29 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
       m_seed = Common::Random::GenerateValue<u32>();
   }
 
+  const std::string region_table = Config::Get(Config::MAIN_MELEE_NETPLAY_REGION_TABLE);
+  if (!region_table.empty())
+  {
+    std::string err;
+    if (!m_rollback.LoadRegionTable(region_table, &err))
+    {
+      // A misloaded table must be loud: silently running without snapshots
+      // would make a torture soak look like a flawless pass.
+      ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeRollback: {}", err);
+    }
+    m_torture = Config::Get(Config::MAIN_MELEE_NETPLAY_TORTURE);
+    m_torture_interval =
+        static_cast<u32>(std::max(1, Config::Get(Config::MAIN_MELEE_NETPLAY_TORTURE_INTERVAL)));
+    m_torture_depth =
+        static_cast<u32>(std::max(1, Config::Get(Config::MAIN_MELEE_NETPLAY_TORTURE_DEPTH)));
+    if (m_torture != 0)
+    {
+      WARN_LOG_FMT(EXPANSIONINTERFACE,
+                   "MeleeRollback: TORTURE mode {} (interval {} depth {})", m_torture,
+                   m_torture_interval, m_torture_depth);
+    }
+  }
+
   m_running.Set();
   m_net_thread = std::thread(&CEXIMeleeNetplay::NetThread, this);
 }
@@ -488,6 +511,14 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
     return DEVICE_ID;
   case CMD_POLL:
   {
+    // Replay directive outranks readiness: memory has already been restored,
+    // so the game must consume the replayed ticks before anything else.
+    if (m_pending_replay != 0)
+    {
+      const u32 k = m_pending_replay;
+      m_pending_replay = 0;
+      return (u32(POLL_REPLAY) << 24) | k;
+    }
     if (FrameReady(m_serve_tick))
     {
       if (m_stall_active)
@@ -532,7 +563,25 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
   {
   case CMD_SEND:
     if (size >= 4 + 4 * PAD_BYTES)
+    {
       SendInputs(ReadBE32(buf), buf + 4);
+      // Snapshot point: the game is parked in this transaction at the top of
+      // tick m_serve_tick, before that tick's inputs are injected or its
+      // logic runs — ring[T] is the pre-state of tick T.
+      if (m_rollback.IsLoaded())
+      {
+        m_rollback.Capture(m_system, m_serve_tick);
+        if (m_rollback.TotalCaptures() % 600 == 0)
+        {
+          INFO_LOG_FMT(EXPANSIONINTERFACE,
+                       "MeleeRollback: {} captures, {:.2f} MB each, last {} us",
+                       m_rollback.TotalCaptures(),
+                       m_rollback.SnapshotBytes() / (1024.0 * 1024.0),
+                       m_rollback.LastCaptureMicros());
+        }
+        MaybeTorture();
+      }
+    }
     break;
   case CMD_CHECKSUM:
     if (size >= 8)
@@ -553,6 +602,44 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
     break;
   default:
     break;
+  }
+}
+
+void CEXIMeleeNetplay::MaybeTorture()
+{
+  // R0a (mode 1): restore the snapshot captured microseconds ago for THIS
+  // tick. The write-back is byte-identical by construction, so any behavior
+  // change (crash, checksum split, slowdown) is a bug in the copy plan or
+  // the copy machinery itself — this validates addressing and measures cost
+  // before the game-side replay path exists.
+  if (m_torture == 1)
+  {
+    if (!m_rollback.Restore(m_system, m_serve_tick))
+      ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeRollback: R0a restore failed at tick {}",
+                    m_serve_tick);
+    return;
+  }
+  // R0 (mode 2): every TortureInterval ticks, restore the pre-state of
+  // (T - depth) and direct the game to replay those ticks from recorded
+  // inputs. A perfect replay reconverges exactly; any missed region shows up
+  // as a cross-peer checksum DESYNC within one checksum interval.
+  if (m_torture == 2 && m_serve_tick >= m_torture_depth &&
+      m_serve_tick % m_torture_interval == 0)
+  {
+    const u32 target = m_serve_tick - m_torture_depth;
+    if (m_rollback.Restore(m_system, target))
+    {
+      INFO_LOG_FMT(EXPANSIONINTERFACE,
+                   "MeleeRollback: torture restore tick {} -> {} (replay {})", m_serve_tick,
+                   target, m_torture_depth);
+      m_serve_tick = target;
+      m_pending_replay = m_torture_depth;
+    }
+    else
+    {
+      ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeRollback: torture restore failed at tick {}",
+                    m_serve_tick);
+    }
   }
 }
 
@@ -594,8 +681,13 @@ void CEXIMeleeNetplay::DMARead(u32 address, u32 size)
       {
         for (u32 port = 0; port < 4; port++)
           std::memcpy(pads + port * PAD_BYTES, it->second.pads[port].data(), PAD_BYTES);
-        // Prune everything up to and including this tick; lockstep never re-reads.
-        m_frames.erase(m_frames.begin(), m_frames.upper_bound(m_serve_tick));
+        // Keep a rollback window of history — replays re-read these ticks.
+        // (Pure lockstep pruned everything up to the serve tick here.)
+        if (m_serve_tick > MeleeRollbackState::RING_SIZE)
+        {
+          m_frames.erase(m_frames.begin(),
+                         m_frames.upper_bound(m_serve_tick - MeleeRollbackState::RING_SIZE));
+        }
       }
       else
       {

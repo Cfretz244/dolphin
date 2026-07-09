@@ -23,6 +23,7 @@
 #include "Common/CommonTypes.h"
 #include "Common/Flag.h"
 #include "Core/HW/EXI/EXI_Device.h"
+#include "Core/HW/EXI/MeleeRollbackState.h"
 
 namespace ExpansionInterface
 {
@@ -55,8 +56,17 @@ private:
   };
 
   static constexpr u32 DEVICE_ID = 0x4D4E4554;  // 'MNET'; unknown to CARD -> "no card"
-  static constexpr u8 PROTO_VERSION = 2;
+  static constexpr u8 PROTO_VERSION = 3;        // v3: POLL status word + replay serving
   static constexpr u32 PAD_BYTES = 0x44;  // sizeof(HSD_PadStatus): full post-transform entry
+
+  // v3 POLL return word: status<<24 | arg. v2's bare 0/1 map onto WAIT/READY.
+  enum : u8
+  {
+    POLL_WAIT = 0,    // inputs for the serve tick not here yet — poll again
+    POLL_READY = 1,   // proceed: RECV serves the current tick
+    POLL_REPLAY = 3,  // arg = K: memory was restored K ticks back; run K
+                      // replay ticks (RECV+inject+body each), then poll again
+  };
 
   // Wire message types
   enum : u8
@@ -132,6 +142,16 @@ private:
   u32 m_rate_window_tick = 0;
   void RecordStall(u32 micros);
   void ReportStalls();
+
+  // --- rollback snapshot machinery (P4; CPU thread only)
+  // Captures happen at CMD_SEND: the game is parked in the EXI transaction at
+  // the top of tick m_serve_tick, so ring[T] = pre-state of tick T.
+  MeleeRollbackState m_rollback;
+  int m_torture = 0;
+  u32 m_torture_interval = 120;
+  u32 m_torture_depth = 4;
+  u32 m_pending_replay = 0;  // ticks the game must replay; announced via POLL
+  void MaybeTorture();
 
   // --- CPU-thread transaction state
   u8 m_command = CMD_ID;
