@@ -51,6 +51,14 @@ public:
   // Returns false if that tick is no longer (or not yet) in the ring.
   bool Restore(Core::System& system, u32 tick);
 
+  // True when the game's scene state (first watch, the major-scene global)
+  // is unchanged between the ring entry for `tick` and now. Restoring across
+  // a scene transition is NEVER safe: scene loads (heap wipes, disc reads)
+  // happen outside the replayable tick body, so a replay that straddles one
+  // leaves the new scene's control flow running on pre-transition state —
+  // observed as permanently wedged scene progression, not a crash.
+  bool SameScene(Core::System& system, u32 tick) const;
+
   // Oldest restorable tick given the current ring contents, or -1 if none.
   s64 OldestTick() const;
 
@@ -62,6 +70,15 @@ public:
   // Capture-time statistics for perf logging.
   u64 TotalCaptures() const { return m_total_captures; }
   u64 LastCaptureMicros() const { return m_last_capture_us; }
+
+  // Diagnostic watches ("watch" lines): u32 globals logged with checksums.
+  struct Watch
+  {
+    u32 addr = 0;
+    std::string label;
+  };
+  const std::vector<Watch>& Watches() const { return m_watches; }
+  u32 ReadWatch(Core::System& system, const Watch& watch) const;
 
 private:
   struct Region
@@ -75,12 +92,14 @@ private:
   {
     bool valid = false;
     u32 tick = 0;
+    u32 scene = 0;  // first watch (major-scene) at capture time
     std::vector<u8> data;  // concatenated regions, m_snapshot_bytes long
   };
 
   void ResolveHeapRegion(Core::System& system);
   void FinalizeCopyPlan();
 
+  std::vector<Watch> m_watches;
   std::vector<Region> m_raw_regions;   // as parsed, pre-exclusion
   std::vector<Region> m_excludes;      // as parsed
   std::vector<Region> m_regions;       // carved, final copy plan

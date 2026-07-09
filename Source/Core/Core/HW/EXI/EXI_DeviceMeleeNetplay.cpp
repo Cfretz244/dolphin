@@ -588,6 +588,11 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
     {
       const u32 tick = ReadBE32(buf);
       const u32 crc = ReadBE32(buf + 4);
+      for (const auto& watch : m_rollback.Watches())
+      {
+        INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: watch {}={:08x} tick={}", watch.label,
+                     m_rollback.ReadWatch(m_system, watch), tick);
+      }
       SendMessageRaw(MSG_CHECKSUM, 0, tick, buf + 4, 4);
       std::lock_guard lk(m_frames_lock);
       m_local_crcs[tick] = crc;
@@ -627,7 +632,17 @@ void CEXIMeleeNetplay::MaybeTorture()
       m_serve_tick % m_torture_interval == 0)
   {
     const u32 target = m_serve_tick - m_torture_depth;
-    if (m_rollback.Restore(m_system, target))
+    // Never roll back across a scene transition — scene loads happen outside
+    // the replayable tick body (see MeleeRollbackState::SameScene). Real
+    // rollback carries the same gate; a prediction window that straddles a
+    // transition must fall back to a lockstep stall instead.
+    if (!m_rollback.SameScene(m_system, target))
+    {
+      INFO_LOG_FMT(EXPANSIONINTERFACE,
+                   "MeleeRollback: torture skipped at tick {} (scene changed in window)",
+                   m_serve_tick);
+    }
+    else if (m_rollback.Restore(m_system, target))
     {
       INFO_LOG_FMT(EXPANSIONINTERFACE,
                    "MeleeRollback: torture restore tick {} -> {} (replay {})", m_serve_tick,

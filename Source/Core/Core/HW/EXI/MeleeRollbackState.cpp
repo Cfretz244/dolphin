@@ -50,6 +50,7 @@ bool MeleeRollbackState::LoadRegionTable(const std::string& path, std::string* e
   m_raw_regions.clear();
   m_excludes.clear();
   m_regions.clear();
+  m_watches.clear();
   m_heap_resolved = false;
 
   std::string line;
@@ -91,6 +92,10 @@ bool MeleeRollbackState::LoadRegionTable(const std::string& path, std::string* e
     {
       m_heapptr_lo = start;
       m_heapptr_hi = end;
+    }
+    else if (kind == "watch")
+    {
+      m_watches.push_back({start, label});
     }
     else
     {
@@ -198,6 +203,7 @@ void MeleeRollbackState::Capture(Core::System& system, u32 tick)
     off += r.end - r.start;
   }
   slot.tick = tick;
+  slot.scene = m_watches.empty() ? 0 : ReadWatch(system, m_watches.front());
   slot.valid = true;
 
   m_total_captures++;
@@ -222,6 +228,16 @@ bool MeleeRollbackState::Restore(Core::System& system, u32 tick)
   return true;
 }
 
+bool MeleeRollbackState::SameScene(Core::System& system, u32 tick) const
+{
+  if (m_watches.empty())
+    return true;  // no watch configured: caller accepts the straddle risk
+  const Slot& slot = m_ring[tick % RING_SIZE];
+  if (!slot.valid || slot.tick != tick)
+    return false;
+  return slot.scene == ReadWatch(system, m_watches.front());
+}
+
 s64 MeleeRollbackState::OldestTick() const
 {
   s64 oldest = -1;
@@ -231,6 +247,14 @@ s64 MeleeRollbackState::OldestTick() const
       oldest = slot.tick;
   }
   return oldest;
+}
+
+u32 MeleeRollbackState::ReadWatch(Core::System& system, const Watch& watch) const
+{
+  auto& memory = system.GetMemory();
+  u8 raw[4] = {};
+  memory.CopyFromEmu(raw, watch.addr, 4);
+  return (u32(raw[0]) << 24) | (u32(raw[1]) << 16) | (u32(raw[2]) << 8) | raw[3];
 }
 
 u32 MeleeRollbackState::LiveChecksum(Core::System& system) const
