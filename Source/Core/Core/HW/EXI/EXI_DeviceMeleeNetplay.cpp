@@ -82,21 +82,8 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
   const int ports_cfg = Config::Get(Config::MAIN_MELEE_NETPLAY_LOCAL_PORTS);
   m_local_mask = ports_cfg != 0 ? static_cast<u8>(ports_cfg) : (m_is_host ? 0x01 : 0x02);
 
-  const u32 trace_seed_addr = Config::Get(Config::MAIN_MELEE_NETPLAY_TRACE_SEED_WRITES);
-  if (trace_seed_addr != 0)
-  {
-    TMemCheck mc;
-    mc.start_address = trace_seed_addr;
-    mc.end_address = trace_seed_addr + 3;
-    mc.is_ranged = true;
-    mc.is_break_on_write = true;  // gates logging; break_on_hit=false so it never pauses
-    mc.log_on_hit = true;
-    mc.break_on_hit = false;
-    m_system.GetPowerPC().GetMemChecks().Add(std::move(mc));
-    WARN_LOG_FMT(EXPANSIONINTERFACE,
-                 "MeleeNetplay: TRACING writes to {:08x} (log-only watchpoint; slow)",
-                 trace_seed_addr);
-  }
+  m_trace_seed_addr = Config::Get(Config::MAIN_MELEE_NETPLAY_TRACE_SEED_WRITES);
+  EnsureSeedTraceArmed("device init");
 
   m_fake_latency_ms = std::max(0, Config::Get(Config::MAIN_MELEE_NETPLAY_FAKE_LATENCY_MS));
   m_fake_jitter_ms = std::max(0, Config::Get(Config::MAIN_MELEE_NETPLAY_FAKE_JITTER_MS));
@@ -764,6 +751,7 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
     if (size >= 4 + 4 * PAD_BYTES)
     {
       SendInputs(ReadBE32(buf), buf + 4);
+      EnsureSeedTraceArmed("CMD_SEND");
       // Snapshot point: the game is parked in this transaction at the top of
       // tick m_serve_tick, before that tick's inputs are injected or its
       // logic runs — ring[T] is the pre-state of tick T.
@@ -848,6 +836,29 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
   default:
     break;
   }
+}
+
+void CEXIMeleeNetplay::EnsureSeedTraceArmed(const char* when)
+{
+  if (m_trace_seed_addr == 0)
+    return;
+  auto& memchecks = m_system.GetPowerPC().GetMemChecks();
+  // Something between device init and gameplay emptied the list on earlier
+  // attempts (0 MBP hits at full speed with the watchpoint "armed"), so
+  // re-arm opportunistically and say WHEN it was found missing.
+  if (memchecks.GetMemCheck(m_trace_seed_addr, 4) != nullptr)
+    return;
+  TMemCheck mc;
+  mc.start_address = m_trace_seed_addr;
+  mc.end_address = m_trace_seed_addr + 3;
+  mc.is_ranged = true;
+  mc.is_break_on_write = true;  // gates logging; break_on_hit=false so it never pauses
+  mc.log_on_hit = true;
+  mc.break_on_hit = false;
+  memchecks.Add(std::move(mc));
+  WARN_LOG_FMT(EXPANSIONINTERFACE,
+               "MeleeNetplay: TRACING writes to {:08x} (armed at: {}; HasAny={} count={})",
+               m_trace_seed_addr, when, memchecks.HasAny(), memchecks.GetMemChecks().size());
 }
 
 bool CEXIMeleeNetplay::AsyncIOQuiescent() const

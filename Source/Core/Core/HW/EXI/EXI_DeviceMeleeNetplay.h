@@ -178,6 +178,9 @@ private:
   // reads, DI command completions). Restore/rollback must not run otherwise:
   // the rolled-back game re-waits on a completion that will never re-fire.
   bool AsyncIOQuiescent() const;
+  // (Re-)install the TraceSeedWrites watchpoint if configured and missing.
+  void EnsureSeedTraceArmed(const char* when);
+  u32 m_trace_seed_addr = 0;
 
   // --- prediction + rollback (R1; window > 0 enables, 0 = pure lockstep)
   //
