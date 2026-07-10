@@ -227,5 +227,8 @@ private:
   u8 m_command = CMD_ID;
   u32 m_serve_tick = 0;
   bool m_warned_savestate = false;
+  // Index of the "rng-seed" watch in the region table, resolved lazily at the
+  // first RECV; -1 = not looked up yet, -2 = table has none (stop looking).
+  int m_seed_watch = -1;
 };
 }  // namespace ExpansionInterface

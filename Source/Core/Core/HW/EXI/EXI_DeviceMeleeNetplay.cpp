@@ -1164,6 +1164,32 @@ void CEXIMeleeNetplay::DMARead(u32 address, u32 size)
       m_rollback.VerifyAgainstRing(m_system, static_cast<u32>(m_verify_tick));
       m_verify_tick = -1;
     }
+    // Full-speed fork oracle: log the end-of-previous-tick RNG seed at every
+    // serve, normal AND replayed. The MBP write tracer masks the real-time-
+    // conditioned fork class (its slowdown gives the DSP time to keep up with
+    // replay bursts); reading the watch value per tick costs nothing, so
+    // cross-peer alignment pins a roll-count fork to the exact tick and shows
+    // whether a replay reproduced the straight-through walk.
+    if (m_seed_watch != -2 && m_rollback.IsLoaded())
+    {
+      if (m_seed_watch < 0)
+      {
+        const auto& ws = m_rollback.Watches();
+        for (size_t i = 0; i < ws.size(); i++)
+        {
+          if (ws[i].label == "rng-seed")
+            m_seed_watch = static_cast<int>(i);
+        }
+        if (m_seed_watch < 0)
+          m_seed_watch = -2;  // no seed watch in this region table: stop looking
+      }
+      if (m_seed_watch >= 0)
+      {
+        INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: tickseed tick={} replay={} seed={:08x}",
+                     m_serve_tick, m_replay_serving,
+                     m_rollback.ReadWatch(m_system, m_rollback.Watches()[m_seed_watch]));
+      }
+    }
     // Replayed ticks issue no SENDs, so re-capture their pre-states here (the
     // RECV entry is the same semantic point). Without this, ring slots inside
     // a corrected window would keep the mispredicted pass's state and a later
