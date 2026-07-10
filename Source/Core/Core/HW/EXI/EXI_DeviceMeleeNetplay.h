@@ -202,6 +202,11 @@ private:
   std::map<u32, std::array<std::array<u8, PAD_BYTES>, 4>> m_speculative;  // tick -> served pads
   bool m_rollback_needed = false;  // mispredict at the frontier awaits restore
   u32 m_replay_serving = 0;        // RECVs left in an in-flight replay window
+  // Scene-barrier fence: true while the game's outgoing pad block carries the
+  // barrier ready bit (nw_SceneBarrier stamp, byte 0x42 bit 0 of the first
+  // owned port's block). While armed, prediction is suppressed so no
+  // speculative window can span a barrier release (see the predict gate).
+  bool m_barrier_armed = false;
   // stats (CPU thread only)
   u64 m_predicted_ticks = 0;
   u64 m_validated_ok = 0;

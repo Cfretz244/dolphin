@@ -439,6 +439,32 @@ void CEXIMeleeNetplay::SendInputs(u32 tick, const u8* pads)
     }
     frame.have_mask |= m_local_mask;
   }
+  // Scene-barrier fence. The game stamps its barrier ready bit into byte 0x42
+  // of its first OWNED netplay port's block (nw_SceneBarrier); peek exactly
+  // that slot. While the bit is up the game is waiting at (or approaching) a
+  // barrier release, and the release must be evaluated on REAL flag data at
+  // the same tick on both peers: nw_SceneBarrier lives in the OUTER scene
+  // loop, not the replayed tick body, so a rollback replay spanning the true
+  // release tick can never re-evaluate it -- the rolled-back peer releases
+  // LATE and the seed re-sync (agreed ^ release_tick) forks by the tick skew
+  // (smoke #19: XOR 0x06 at the fight-exit barrier, desync at the next demo
+  // roll). Suppressing prediction from the stamp on guarantees every barrier
+  // evaluation from stamp to release sees confirmed data: the stamp rides
+  // blocks `delay` ticks ahead of consumption, pre-stamp speculation resolves
+  // before the release tick can be served, and pre-stamp barrier evaluations
+  // are release-insensitive (both-up needs the local flag, down there).
+  {
+    u32 p = 0;
+    while (p < 3 && (m_local_mask & (1 << p)) == 0)
+      p++;
+    const bool stamped = (pads[p * PAD_BYTES + 0x42] & 1) != 0;
+    if (stamped != m_barrier_armed)
+    {
+      m_barrier_armed = stamped;
+      INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: barrier fence {} at tick {}",
+                   stamped ? "armed" : "disarmed", tick);
+    }
+  }
   // Log non-neutral input. A peer whose controller never reaches the exchange
   // (wrong port mapping, dead input pipe) otherwise looks identical to a peer
   // whose player is simply holding still.
@@ -838,7 +864,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
     // unrecoverable — same disc-streaming reasoning as the torture gate);
     // local inputs must already be looped back (they always are: the game
     // SENDs tick+delay before polling tick).
-    if (m_window != 0 && m_rollback.IsLoaded() && MatchStateEvolving())
+    if (m_window != 0 && m_rollback.IsLoaded() && MatchStateEvolving() && !m_barrier_armed)
     {
       std::lock_guard lk(m_frames_lock);
       const u32 ahead = m_serve_tick - m_confirmed_frontier;
