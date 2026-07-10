@@ -123,6 +123,7 @@ extern const Info<std::string> MAIN_MELEE_NETPLAY_REGION_TABLE;
 extern const Info<int> MAIN_MELEE_NETPLAY_TORTURE;
 extern const Info<int> MAIN_MELEE_NETPLAY_TORTURE_INTERVAL;
 extern const Info<int> MAIN_MELEE_NETPLAY_TORTURE_DEPTH;
+extern const Info<int> MAIN_MELEE_NETPLAY_WINDOW;
 const Info<SerialInterface::SIDevices>& GetInfoForSIDevice(int channel);
 const Info<bool>& GetInfoForAdapterRumble(int channel);
 const Info<bool>& GetInfoForSimulateKonga(int channel);

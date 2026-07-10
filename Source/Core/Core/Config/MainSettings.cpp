@@ -197,6 +197,9 @@ const Info<int> MAIN_MELEE_NETPLAY_TORTURE_INTERVAL{
     {System::Main, "MeleeNetplay", "TortureInterval"}, 120};
 const Info<int> MAIN_MELEE_NETPLAY_TORTURE_DEPTH{{System::Main, "MeleeNetplay", "TortureDepth"},
                                                  4};
+// Max rollback window W (ticks the game may run ahead on predicted remote
+// inputs). 0 = pure lockstep. Host-imposed on the client via HELLO, like Delay.
+const Info<int> MAIN_MELEE_NETPLAY_WINDOW{{System::Main, "MeleeNetplay", "Window"}, 0};
 
 const Info<SerialInterface::SIDevices>& GetInfoForSIDevice(int channel)
 {

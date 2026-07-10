@@ -94,6 +94,10 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
     m_seed = Config::Get(Config::MAIN_MELEE_NETPLAY_SEED);
     if (m_seed == 0)
       m_seed = Common::Random::GenerateValue<u32>();
+    // Host imposes the rollback window like it imposes delay. Clamp well
+    // below RING_SIZE: replays re-read input history and ring snapshots.
+    m_window = static_cast<u32>(std::clamp(Config::Get(Config::MAIN_MELEE_NETPLAY_WINDOW), 0,
+                                           int(MeleeRollbackState::RING_SIZE) / 2));
   }
 
   const std::string region_table = Config::Get(Config::MAIN_MELEE_NETPLAY_REGION_TABLE);
@@ -155,12 +159,13 @@ bool CEXIMeleeNetplay::EstablishSession(sf::TcpSocket& sock)
   sock.setBlocking(true);
   if (m_is_host)
   {
-    u8 hello[8];
+    u8 hello[9];
     hello[0] = MSG_HELLO;
     hello[1] = PROTO_VERSION;
     hello[2] = m_local_mask;
     hello[3] = m_delay;
     WriteBE32(&hello[4], m_seed);
+    hello[8] = static_cast<u8>(m_window);
     if (!SendAll(sock, hello, sizeof(hello)))
       return false;
 
@@ -178,7 +183,7 @@ bool CEXIMeleeNetplay::EstablishSession(sf::TcpSocket& sock)
   }
   else
   {
-    u8 hello[8];
+    u8 hello[9];
     sock.setBlocking(false);
     if (!RecvAll(sock, hello, sizeof(hello), m_running))
       return false;
@@ -191,6 +196,7 @@ bool CEXIMeleeNetplay::EstablishSession(sf::TcpSocket& sock)
     m_remote_mask = hello[2];
     m_delay = hello[3];
     m_seed = ReadBE32(&hello[4]);
+    m_window = hello[8];
     // Host assigns; if it claims our default port, take the other one.
     if ((m_local_mask & m_remote_mask) != 0)
       m_local_mask = m_remote_mask == 0x01 ? 0x02 : 0x01;
@@ -273,9 +279,14 @@ void CEXIMeleeNetplay::NetThread()
   }
 
   m_session_ready = true;
-  Core::DisplayMessage(fmt::format("MeleeNetplay: session up (local ports {:#x}, delay {})",
-                                   m_local_mask, m_delay),
+  Core::DisplayMessage(fmt::format("MeleeNetplay: session up (local ports {:#x}, delay {}, "
+                                   "window {})",
+                                   m_local_mask, m_delay, m_window),
                        8000);
+  if (m_window != 0)
+  {
+    WARN_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: prediction+rollback ON (window {})", m_window);
+  }
 
   // Receive loop
   while (m_running.IsSet())
@@ -472,6 +483,15 @@ void CEXIMeleeNetplay::ReportStalls()
                "MeleeNetplay: rate={:.1f} ticks/s ({:.0f}% of 60Hz) | stall us over {} ticks: "
                "p50={} p90={} p99={} max={}",
                rate, 100.0 * rate / 60.0, n, pct(0.50), pct(0.90), pct(0.99), sorted[n - 1]);
+  if (m_window != 0)
+  {
+    INFO_LOG_FMT(EXPANSIONINTERFACE,
+                 "MeleeNetplay: rollback stats: predicted={} validated_ok={} rollbacks={} "
+                 "max_depth={} refused_scene={} checksums_skipped={} frontier_lag={}",
+                 m_predicted_ticks, m_validated_ok, m_rollback_count, m_rollback_depth_max,
+                 m_rollback_refused_scene, m_checksums_skipped,
+                 m_serve_tick - m_confirmed_frontier);
+  }
 
   m_stall_samples_us.clear();
   m_rate_window_start = now;
@@ -492,6 +512,80 @@ bool CEXIMeleeNetplay::FrameReady(u32 tick)
     return false;
   }
   return true;
+}
+
+bool CEXIMeleeNetplay::RemoteArrivedLocked(u32 tick) const
+{
+  const auto it = m_frames.find(tick);
+  if (it == m_frames.end() || (it->second.have_mask & m_remote_mask) != m_remote_mask)
+    return false;
+  // Fake latency delays *visibility*: for mispredict detection too, or the
+  // simulation would validate predictions against data still "in flight".
+  if (it->second.visible_at.time_since_epoch().count() != 0 &&
+      std::chrono::steady_clock::now() < it->second.visible_at)
+  {
+    return false;
+  }
+  return true;
+}
+
+// Advance the confirmed frontier over ticks whose real remote inputs have
+// arrived, validating any prediction served for them. Runs on the CPU thread
+// only. A mismatch stops the frontier: that tick is the rollback target.
+void CEXIMeleeNetplay::ValidateSpeculationLocked()
+{
+  while (m_confirmed_frontier < m_serve_tick && !m_rollback_needed)
+  {
+    const u32 t = m_confirmed_frontier;
+    if (!RemoteArrivedLocked(t))
+      break;
+    const auto spec = m_speculative.find(t);
+    if (spec != m_speculative.end())
+    {
+      const Frame& frame = m_frames[t];
+      bool match = true;
+      for (u32 port = 0; port < 4 && match; port++)
+      {
+        if ((m_remote_mask & (1 << port)) == 0)
+          continue;
+        match = std::memcmp(frame.pads[port].data(), spec->second[port].data(), PAD_BYTES) == 0;
+      }
+      m_speculative.erase(spec);
+      if (!match)
+      {
+        m_rollback_needed = true;
+        break;  // frontier stays at t: the rollback target
+      }
+      m_validated_ok++;
+    }
+    m_confirmed_frontier = t + 1;
+  }
+  // Nothing speculative below the frontier: keep the map from growing if the
+  // peer vanished mid-speculation.
+  m_speculative.erase(m_speculative.begin(), m_speculative.lower_bound(m_confirmed_frontier));
+}
+
+// Fill tick's remote half with the newest confirmed remote inputs
+// (repeat-last-received, the standard GGPO/Slippi predictor) and remember
+// exactly what was served for later validation. have_mask is NOT touched:
+// its remote bits keep meaning "real data arrived".
+void CEXIMeleeNetplay::PredictIntoLocked(u32 tick)
+{
+  const u32 src_tick = m_confirmed_frontier == 0 ? 0 : m_confirmed_frontier - 1;
+  const auto src = m_frames.find(src_tick);
+  Frame& frame = m_frames[tick];
+  auto& served = m_speculative[tick];
+  for (u32 port = 0; port < 4; port++)
+  {
+    if ((m_remote_mask & (1 << port)) == 0)
+      continue;
+    if (src != m_frames.end())
+      frame.pads[port] = src->second.pads[port];
+    else
+      frame.pads[port].fill(0);
+    served[port] = frame.pads[port];
+  }
+  m_predicted_ticks++;
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +611,58 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
     {
       const u32 k = m_pending_replay;
       m_pending_replay = 0;
+      m_replay_serving = k;
       return (u32(POLL_REPLAY) << 24) | k;
+    }
+    if (m_window != 0)
+    {
+      std::lock_guard lk(m_frames_lock);
+      ValidateSpeculationLocked();
+      if (m_rollback_needed)
+      {
+        const u32 target = m_confirmed_frontier;
+        const u32 depth = m_serve_tick - target;
+        if (!m_rollback.IsLoaded() || !m_rollback.SameScene(m_system, target))
+        {
+          // Unrecoverable: the mispredicted ticks straddle a scene change (or
+          // there is no snapshot machinery). Accept the divergence loudly —
+          // the checksum oracle downstream will scream if it mattered.
+          ERROR_LOG_FMT(EXPANSIONINTERFACE,
+                        "MeleeNetplay: ROLLBACK REFUSED at tick {} depth {} (scene changed)",
+                        m_serve_tick, depth);
+          m_rollback_refused_scene++;
+          m_rollback_needed = false;
+          m_confirmed_frontier++;  // treat the mismatched tick as confirmed-wrong
+        }
+        else if (m_rollback.Restore(m_system, target))
+        {
+          // Ticks in the window whose real inputs are still missing get a
+          // fresh prediction (newer information than the one they were first
+          // served with); the rest replay with the real data now in m_frames.
+          for (u32 t = target; t < m_serve_tick; t++)
+          {
+            if (!RemoteArrivedLocked(t))
+              PredictIntoLocked(t);
+            else
+              m_speculative.erase(t);
+          }
+          INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: ROLLBACK tick {} -> {} (replay {})",
+                       m_serve_tick, target, depth);
+          m_serve_tick = target;
+          m_replay_serving = depth;
+          m_rollback_count++;
+          m_rollback_depth_max = std::max(m_rollback_depth_max, depth);
+          m_rollback_needed = false;
+          return (u32(POLL_REPLAY) << 24) | depth;
+        }
+        else
+        {
+          ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: ROLLBACK restore failed at tick {}",
+                        m_serve_tick);
+          m_rollback_needed = false;
+          m_confirmed_frontier++;
+        }
+      }
     }
     if (FrameReady(m_serve_tick))
     {
@@ -533,6 +678,27 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
         RecordStall(0);  // peer's inputs were already here: zero stall
       }
       return u32(POLL_READY) << 24;
+    }
+    // Remote inputs late: predict instead of stalling, if allowed. Gates:
+    // window budget vs the confirmed frontier; fights only (predicting
+    // through menus/movies is pointless and, worse, a rollback there is
+    // unrecoverable — same disc-streaming reasoning as the torture gate);
+    // local inputs must already be looped back (they always are: the game
+    // SENDs tick+delay before polling tick).
+    if (m_window != 0 && m_rollback.IsLoaded() && MatchStateEvolving())
+    {
+      std::lock_guard lk(m_frames_lock);
+      const u32 ahead = m_serve_tick - m_confirmed_frontier;
+      const auto it = m_frames.find(m_serve_tick);
+      const bool local_here =
+          it != m_frames.end() && (it->second.have_mask & m_local_mask) == m_local_mask;
+      if (ahead < m_window && local_here)
+      {
+        PredictIntoLocked(m_serve_tick);
+        RecordStall(0);
+        m_stall_active = false;
+        return u32(POLL_READY) << 24;
+      }
     }
     if (!m_stall_active)
     {
@@ -591,6 +757,20 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
       m_game_crc_prev = m_game_crc_seen ? m_game_crc_last : crc;
       m_game_crc_last = crc;
       m_game_crc_seen = true;
+      // Confirmed-frontier policy: a checksum computed while any earlier tick
+      // was still speculative may hash mispredicted state. Neither transmit
+      // nor compare it — each peer skips independently, so a tick is
+      // cross-checked iff BOTH peers considered it clean.
+      if (m_window != 0)
+      {
+        std::lock_guard lk(m_frames_lock);
+        ValidateSpeculationLocked();
+        if (m_confirmed_frontier < tick || m_rollback_needed)
+        {
+          m_checksums_skipped++;
+          break;
+        }
+      }
       for (const auto& watch : m_rollback.Watches())
       {
         INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: watch {}={:08x} tick={}", watch.label,
@@ -639,6 +819,15 @@ void CEXIMeleeNetplay::MaybeTorture()
     // are where rollback matters and where replay is sound.
     if (!MatchStateEvolving())
       return;
+    // Don't compose with live speculation (window mode): a torture replay
+    // through predicted ticks would verify against a pass the real inputs
+    // may yet contradict.
+    if (m_window != 0)
+    {
+      std::lock_guard lk(m_frames_lock);
+      if (m_confirmed_frontier < m_serve_tick || !m_speculative.empty())
+        return;
+    }
     const u32 target = m_serve_tick - m_torture_depth;
     // Never roll back across a scene transition — scene loads happen outside
     // the replayable tick body (see MeleeRollbackState::SameScene). Real
@@ -704,6 +893,16 @@ void CEXIMeleeNetplay::DMARead(u32 address, u32 size)
     {
       m_rollback.VerifyAgainstRing(m_system, static_cast<u32>(m_verify_tick));
       m_verify_tick = -1;
+    }
+    // Replayed ticks issue no SENDs, so re-capture their pre-states here (the
+    // RECV entry is the same semantic point). Without this, ring slots inside
+    // a corrected window would keep the mispredicted pass's state and a later
+    // rollback into that window would restore garbage.
+    if (m_replay_serving != 0)
+    {
+      if (m_rollback.IsLoaded())
+        m_rollback.Capture(m_system, m_serve_tick);
+      m_replay_serving--;
     }
     u8 pads[320] = {};
     {

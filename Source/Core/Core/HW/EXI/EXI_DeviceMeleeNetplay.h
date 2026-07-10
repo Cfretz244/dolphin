@@ -96,6 +96,9 @@ private:
   void SendInputs(u32 tick, const u8* pads);
   void SendMessageRaw(u8 type, u8 mask, u32 tick, const u8* payload, u16 len);
   bool FrameReady(u32 tick);
+  bool RemoteArrivedLocked(u32 tick) const;  // real remote data present & visible
+  void ValidateSpeculationLocked();          // advance frontier; detect mispredicts
+  void PredictIntoLocked(u32 tick);          // fill remote half from newest confirmed
 
   // --- session (written by net thread before m_session_ready, read-only after)
   std::atomic<bool> m_session_ready{false};
@@ -164,6 +167,31 @@ private:
     return m_game_crc_seen && m_game_crc_last != m_game_crc_prev;
   }
   void MaybeTorture();
+
+  // --- prediction + rollback (R1; window > 0 enables, 0 = pure lockstep)
+  //
+  // Invariants (TCP delivers MSG_INPUTS in tick order, so real remote data
+  // arrives in order):
+  //  - every tick < m_confirmed_frontier was simulated with real remote
+  //    inputs or a prediction later proven byte-identical;
+  //  - the first known mispredict is always exactly at the frontier, and
+  //    ring[frontier] was captured before any wrong input was injected, so
+  //    it is always a clean rollback target.
+  // All fields below are guarded by m_frames_lock; validation runs lazily on
+  // the CPU thread at POLL (never on the net thread) so the fake-latency
+  // visibility model applies to mispredict detection too.
+  u32 m_window = 0;
+  u32 m_confirmed_frontier = 0;
+  std::map<u32, std::array<std::array<u8, PAD_BYTES>, 4>> m_speculative;  // tick -> served pads
+  bool m_rollback_needed = false;  // mispredict at the frontier awaits restore
+  u32 m_replay_serving = 0;        // RECVs left in an in-flight replay window
+  // stats (CPU thread only)
+  u64 m_predicted_ticks = 0;
+  u64 m_validated_ok = 0;
+  u32 m_rollback_count = 0;
+  u32 m_rollback_depth_max = 0;
+  u32 m_rollback_refused_scene = 0;
+  u32 m_checksums_skipped = 0;
 
   // --- CPU-thread transaction state
   u8 m_command = CMD_ID;
