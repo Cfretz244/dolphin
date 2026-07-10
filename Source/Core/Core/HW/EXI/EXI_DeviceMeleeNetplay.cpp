@@ -954,7 +954,17 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
       // logic runs — ring[T] is the pre-state of tick T.
       if (m_rollback.IsLoaded())
       {
-        m_rollback.Capture(m_system, m_serve_tick);
+        // Window mode captures at RECV instead (see CMD_RECV): a rollback's
+        // ORIGIN serve tick is captured here during the pass the rollback
+        // invalidates, and the replay re-captures only target..serve-1 — the
+        // origin slot stayed stale, so a hash tick landing on it compared
+        // wrong-pass state (target8: ~94% of intervals flagged with sims
+        // byte-identical), and a later rollback TARGETING it restored the
+        // invalidated pass. RECV is the same semantic point (pre-inject,
+        // nothing but polls between SEND and RECV) and covers normal,
+        // replayed, and post-replay-origin serves uniformly.
+        if (m_window == 0)
+          m_rollback.Capture(m_system, m_serve_tick);
         if (m_rollback.TotalCaptures() % 600 == 0)
         {
           INFO_LOG_FMT(EXPANSIONINTERFACE,
@@ -1229,14 +1239,17 @@ void CEXIMeleeNetplay::DMARead(u32 address, u32 size)
                      m_rollback.ReadWatch(m_system, m_rollback.Watches()[m_seed_watch]));
       }
     }
-    // Replayed ticks issue no SENDs, so re-capture their pre-states here (the
-    // RECV entry is the same semantic point). Without this, ring slots inside
-    // a corrected window would keep the mispredicted pass's state and a later
-    // rollback into that window would restore garbage.
+    // Window mode: EVERY serve (normal, replayed, post-replay origin)
+    // captures its pre-state here — the one point all three pass through on
+    // the timeline that ends up canonical (see the CMD_SEND comment).
+    // Lockstep keeps SEND-time captures (torture mode 1 restores ring[serve]
+    // between SEND and RECV).
     const u32 replay_tag = m_replay_serving;
+    if (m_window != 0 && m_rollback.IsLoaded())
+      m_rollback.Capture(m_system, m_serve_tick);
     if (m_replay_serving != 0)
     {
-      if (m_rollback.IsLoaded())
+      if (m_window == 0 && m_rollback.IsLoaded())
         m_rollback.Capture(m_system, m_serve_tick);
       m_replay_serving--;
     }
