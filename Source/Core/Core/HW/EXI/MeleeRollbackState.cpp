@@ -257,6 +257,54 @@ u32 MeleeRollbackState::ReadWatch(Core::System& system, const Watch& watch) cons
   return (u32(raw[0]) << 24) | (u32(raw[1]) << 16) | (u32(raw[2]) << 8) | raw[3];
 }
 
+int MeleeRollbackState::VerifyAgainstRing(Core::System& system, u32 tick) const
+{
+  const Slot& slot = m_ring[tick % RING_SIZE];
+  if (!slot.valid || slot.tick != tick || slot.data.size() != m_snapshot_bytes)
+  {
+    ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeRollback: verify: no ring entry for tick {}", tick);
+    return -1;
+  }
+
+  auto& memory = system.GetMemory();
+  std::vector<u8> live;
+  size_t off = 0;
+  int spans = 0;
+  for (const Region& r : m_regions)
+  {
+    const size_t len = r.end - r.start;
+    live.resize(len);
+    memory.CopyFromEmu(live.data(), r.start, len);
+    const u8* want = slot.data.data() + off;
+
+    size_t i = 0;
+    while (i < len && spans < 24)  // cap the log noise per verification
+    {
+      if (live[i] == want[i])
+      {
+        i++;
+        continue;
+      }
+      size_t j = i;
+      while (j < len && live[j] != want[j])
+        j++;
+      spans++;
+      ERROR_LOG_FMT(EXPANSIONINTERFACE,
+                    "MeleeRollback: VERIFY DIFF {}+0x{:x} (addr {:08x}) len {} "
+                    "live={:02x}{:02x}{:02x}{:02x} want={:02x}{:02x}{:02x}{:02x}",
+                    r.label, i, r.start + i, j - i, live[i], i + 1 < len ? live[i + 1] : 0,
+                    i + 2 < len ? live[i + 2] : 0, i + 3 < len ? live[i + 3] : 0, want[i],
+                    i + 1 < len ? want[i + 1] : 0, i + 2 < len ? want[i + 2] : 0,
+                    i + 3 < len ? want[i + 3] : 0);
+      i = j;
+    }
+    off += len;
+  }
+  if (spans == 0)
+    INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeRollback: verify tick {}: replay byte-exact", tick);
+  return spans;
+}
+
 u32 MeleeRollbackState::LiveChecksum(Core::System& system) const
 {
   auto& memory = system.GetMemory();

@@ -67,6 +67,14 @@ public:
   // equality is meaningful. Host-speed; cheap enough for every-60-ticks.
   u32 LiveChecksum(Core::System& system) const;
 
+  // Replay-fidelity oracle: memcmp the LIVE regions against the ring entry
+  // for `tick` and log every differing span (region label + offset + first
+  // bytes). At the exchange point of tick T, a perfect restore+replay must
+  // reproduce ring[T] byte-for-byte — any diff is exactly the state the
+  // region set failed to capture (or state mutated by non-replayable side
+  // effects). Returns the number of differing spans.
+  int VerifyAgainstRing(Core::System& system, u32 tick) const;
+
   // Capture-time statistics for perf logging.
   u64 TotalCaptures() const { return m_total_captures; }
   u64 LastCaptureMicros() const { return m_last_capture_us; }

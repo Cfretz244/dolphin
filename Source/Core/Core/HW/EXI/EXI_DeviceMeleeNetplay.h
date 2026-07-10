@@ -151,6 +151,7 @@ private:
   u32 m_torture_interval = 120;
   u32 m_torture_depth = 4;
   u32 m_pending_replay = 0;  // ticks the game must replay; announced via POLL
+  s64 m_verify_tick = -1;    // after replay, byte-verify live state vs ring[tick]
   // Match-activity gate: the game's periodic state checksums (CMD_CHECKSUM)
   // change only while a fight is simulating. Replay is only valid there —
   // menus/movies stream from disc (DVD/THP state is real-time, outside the

@@ -657,6 +657,7 @@ void CEXIMeleeNetplay::MaybeTorture()
                    target, m_torture_depth);
       m_serve_tick = target;
       m_pending_replay = m_torture_depth;
+      m_verify_tick = static_cast<s64>(target) + m_torture_depth;
     }
     else
     {
@@ -696,6 +697,14 @@ void CEXIMeleeNetplay::DMARead(u32 address, u32 size)
   }
   case CMD_RECV:
   {
+    // Post-replay fidelity check: the game is back at the exchange point of
+    // the tortured tick, where memory must byte-match the snapshot taken on
+    // the first pass. Diffs name exactly the state replay failed to restore.
+    if (m_verify_tick >= 0 && m_serve_tick == static_cast<u32>(m_verify_tick))
+    {
+      m_rollback.VerifyAgainstRing(m_system, static_cast<u32>(m_verify_tick));
+      m_verify_tick = -1;
+    }
     u8 pads[320] = {};
     {
       std::lock_guard lk(m_frames_lock);
