@@ -162,6 +162,13 @@ private:
   u32 m_game_crc_last = 0;
   u32 m_game_crc_prev = 0;
   bool m_game_crc_seen = false;
+  // Cross-peer forensics: first DESYNC arms a dump; the NEXT checksum
+  // submission (same game tick on both peers, both parked at the exchange)
+  // writes the live region set to <userdir>/desync-<tick>.bin for offline
+  // host-vs-client byte diffing (scripts/diff-desync-dumps.py). Guarded by
+  // m_frames_lock (armed from the net thread, consumed on the CPU thread).
+  s64 m_dump_armed_tick = -1;
+  bool m_desync_dumped = false;
   bool MatchStateEvolving() const
   {
     return m_game_crc_seen && m_game_crc_last != m_game_crc_prev;

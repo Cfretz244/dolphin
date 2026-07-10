@@ -8,6 +8,8 @@
 #include <fstream>
 #include <sstream>
 
+#include <fmt/format.h>
+
 #include "Common/Logging/Log.h"
 #include "Core/HW/Memmap.h"
 #include "Core/PowerPC/MMU.h"
@@ -318,5 +320,30 @@ u32 MeleeRollbackState::LiveChecksum(Core::System& system) const
       hash = (hash ^ b) * 0x01000193;
   }
   return hash;
+}
+
+bool MeleeRollbackState::DumpLive(Core::System& system, const std::string& path) const
+{
+  auto& memory = system.GetMemory();
+  std::ofstream out(path, std::ios::binary);
+  if (!out)
+    return false;
+  // Text header (one region per line), then a blank line, then the raw
+  // concatenated region bytes. The offline differ re-derives offsets from
+  // the header, so dumps remain self-describing even if the table changes.
+  std::ostringstream hdr;
+  for (const Region& r : m_regions)
+    hdr << fmt::format("{:08x} {:08x} {}\n", r.start, r.end, r.label);
+  hdr << "\n";
+  const std::string h = hdr.str();
+  out.write(h.data(), h.size());
+  std::vector<u8> buf;
+  for (const Region& r : m_regions)
+  {
+    buf.resize(r.end - r.start);
+    memory.CopyFromEmu(buf.data(), r.start, r.end - r.start);
+    out.write(reinterpret_cast<const char*>(buf.data()), buf.size());
+  }
+  return out.good();
 }
 }  // namespace ExpansionInterface

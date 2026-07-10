@@ -79,6 +79,13 @@ public:
   u64 TotalCaptures() const { return m_total_captures; }
   u64 LastCaptureMicros() const { return m_last_capture_us; }
 
+  // Cross-peer divergence forensics: dump the LIVE region set (with a small
+  // header naming each region's bounds) to a file. Both peers dump at the
+  // same tick on a DESYNC; scripts/diff-desync-dumps.py names the exact
+  // divergent bytes host-vs-client — the oracle VerifyAgainstRing cannot
+  // provide, since it only sees one peer's memory.
+  bool DumpLive(Core::System& system, const std::string& path) const;
+
   // Diagnostic watches ("watch" lines): u32 globals logged with checksums.
   struct Watch
   {

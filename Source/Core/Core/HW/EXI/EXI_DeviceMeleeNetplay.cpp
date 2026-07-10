@@ -10,6 +10,7 @@
 
 #include <fmt/format.h>
 
+#include "Common/FileUtil.h"
 #include "Common/Logging/Log.h"
 #include "Common/Random.h"
 #include "Common/Thread.h"
@@ -365,6 +366,8 @@ void CEXIMeleeNetplay::HandleMessage(u8 type, u8 mask, u32 tick, const u8* paylo
         ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: DESYNC at tick {} ({:08x} != {:08x})",
                       tick, local->second, remote_crc);
         Core::DisplayMessage(fmt::format("MeleeNetplay: DESYNC at tick {}", tick), 20000);
+        if (!m_desync_dumped && m_dump_armed_tick < 0)
+          m_dump_armed_tick = tick;
       }
       else
       {
@@ -757,6 +760,28 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
       m_game_crc_prev = m_game_crc_seen ? m_game_crc_last : crc;
       m_game_crc_last = crc;
       m_game_crc_seen = true;
+      // A desync armed a forensic dump: the first checksum AFTER the desynced
+      // tick is the same parked game tick on both peers, so their region
+      // dumps are directly byte-comparable offline.
+      {
+        bool do_dump = false;
+        {
+          std::lock_guard lk(m_frames_lock);
+          if (m_dump_armed_tick >= 0 && !m_desync_dumped && tick > static_cast<u32>(m_dump_armed_tick))
+          {
+            m_desync_dumped = true;
+            do_dump = true;
+          }
+        }
+        if (do_dump && m_rollback.IsLoaded())
+        {
+          const std::string path =
+              File::GetUserPath(D_USER_IDX) + fmt::format("desync-{}.bin", tick);
+          const bool ok = m_rollback.DumpLive(m_system, path);
+          ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: desync region dump {} -> {}",
+                        ok ? "written" : "FAILED", path);
+        }
+      }
       // Confirmed-frontier policy: a checksum computed while any earlier tick
       // was still speculative may hash mispredicted state. Neither transmit
       // nor compare it — each peer skips independently, so a tick is
@@ -785,6 +810,8 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
         ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: DESYNC at tick {} ({:08x} != {:08x})",
                       tick, crc, remote->second);
         Core::DisplayMessage(fmt::format("MeleeNetplay: DESYNC at tick {}", tick), 20000);
+        if (!m_desync_dumped && m_dump_armed_tick < 0)
+          m_dump_armed_tick = tick;
       }
     }
     break;
