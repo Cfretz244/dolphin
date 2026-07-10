@@ -753,6 +753,19 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
             else
               m_speculative.erase(t);
           }
+          // Parked checksums at/after the target hash state from the pass
+          // this rollback just invalidated, and the game submits checksums
+          // from the EXCHANGE path only (nw_ExchangeMaster) -- replayed
+          // ticks never re-submit. Draining them later would compare stale
+          // hashes against the peer's correct ones: a FALSE desync at
+          // byte-identical state (smoke #12: dump diff showed zero unmasked
+          // player_slots differences at the "desync"). Discard them; the
+          // crossed interval simply goes uncompared.
+          for (auto it = m_local_crcs_pending.lower_bound(target);
+               it != m_local_crcs_pending.end(); it = m_local_crcs_pending.erase(it))
+          {
+            m_checksums_skipped++;
+          }
           INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: ROLLBACK tick {} -> {} (replay {})",
                        m_serve_tick, target, depth);
           m_serve_tick = target;
