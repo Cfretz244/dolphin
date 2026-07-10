@@ -632,6 +632,18 @@ void CEXIMeleeNetplay::PredictIntoLocked(u32 tick)
   {
     if ((m_remote_mask & (1 << port)) == 0)
       continue;
+    // NEVER clobber real data. A tick can have ARRIVED remote inputs that
+    // are still latency-INVISIBLE (visible_at in the future) -- predicting
+    // into it overwrote the real bytes, and validation then compared the
+    // speculation against itself: a wrong input silently false-validated,
+    // peers diverged with no rollback, and the failure was a wall-clock
+    // race (masked by tracer timing, widened by deeper windows -- smokes
+    // #13-#15). Arrived data is a guaranteed-correct prediction: serve it.
+    if ((frame.have_mask & (1 << port)) != 0)
+    {
+      served[port] = frame.pads[port];
+      continue;
+    }
     if (src != m_frames.end())
       frame.pads[port] = src->second.pads[port];
     else
