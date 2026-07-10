@@ -101,6 +101,19 @@ bool MeleeRollbackState::LoadRegionTable(const std::string& path, std::string* e
       m_heapptr_lo = start;
       m_heapptr_hi = end;
     }
+    else if (kind == "heapbase")
+    {
+      // Fixed LOWER bound for the heap region (static image end, build-time).
+      // The runtime hsd_heap_next_arena_lo read happens at first capture —
+      // AFTER boot-era arenas were carved — so every ObjAlloc pool page and
+      // OS heap header allocated during engine init sits BELOW that
+      // watermark. HSD_ObjAlloc conditions success on OSCheckHeap() (live
+      // heap headers) and pool free lists thread through those pages:
+      // restoring the pool heads (static bss) while the pages stay live is
+      // the rumble mixed-structure bug for every boot-era pool — the
+      // in-fight RNG bundle fork (disc10 / rf2-5).
+      m_heap_base = start;
+    }
     else if (kind == "watch")
     {
       m_watches.push_back({start, label});
@@ -174,8 +187,10 @@ void MeleeRollbackState::ResolveHeapRegion(Core::System& system)
   u8 raw[8] = {};
   memory.CopyFromEmu(raw, m_heapptr_lo, 4);
   memory.CopyFromEmu(raw + 4, m_heapptr_hi, 4);
-  const u32 heap_start = (u32(raw[0]) << 24) | (u32(raw[1]) << 16) | (u32(raw[2]) << 8) | raw[3];
+  u32 heap_start = (u32(raw[0]) << 24) | (u32(raw[1]) << 16) | (u32(raw[2]) << 8) | raw[3];
   const u32 heap_end = (u32(raw[4]) << 24) | (u32(raw[5]) << 16) | (u32(raw[6]) << 8) | raw[7];
+  if (m_heap_base != 0 && m_heap_base < heap_start)
+    heap_start = m_heap_base;  // see the heapbase comment in LoadRegionTable
 
   if (!SaneRange(heap_start, heap_end))
   {

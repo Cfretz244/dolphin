@@ -136,6 +136,7 @@ private:
   std::vector<Region> m_regions;       // carved, final copy plan
   u32 m_heapptr_lo = 0;                // emu addr holding heap start (u32be)
   u32 m_heapptr_hi = 0;                // emu addr holding heap end (u32be)
+  u32 m_heap_base = 0;                 // fixed lower bound (static image end); 0 = runtime lo
   bool m_heap_resolved = false;
   size_t m_snapshot_bytes = 0;
 
