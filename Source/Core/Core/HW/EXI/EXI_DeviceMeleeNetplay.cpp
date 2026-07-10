@@ -11,6 +11,7 @@
 #include <fmt/format.h>
 
 #include "Common/FileUtil.h"
+#include "Common/Hash.h"
 #include "Common/Logging/Log.h"
 #include "Common/Random.h"
 #include "Common/Thread.h"
@@ -1194,6 +1195,7 @@ void CEXIMeleeNetplay::DMARead(u32 address, u32 size)
     // RECV entry is the same semantic point). Without this, ring slots inside
     // a corrected window would keep the mispredicted pass's state and a later
     // rollback into that window would restore garbage.
+    const u32 replay_tag = m_replay_serving;
     if (m_replay_serving != 0)
     {
       if (m_rollback.IsLoaded())
@@ -1208,6 +1210,13 @@ void CEXIMeleeNetplay::DMARead(u32 address, u32 size)
       {
         for (u32 port = 0; port < 4; port++)
           std::memcpy(pads + port * PAD_BYTES, it->second.pads[port].data(), PAD_BYTES);
+        // Cross-peer INPUT oracle (companion to tickseed): hash of the exact
+        // 4-port block served for this tick; last occurrence per tick =
+        // corrected history. If both peers' streams align through a state
+        // fork, the divergence is restore fidelity — not input serving.
+        INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: padhash tick={} replay={} hash={:08x}",
+                     m_serve_tick, replay_tag,
+                     Common::ComputeCRC32(pads, 4 * PAD_BYTES));
         // Keep a rollback window of history — replays re-read these ticks.
         // (Pure lockstep pruned everything up to the serve tick here.)
         // Never prune at/above the confirmed frontier: validation needs the
