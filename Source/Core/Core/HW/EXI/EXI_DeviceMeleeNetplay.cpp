@@ -587,6 +587,35 @@ void CEXIMeleeNetplay::ValidateSpeculationLocked()
   // Nothing speculative below the frontier: keep the map from growing if the
   // peer vanished mid-speculation.
   m_speculative.erase(m_speculative.begin(), m_speculative.lower_bound(m_confirmed_frontier));
+  DrainConfirmedChecksumsLocked();
+}
+
+// Transmit + compare every parked checksum whose tick the confirmed frontier
+// has passed (see CMD_CHECKSUM). m_frames_lock held by the caller.
+void CEXIMeleeNetplay::DrainConfirmedChecksumsLocked()
+{
+  while (!m_local_crcs_pending.empty())
+  {
+    const auto it = m_local_crcs_pending.begin();
+    const u32 tick = it->first;
+    if (m_window != 0 && m_confirmed_frontier < tick)
+      break;
+    const u32 crc = it->second;
+    m_local_crcs_pending.erase(it);
+    u8 payload[4];
+    WriteBE32(payload, crc);
+    SendMessageRaw(MSG_CHECKSUM, 0, tick, payload, 4);
+    m_local_crcs[tick] = crc;
+    const auto remote = m_remote_crcs.find(tick);
+    if (remote != m_remote_crcs.end() && remote->second != crc)
+    {
+      ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: DESYNC at tick {} ({:08x} != {:08x})",
+                    tick, crc, remote->second);
+      Core::DisplayMessage(fmt::format("MeleeNetplay: DESYNC at tick {}", tick), 20000);
+      if (!m_desync_dumped && m_dump_armed_tick < 0)
+        m_dump_armed_tick = tick;
+    }
+  }
 }
 
 // Fill tick's remote half with the newest confirmed remote inputs
@@ -857,37 +886,34 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
                         ok ? "written" : "FAILED", path);
         }
       }
-      // Confirmed-frontier policy: a checksum computed while any earlier tick
-      // was still speculative may hash mispredicted state. Neither transmit
-      // nor compare it — each peer skips independently, so a tick is
-      // cross-checked iff BOTH peers considered it clean.
-      if (m_window != 0)
-      {
-        std::lock_guard lk(m_frames_lock);
-        ValidateSpeculationLocked();
-        if (m_confirmed_frontier < tick || m_rollback_needed)
-        {
-          m_checksums_skipped++;
-          break;
-        }
-      }
       for (const auto& watch : m_rollback.Watches())
       {
         INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: watch {}={:08x} tick={}", watch.label,
                      m_rollback.ReadWatch(m_system, watch), tick);
       }
-      SendMessageRaw(MSG_CHECKSUM, 0, tick, buf + 4, 4);
+      // Confirmed-frontier policy, deferred form: a checksum computed while
+      // any earlier tick was still speculative may hash mispredicted state —
+      // but SKIPPING it starves the oracle completely under sustained
+      // latency (the frontier trails the serve tick by the latency floor,
+      // so every submission is contaminated at submission time; R1 smoke #3
+      // skipped 510/510). Instead PARK it and transmit once the frontier
+      // passes its tick: the hash covers state before tick T's body, so it
+      // is final as soon as ticks < T are confirmed. A rollback replay
+      // re-submits corrected values for its span, overwriting the parked
+      // entry before it can ever drain.
       std::lock_guard lk(m_frames_lock);
-      m_local_crcs[tick] = crc;
-      const auto remote = m_remote_crcs.find(tick);
-      if (remote != m_remote_crcs.end() && remote->second != crc)
+      if (m_window != 0)
       {
-        ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: DESYNC at tick {} ({:08x} != {:08x})",
-                      tick, crc, remote->second);
-        Core::DisplayMessage(fmt::format("MeleeNetplay: DESYNC at tick {}", tick), 20000);
-        if (!m_desync_dumped && m_dump_armed_tick < 0)
-          m_dump_armed_tick = tick;
+        ValidateSpeculationLocked();
+        if (m_confirmed_frontier < tick)
+        {
+          m_checksums_skipped++;  // stat now counts deferred-at-submission
+          m_local_crcs_pending[tick] = crc;
+          break;
+        }
       }
+      m_local_crcs_pending[tick] = crc;
+      DrainConfirmedChecksumsLocked();
     }
     break;
   default:

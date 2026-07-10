@@ -114,6 +114,9 @@ private:
   std::map<u32, Frame> m_frames;
   std::map<u32, u32> m_local_crcs;
   std::map<u32, u32> m_remote_crcs;
+  // Submitted but not yet confirmed by the frontier; transmitted on drain.
+  std::map<u32, u32> m_local_crcs_pending;
+  void DrainConfirmedChecksumsLocked();
 
   // --- transport
   sf::TcpSocket m_socket;
