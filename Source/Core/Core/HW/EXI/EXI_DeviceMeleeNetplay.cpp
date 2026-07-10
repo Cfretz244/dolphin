@@ -498,11 +498,11 @@ void CEXIMeleeNetplay::ReportStalls()
   {
     INFO_LOG_FMT(EXPANSIONINTERFACE,
                  "MeleeNetplay: rollback stats: predicted={} validated_ok={} rollbacks={} "
-                 "max_depth={} refused_scene={} refused_io={} checksums_skipped={} "
-                 "frontier_lag={}",
+                 "max_depth={} refused_scene={} refused_io={} refused_epoch={} "
+                 "checksums_skipped={} frontier_lag={}",
                  m_predicted_ticks, m_validated_ok, m_rollback_count, m_rollback_depth_max,
-                 m_rollback_refused_scene, m_restore_refused_io, m_checksums_skipped,
-                 m_serve_tick - m_confirmed_frontier);
+                 m_rollback_refused_scene, m_restore_refused_io, m_restore_refused_epoch,
+                 m_checksums_skipped, m_serve_tick - m_confirmed_frontier);
   }
 
   m_stall_samples_us.clear();
@@ -641,6 +641,14 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
           // emulated time, so leave m_rollback_needed set and retry at the
           // next POLL — the game plays on predictions a tick longer.
           m_restore_refused_io++;
+        }
+        else if (m_rollback.IsLoaded() && !m_rollback.IOEpochUnchanged(m_system, target))
+        {
+          // A completion was DELIVERED inside the window (see the torture
+          // path): this slot is permanently unrestorable, but the frontier
+          // advances as real inputs arrive, moving the target onto a slot
+          // captured after the delivery. Defer like the in-flight case.
+          m_restore_refused_epoch++;
         }
         else if (!m_rollback.IsLoaded() || !m_rollback.SameScene(m_system, target))
         {
@@ -940,6 +948,18 @@ void CEXIMeleeNetplay::MaybeTorture()
                    m_serve_tick, m_system.GetDSP().IsARAMDMAInProgress(),
                    m_system.GetDVDThread().HasPendingReads(),
                    m_system.GetDVDInterface().IsCommandPending());
+    }
+    else if (!m_rollback.IOEpochUnchanged(m_system, target))
+    {
+      // A completion was DELIVERED inside the window — invisible to the
+      // in-flight predicates above, but restoring would rewind the game's
+      // request bookkeeping to "waiting" for a callback that already fired
+      // and will never re-fire (HSD synth spin-waits on ARAM loads forever).
+      // The slot is permanently unrestorable; skip the interval.
+      m_restore_refused_epoch++;
+      INFO_LOG_FMT(EXPANSIONINTERFACE,
+                   "MeleeRollback: torture skipped at tick {} (async completion in window)",
+                   m_serve_tick);
     }
     else if (m_rollback.Restore(m_system, target))
     {

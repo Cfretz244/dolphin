@@ -146,6 +146,12 @@ public:
   // CPU thread only.
   bool IsCommandPending() const;
 
+  // Total non-DTK command completions delivered to the game (bumped at
+  // FinishExecutingCommand). Restoring game memory to a snapshot older than
+  // the latest delivery erases the game's record of a completion the
+  // emulator will never re-fire; snapshotting this count detects that.
+  u64 GetNonDTKCommandsCompleted() const { return m_non_dtk_commands_completed; }
+
   void EjectDisc(const Core::CPUThreadGuard& guard, EjectCause cause);
   void ChangeDisc(const Core::CPUThreadGuard& guard, const std::vector<std::string>& paths);
   void ChangeDisc(const Core::CPUThreadGuard& guard, const std::string& new_path);
@@ -288,6 +294,9 @@ private:
   DriveState m_drive_state = DriveState::Ready;
   DriveError m_error_code = DriveError::None;
   u64 m_disc_end_offset = 0;
+
+  // See GetNonDTKCommandsCompleted().
+  u64 m_non_dtk_commands_completed = 0;
 
   // Disc drive timing
   u64 m_read_buffer_start_time = 0;

@@ -113,6 +113,7 @@ void DVDInterface::DoState(PointerWrap& p)
 
   p.Do(m_drive_state);
   p.Do(m_error_code);
+  p.Do(m_non_dtk_commands_completed);
 
   p.Do(m_read_buffer_start_time);
   p.Do(m_read_buffer_end_time);
@@ -1321,6 +1322,9 @@ void DVDInterface::FinishExecutingCommand(ReplyType reply_type, DIInterruptType 
 {
   // The data parameter contains the requested data iff this was called from DVDThread, and is
   // empty otherwise. DVDThread is the only source of ReplyType::NoReply and ReplyType::DTK.
+
+  if (reply_type != ReplyType::DTK)
+    m_non_dtk_commands_completed++;
 
   u32 transfer_size = 0;
   if (reply_type == ReplyType::NoReply)

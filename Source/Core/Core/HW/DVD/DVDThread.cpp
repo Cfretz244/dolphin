@@ -75,6 +75,7 @@ void DVDThread::DoState(PointerWrap& p)
   p.Do(m_result_map);
   p.Do(m_next_id);
   p.Do(m_pending_non_dtk_reads);
+  p.Do(m_non_dtk_reads_completed);
 
   // m_disc isn't savestated (because it points to files on the
   // local system). Instead, we check that the status of the disc
@@ -266,7 +267,8 @@ void DVDThread::FinishRead(u64 id, s64 cycles_late)
   }
   // We have now obtained the right ReadResult.
 
-  m_pending_non_dtk_reads.erase(id);
+  if (m_pending_non_dtk_reads.erase(id) != 0)
+    m_non_dtk_reads_completed++;
 
   const ReadRequest& request = result.first;
   const std::vector<u8>& buffer = result.second;

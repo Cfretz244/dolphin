@@ -12,6 +12,9 @@
 
 #include "Common/Logging/Log.h"
 #include "Core/CoreTiming.h"
+#include "Core/HW/DSP.h"
+#include "Core/HW/DVD/DVDInterface.h"
+#include "Core/HW/DVD/DVDThread.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/PowerPC/MMU.h"
@@ -210,6 +213,7 @@ void MeleeRollbackState::Capture(Core::System& system, u32 tick)
   slot.tick = tick;
   slot.scene = m_watches.empty() ? 0 : ReadWatch(system, m_watches.front());
   slot.timebase = system.GetSystemTimers().GetFakeTimeBase();
+  slot.io_epoch = AsyncIOEpoch(system);
   slot.valid = true;
 
   m_total_captures++;
@@ -258,6 +262,21 @@ bool MeleeRollbackState::SameScene(Core::System& system, u32 tick) const
   if (!slot.valid || slot.tick != tick)
     return false;
   return slot.scene == ReadWatch(system, m_watches.front());
+}
+
+u64 MeleeRollbackState::AsyncIOEpoch(Core::System& system)
+{
+  return system.GetDSP().GetARAMDMACompletionCount() +
+         system.GetDVDThread().GetNonDTKReadsCompleted() +
+         system.GetDVDInterface().GetNonDTKCommandsCompleted();
+}
+
+bool MeleeRollbackState::IOEpochUnchanged(Core::System& system, u32 tick) const
+{
+  const Slot& slot = m_ring[tick % RING_SIZE];
+  if (!slot.valid || slot.tick != tick)
+    return false;
+  return slot.io_epoch == AsyncIOEpoch(system);
 }
 
 s64 MeleeRollbackState::OldestTick() const

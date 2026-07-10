@@ -87,6 +87,7 @@ void DSPManager::DoState(PointerWrap& p)
   p.Do(m_aram_mode);
   p.Do(m_aram_refresh);
   p.Do(m_dsp_slice);
+  p.Do(m_aram_dma_completion_count);
 
   m_dsp_emulator->DoState(p);
 }
@@ -99,6 +100,7 @@ void DSPManager::GlobalCompleteARAM(Core::System& system, u64 userdata, s64 cycl
 void DSPManager::CompleteARAM(u64 userdata, s64 cyclesLate)
 {
   m_dsp_control.DMAState = 0;
+  m_aram_dma_completion_count++;
   GenerateDSPInterrupt(INT_ARAM, 0);
 }
 

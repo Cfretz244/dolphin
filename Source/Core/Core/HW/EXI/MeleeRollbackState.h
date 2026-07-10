@@ -59,6 +59,20 @@ public:
   // observed as permanently wedged scene progression, not a crash.
   bool SameScene(Core::System& system, u32 tick) const;
 
+  // Monotonic count of async I/O completions DELIVERED to the game (ARAM DMA
+  // interrupts + non-DTK DVD read/command completions). Distinct from the
+  // in-flight predicates (AsyncIOQuiescent): a completion that landed INSIDE
+  // a rollback window is invisible to those — nothing is pending at restore
+  // time — but restoring erases the game's record of a callback the emulator
+  // will never re-fire, and Melee's HSD synth spin-waits on ARAM loads
+  // forever (observed: both-peer stall right after a torture restore with
+  // zero in-flight skips).
+  static u64 AsyncIOEpoch(Core::System& system);
+
+  // True when no async completion has been delivered since the ring entry
+  // for `tick` was captured — i.e. restoring to it cannot swallow one.
+  bool IOEpochUnchanged(Core::System& system, u32 tick) const;
+
   // Oldest restorable tick given the current ring contents, or -1 if none.
   s64 OldestTick() const;
 
@@ -109,6 +123,7 @@ private:
     u32 tick = 0;
     u32 scene = 0;  // first watch (major-scene) at capture time
     u64 timebase = 0;  // game-visible TB at capture (see Restore)
+    u64 io_epoch = 0;  // AsyncIOEpoch at capture (see IOEpochUnchanged)
     std::vector<u8> data;  // concatenated regions, m_snapshot_bytes long
   };
 

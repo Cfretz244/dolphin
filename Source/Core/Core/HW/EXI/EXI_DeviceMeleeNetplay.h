@@ -207,6 +207,7 @@ private:
   u32 m_rollback_refused_scene = 0;
   u32 m_checksums_skipped = 0;
   u32 m_restore_refused_io = 0;  // deferred/skipped restores: async I/O in flight
+  u32 m_restore_refused_epoch = 0;  // deferred/skipped: completion landed in window
 
   // --- CPU-thread transaction state
   u8 m_command = CMD_ID;

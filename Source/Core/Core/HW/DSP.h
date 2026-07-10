@@ -107,6 +107,12 @@ public:
   // the game does not learn of completion until the interrupt).
   bool IsARAMDMAInProgress() const { return m_dsp_control.DMAState != 0; }
 
+  // Total ARAM DMA completions delivered to the game (bumped when the
+  // "ARAMint" event fires). Restoring game memory to a snapshot older than
+  // the latest delivery erases the game's record of a completion the
+  // emulator will never re-fire; snapshotting this count detects that.
+  u64 GetARAMDMACompletionCount() const { return m_aram_dma_completion_count; }
+
 private:
   void GenerateDSPInterrupt(u64 DSPIntType, s64 cyclesLate);
   static void GlobalGenerateDSPInterrupt(Core::System& system, u64 DSPIntType, s64 cyclesLate);
@@ -185,6 +191,9 @@ private:
   u16 m_aram_mode = 0;
   u16 m_aram_refresh = 0;
   int m_dsp_slice = 0;
+
+  // See GetARAMDMACompletionCount().
+  u64 m_aram_dma_completion_count = 0;
 
   std::unique_ptr<DSPEmulator> m_dsp_emulator;
 

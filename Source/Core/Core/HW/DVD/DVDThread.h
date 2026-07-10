@@ -91,6 +91,12 @@ public:
   // Non-blocking, unlike WaitUntilIdle(). CPU thread only.
   bool HasPendingReads() const;
 
+  // Total non-DTK read completions delivered to the game (bumped at
+  // FinishRead). Restoring game memory to a snapshot older than the latest
+  // delivery erases the game's record of a completion the emulator will
+  // never re-fire; snapshotting this count detects that.
+  u64 GetNonDTKReadsCompleted() const { return m_non_dtk_reads_completed; }
+
 private:
   void WaitUntilIdle();
 
@@ -135,6 +141,9 @@ private:
 
   // IDs of outstanding non-DTK requests (see HasPendingReads).
   std::set<u64> m_pending_non_dtk_reads;
+
+  // See GetNonDTKReadsCompleted().
+  u64 m_non_dtk_reads_completed = 0;
 
   Common::WorkQueueThreadSP<ReadRequest> m_dvd_thread;
 
