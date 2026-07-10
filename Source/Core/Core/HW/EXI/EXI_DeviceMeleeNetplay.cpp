@@ -494,6 +494,18 @@ void CEXIMeleeNetplay::ReportStalls()
                "MeleeNetplay: rate={:.1f} ticks/s ({:.0f}% of 60Hz) | stall us over {} ticks: "
                "p50={} p90={} p99={} max={}",
                rate, 100.0 * rate / 60.0, n, pct(0.50), pct(0.90), pct(0.99), sorted[n - 1]);
+  // Async-I/O epoch source diagnosis: which completion class churns, and how
+  // often each in-flight predicate is up at the sample instant. R1 smoke #1
+  // showed ~100 completions/s starving both restore gates; the split names
+  // the autonomous (never-awaited) source to exclude, like DTK in gate v2.
+  INFO_LOG_FMT(EXPANSIONINTERFACE,
+               "MeleeNetplay: io epoch: aram={} dvdread={} dicmd={} | inflight now: aram={} "
+               "dvdread={} dicmd={}",
+               m_system.GetDSP().GetARAMDMACompletionCount(),
+               m_system.GetDVDThread().GetNonDTKReadsCompleted(),
+               m_system.GetDVDInterface().GetNonDTKCommandsCompleted(),
+               m_system.GetDSP().IsARAMDMAInProgress(), m_system.GetDVDThread().HasPendingReads(),
+               m_system.GetDVDInterface().IsCommandPending());
   if (m_window != 0)
   {
     INFO_LOG_FMT(EXPANSIONINTERFACE,
@@ -634,21 +646,37 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       {
         const u32 target = m_confirmed_frontier;
         const u32 depth = m_serve_tick - target;
-        if (!AsyncIOQuiescent())
+        if (!AsyncIOQuiescent() && m_rollback_io_defer_streak < 120)
         {
-          // In-flight ARAM/DVD transfer (see AsyncIOQuiescent). Unlike the
-          // scene case this is recoverable: the transfer completes in bounded
-          // emulated time, so leave m_rollback_needed set and retry at the
-          // next POLL — the game plays on predictions a tick longer.
+          // In-flight ARAM/DVD transfer (see AsyncIOQuiescent). Usually
+          // recoverable: the transfer completes in bounded emulated time, so
+          // leave m_rollback_needed set and retry at the next POLL — the
+          // game plays on predictions a tick longer. BUT a chronically-up
+          // predicate (autonomous traffic; R1 smoke #1 logged 23k straight
+          // refusals) must not starve the frontier forever: past ~2s of
+          // consecutive defers, fall through to the epoch/scene handling
+          // below, which accepts divergence loudly rather than deadlocking.
           m_restore_refused_io++;
+          m_rollback_io_defer_streak++;
         }
         else if (m_rollback.IsLoaded() && !m_rollback.IOEpochUnchanged(m_system, target))
         {
           // A completion was DELIVERED inside the window (see the torture
-          // path): this slot is permanently unrestorable, but the frontier
-          // advances as real inputs arrive, moving the target onto a slot
-          // captured after the delivery. Defer like the in-flight case.
+          // path): this slot is PERMANENTLY unrestorable (the epoch only
+          // grows), and the frontier cannot advance past a mispredicted tick
+          // without the rollback -- deferring here deadlocks the frontier
+          // forever (R1 smoke #1: frontier_lag 24k, 50k refusals, oracle
+          // blind). Degrade like the scene case instead: accept the
+          // divergence loudly and move on; the checksum oracle downstream
+          // reports it if the mispredict mattered.
+          ERROR_LOG_FMT(EXPANSIONINTERFACE,
+                        "MeleeNetplay: ROLLBACK REFUSED at tick {} depth {} (async completion "
+                        "in window; accepting divergence)",
+                        m_serve_tick, depth);
           m_restore_refused_epoch++;
+          m_rollback_needed = false;
+          m_rollback_io_defer_streak = 0;
+          m_confirmed_frontier++;  // treat the mismatched tick as confirmed-wrong
         }
         else if (!m_rollback.IsLoaded() || !m_rollback.SameScene(m_system, target))
         {
@@ -660,6 +688,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
                         m_serve_tick, depth);
           m_rollback_refused_scene++;
           m_rollback_needed = false;
+          m_rollback_io_defer_streak = 0;
           m_confirmed_frontier++;  // treat the mismatched tick as confirmed-wrong
         }
         else if (m_rollback.Restore(m_system, target))
@@ -681,6 +710,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
           m_rollback_count++;
           m_rollback_depth_max = std::max(m_rollback_depth_max, depth);
           m_rollback_needed = false;
+          m_rollback_io_defer_streak = 0;
           return (u32(POLL_REPLAY) << 24) | depth;
         }
         else
@@ -688,6 +718,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
           ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: ROLLBACK restore failed at tick {}",
                         m_serve_tick);
           m_rollback_needed = false;
+          m_rollback_io_defer_streak = 0;
           m_confirmed_frontier++;
         }
       }
