@@ -437,7 +437,14 @@ bool DVDInterface::IsDiscInside() const
 
 bool DVDInterface::IsCommandPending() const
 {
-  return m_system.GetCoreTiming().IsScheduled(m_finish_executing_command);
+  // The DTK streaming pump keeps one m_finish_executing_command event queued
+  // at ALL times (it reschedules itself even when no audio is streaming, see
+  // UpdateDTK) -- it is emulator-side state the game never waits on, so only
+  // non-DTK completions count. Reply type is packed in the high half of the
+  // userdata (PackFinishExecutingCommandUserdata).
+  return m_system.GetCoreTiming().IsScheduled(
+      m_finish_executing_command,
+      [](u64 userdata) { return static_cast<ReplyType>(userdata >> 32) != ReplyType::DTK; });
 }
 
 void DVDInterface::AutoChangeDiscCallback(Core::System& system, u64 userdata, s64 cyclesLate)

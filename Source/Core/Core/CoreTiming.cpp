@@ -323,6 +323,14 @@ bool CoreTimingManager::IsScheduled(EventType* event_type) const
                              [&](const Event& e) { return e.type == event_type; });
 }
 
+bool CoreTimingManager::IsScheduled(
+    EventType* event_type, const std::function<bool(u64 userdata)>& userdata_filter) const
+{
+  return std::ranges::any_of(m_event_queue, [&](const Event& e) {
+    return e.type == event_type && userdata_filter(e.userdata);
+  });
+}
+
 void CoreTimingManager::ForceExceptionCheck(s64 cycles)
 {
   cycles = std::max<s64>(0, cycles);

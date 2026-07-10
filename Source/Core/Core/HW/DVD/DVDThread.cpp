@@ -55,6 +55,7 @@ void DVDThread::Stop()
 
   m_result_queue.Clear();
   m_result_map.clear();
+  m_pending_non_dtk_reads.clear();
 
   m_disc.reset();
 }
@@ -73,6 +74,7 @@ void DVDThread::DoState(PointerWrap& p)
 
   p.Do(m_result_map);
   p.Do(m_next_id);
+  p.Do(m_pending_non_dtk_reads);
 
   // m_disc isn't savestated (because it points to files on the
   // local system). Instead, we check that the status of the disc
@@ -179,7 +181,7 @@ void DVDThread::WaitUntilIdle()
 
 bool DVDThread::HasPendingReads() const
 {
-  return m_system.GetCoreTiming().IsScheduled(m_finish_read);
+  return !m_pending_non_dtk_reads.empty();
 }
 
 void DVDThread::StartRead(u64 dvd_offset, u32 length, const DiscIO::Partition& partition,
@@ -218,6 +220,9 @@ void DVDThread::StartReadInternal(bool copy_to_ram, u32 output_address, u64 dvd_
 
   request.time_started_ticks = core_timing.GetTicks();
   request.realtime_started_us = Common::Timer::NowUs();
+
+  if (reply_type != DVD::ReplyType::DTK)
+    m_pending_non_dtk_reads.insert(id);
 
   m_dvd_thread.Push(std::move(request));
   core_timing.ScheduleEvent(ticks_until_completion, m_finish_read, id);
@@ -260,6 +265,8 @@ void DVDThread::FinishRead(u64 id, s64 cycles_late)
     }
   }
   // We have now obtained the right ReadResult.
+
+  m_pending_non_dtk_reads.erase(id);
 
   const ReadRequest& request = result.first;
   const std::vector<u8>& buffer = result.second;

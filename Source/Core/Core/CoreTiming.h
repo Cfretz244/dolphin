@@ -16,6 +16,7 @@
 // inside callback:
 //   ScheduleEvent(periodInCycles - cyclesLate, callback, "whatever")
 
+#include <functional>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -126,7 +127,12 @@ public:
 
   // True while an event of this type sits in the queue. CPU thread only; does
   // not see events staged from other threads before the next MoveEvents().
+  // The filtered form only counts events whose userdata passes the predicate
+  // (for event types shared by several uses, e.g. DVD's command-finish event
+  // doubling as the free-running DTK ticker).
   bool IsScheduled(EventType* event_type) const;
+  bool IsScheduled(EventType* event_type,
+                   const std::function<bool(u64 userdata)>& userdata_filter) const;
 
   // Advance must be called at the beginning of dispatcher loops, not the end. Advance() ends
   // the previous timing slice and begins the next one, you must Advance from the previous

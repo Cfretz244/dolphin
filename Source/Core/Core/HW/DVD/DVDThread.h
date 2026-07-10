@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -84,10 +85,10 @@ public:
                               const DiscIO::Partition& partition, DVD::ReplyType reply_type,
                               s64 ticks_until_completion);
 
-  // True while any read's completion event is still queued. The event is
-  // scheduled at StartRead time (the worker thread only fills in the data),
-  // so this covers a request's whole emulated lifetime. Non-blocking, unlike
-  // WaitUntilIdle(). CPU thread only.
+  // True while any GAME-VISIBLE read is outstanding (from StartRead until its
+  // FinishRead event fires). DTK reads are excluded: the streaming-audio pump
+  // free-runs forever and is emulator-side state the game never waits on.
+  // Non-blocking, unlike WaitUntilIdle(). CPU thread only.
   bool HasPendingReads() const;
 
 private:
@@ -131,6 +132,9 @@ private:
   CoreTiming::EventType* m_finish_read = nullptr;
 
   u64 m_next_id = 0;
+
+  // IDs of outstanding non-DTK requests (see HasPendingReads).
+  std::set<u64> m_pending_non_dtk_reads;
 
   Common::WorkQueueThreadSP<ReadRequest> m_dvd_thread;
 

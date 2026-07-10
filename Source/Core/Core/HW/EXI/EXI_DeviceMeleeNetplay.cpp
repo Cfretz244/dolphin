@@ -900,8 +900,11 @@ void CEXIMeleeNetplay::MaybeTorture()
       // interval; the next one is a tick-count away.
       m_restore_refused_io++;
       INFO_LOG_FMT(EXPANSIONINTERFACE,
-                   "MeleeRollback: torture skipped at tick {} (async I/O in flight)",
-                   m_serve_tick);
+                   "MeleeRollback: torture skipped at tick {} (async I/O in flight: aram={} "
+                   "dvdread={} dicmd={})",
+                   m_serve_tick, m_system.GetDSP().IsARAMDMAInProgress(),
+                   m_system.GetDVDThread().HasPendingReads(),
+                   m_system.GetDVDInterface().IsCommandPending());
     }
     else if (m_rollback.Restore(m_system, target))
     {
