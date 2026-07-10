@@ -63,6 +63,14 @@ void JitArm64::EmitBackpatchRoutine(u32 flags, MemAccessMode mode, ARM64Reg RS, 
   if (m_accurate_cpu_cache_enabled)
     mode = MemAccessMode::AlwaysSlowAccess;
 
+  // Watchpoints (memchecks) are only tested in the C++ helpers
+  // (ReadFromJit/WriteFromJit -> MMU::Memcheck); both the fastmem path and
+  // the non-fastmem inline page-table path skip them. Blocks are recompiled
+  // when the first memcheck is added (MemChecks::Update clears the cache),
+  // so this only slows runs that actually trace.
+  if (m_system.GetPowerPC().GetMemChecks().HasAny())
+    mode = MemAccessMode::AlwaysSlowAccess;
+
   const bool emit_fast_access = mode != MemAccessMode::AlwaysSlowAccess;
   const bool emit_slow_access = mode != MemAccessMode::AlwaysFastAccess;
 
