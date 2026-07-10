@@ -646,7 +646,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       {
         const u32 target = m_confirmed_frontier;
         const u32 depth = m_serve_tick - target;
-        if (!AsyncIOQuiescent() && m_rollback_io_defer_streak < 120)
+        if (!AsyncIOQuiescent() && m_rollback_io_defer_streak < 2000)
         {
           // In-flight ARAM/DVD transfer (see AsyncIOQuiescent). Usually
           // recoverable: the transfer completes in bounded emulated time, so
@@ -721,6 +721,18 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
           m_rollback_io_defer_streak = 0;
           m_confirmed_frontier++;
         }
+      }
+      if (m_rollback_needed)
+      {
+        // PARK while a rollback is pending (io-deferred above): serving more
+        // ticks past a stalled frontier grows the restore depth without
+        // bound — past RING_SIZE the snapshot AND the frame history are gone
+        // and the rollback becomes impossible by construction (R1 smoke #2:
+        // depth 45, frontier deadlocked 24k ticks). Parking bounds depth at
+        // ~W, keeps history alive, and the game spinning at POLL still
+        // advances CoreTiming, so the in-flight transfer actually drains.
+        Common::SleepCurrentThread(1);
+        return u32(POLL_WAIT) << 24;
       }
     }
     if (FrameReady(m_serve_tick))
@@ -1067,10 +1079,13 @@ void CEXIMeleeNetplay::DMARead(u32 address, u32 size)
           std::memcpy(pads + port * PAD_BYTES, it->second.pads[port].data(), PAD_BYTES);
         // Keep a rollback window of history — replays re-read these ticks.
         // (Pure lockstep pruned everything up to the serve tick here.)
+        // Never prune at/above the confirmed frontier: validation needs the
+        // real inputs there, and a pending rollback needs the whole span.
         if (m_serve_tick > MeleeRollbackState::RING_SIZE)
         {
-          m_frames.erase(m_frames.begin(),
-                         m_frames.upper_bound(m_serve_tick - MeleeRollbackState::RING_SIZE));
+          const u32 prune_to =
+              std::min(m_serve_tick - MeleeRollbackState::RING_SIZE, m_confirmed_frontier);
+          m_frames.erase(m_frames.begin(), m_frames.upper_bound(prune_to));
         }
       }
       else
