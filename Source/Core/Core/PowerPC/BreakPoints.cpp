@@ -19,6 +19,7 @@
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PPCSymbolDB.h"
+#include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
 BreakPoints::BreakPoints(Core::System& system) : m_system(system)
@@ -432,9 +433,13 @@ bool TMemCheck::Action(Core::System& system, u64 value, u32 addr, bool write, si
     if (log_on_hit)
     {
       auto& ppc_symbol_db = system.GetPPCSymbolDB();
-      NOTICE_LOG_FMT(MEMMAP, "MBP {:08x} ({}) {}{} {:x} at {:08x} ({})", pc,
+      // LR identifies the CALLER when the accessing instruction sits in a
+      // leaf helper every caller shares (e.g. an RNG's store to its seed).
+      const u32 lr = LR(system.GetPPCState());
+      NOTICE_LOG_FMT(MEMMAP, "MBP {:08x} ({}) {}{} {:x} at {:08x} ({}) lr={:08x} ({})", pc,
                      ppc_symbol_db.GetDescription(pc), write ? "Write" : "Read", size * 8, value,
-                     addr, ppc_symbol_db.GetDescription(addr));
+                     addr, ppc_symbol_db.GetDescription(addr), lr,
+                     ppc_symbol_db.GetDescription(lr));
     }
     if (break_on_hit)
       return true;

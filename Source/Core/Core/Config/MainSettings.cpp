@@ -200,6 +200,14 @@ const Info<int> MAIN_MELEE_NETPLAY_TORTURE_DEPTH{{System::Main, "MeleeNetplay", 
 // Max rollback window W (ticks the game may run ahead on predicted remote
 // inputs). 0 = pure lockstep. Host-imposed on the client via HELLO, like Delay.
 const Info<int> MAIN_MELEE_NETPLAY_WINDOW{{System::Main, "MeleeNetplay", "Window"}, 0};
+// Diagnostic: arm a log-only write watchpoint on this address (u32) at device
+// init. Every PPC store there logs PC, value AND LR -- with the game's RNG
+// seed as the target, the log names every HSD_Rand caller in order, so the
+// first divergent entry between two peers' logs identifies a
+// nondeterministic RNG consumer precisely. 0 = off. Forces the slow
+// (watchpoint-aware) JIT memory path; expect a big slowdown.
+const Info<u32> MAIN_MELEE_NETPLAY_TRACE_SEED_WRITES{
+    {System::Main, "MeleeNetplay", "TraceSeedWrites"}, 0};
 
 const Info<SerialInterface::SIDevices>& GetInfoForSIDevice(int channel)
 {

@@ -20,6 +20,8 @@
 #include "Core/HW/DVD/DVDInterface.h"
 #include "Core/HW/DVD/DVDThread.h"
 #include "Core/HW/Memmap.h"
+#include "Core/PowerPC/BreakPoints.h"
+#include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
 namespace ExpansionInterface
@@ -79,6 +81,22 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
 
   const int ports_cfg = Config::Get(Config::MAIN_MELEE_NETPLAY_LOCAL_PORTS);
   m_local_mask = ports_cfg != 0 ? static_cast<u8>(ports_cfg) : (m_is_host ? 0x01 : 0x02);
+
+  const u32 trace_seed_addr = Config::Get(Config::MAIN_MELEE_NETPLAY_TRACE_SEED_WRITES);
+  if (trace_seed_addr != 0)
+  {
+    TMemCheck mc;
+    mc.start_address = trace_seed_addr;
+    mc.end_address = trace_seed_addr + 3;
+    mc.is_ranged = true;
+    mc.is_break_on_write = true;  // gates logging; break_on_hit=false so it never pauses
+    mc.log_on_hit = true;
+    mc.break_on_hit = false;
+    m_system.GetPowerPC().GetMemChecks().Add(std::move(mc));
+    WARN_LOG_FMT(EXPANSIONINTERFACE,
+                 "MeleeNetplay: TRACING writes to {:08x} (log-only watchpoint; slow)",
+                 trace_seed_addr);
+  }
 
   m_fake_latency_ms = std::max(0, Config::Get(Config::MAIN_MELEE_NETPLAY_FAKE_LATENCY_MS));
   m_fake_jitter_ms = std::max(0, Config::Get(Config::MAIN_MELEE_NETPLAY_FAKE_JITTER_MS));
