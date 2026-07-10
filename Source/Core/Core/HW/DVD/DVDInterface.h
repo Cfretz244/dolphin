@@ -141,6 +141,11 @@ public:
   void SetDisc(std::unique_ptr<DiscIO::VolumeDisc> disc,
                std::optional<std::vector<std::string>> auto_disc_change_paths);
   bool IsDiscInside() const;
+
+  // True while a DI command's completion event (TCINT etc.) is still queued.
+  // CPU thread only.
+  bool IsCommandPending() const;
+
   void EjectDisc(const Core::CPUThreadGuard& guard, EjectCause cause);
   void ChangeDisc(const Core::CPUThreadGuard& guard, const std::vector<std::string>& paths);
   void ChangeDisc(const Core::CPUThreadGuard& guard, const std::string& new_path);

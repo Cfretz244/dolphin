@@ -435,6 +435,11 @@ bool DVDInterface::IsDiscInside() const
   return m_system.GetDVDThread().HasDisc();
 }
 
+bool DVDInterface::IsCommandPending() const
+{
+  return m_system.GetCoreTiming().IsScheduled(m_finish_executing_command);
+}
+
 void DVDInterface::AutoChangeDiscCallback(Core::System& system, u64 userdata, s64 cyclesLate)
 {
   system.GetDVDInterface().AutoChangeDisc(Core::CPUThreadGuard{system});

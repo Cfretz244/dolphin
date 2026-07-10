@@ -177,6 +177,11 @@ void DVDThread::WaitUntilIdle()
   m_dvd_thread.WaitForCompletion();
 }
 
+bool DVDThread::HasPendingReads() const
+{
+  return m_system.GetCoreTiming().IsScheduled(m_finish_read);
+}
+
 void DVDThread::StartRead(u64 dvd_offset, u32 length, const DiscIO::Partition& partition,
                           DVD::ReplyType reply_type, s64 ticks_until_completion)
 {

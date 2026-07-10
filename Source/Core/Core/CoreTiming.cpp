@@ -317,6 +317,12 @@ void CoreTimingManager::RemoveAllEvents(EventType* event_type)
   RemoveEvent(event_type);
 }
 
+bool CoreTimingManager::IsScheduled(EventType* event_type) const
+{
+  return std::ranges::any_of(m_event_queue,
+                             [&](const Event& e) { return e.type == event_type; });
+}
+
 void CoreTimingManager::ForceExceptionCheck(s64 cycles)
 {
   cycles = std::max<s64>(0, cycles);

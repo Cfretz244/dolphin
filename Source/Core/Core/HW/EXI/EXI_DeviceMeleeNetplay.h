@@ -174,6 +174,10 @@ private:
     return m_game_crc_seen && m_game_crc_last != m_game_crc_prev;
   }
   void MaybeTorture();
+  // No emulator-level async I/O toward the game is pending (ARAM DMA, DVD
+  // reads, DI command completions). Restore/rollback must not run otherwise:
+  // the rolled-back game re-waits on a completion that will never re-fire.
+  bool AsyncIOQuiescent() const;
 
   // --- prediction + rollback (R1; window > 0 enables, 0 = pure lockstep)
   //
@@ -199,6 +203,7 @@ private:
   u32 m_rollback_depth_max = 0;
   u32 m_rollback_refused_scene = 0;
   u32 m_checksums_skipped = 0;
+  u32 m_restore_refused_io = 0;  // deferred/skipped restores: async I/O in flight
 
   // --- CPU-thread transaction state
   u8 m_command = CMD_ID;

@@ -84,6 +84,12 @@ public:
                               const DiscIO::Partition& partition, DVD::ReplyType reply_type,
                               s64 ticks_until_completion);
 
+  // True while any read's completion event is still queued. The event is
+  // scheduled at StartRead time (the worker thread only fills in the data),
+  // so this covers a request's whole emulated lifetime. Non-blocking, unlike
+  // WaitUntilIdle(). CPU thread only.
+  bool HasPendingReads() const;
+
 private:
   void WaitUntilIdle();
 

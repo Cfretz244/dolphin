@@ -102,6 +102,11 @@ public:
   void UpdateAudioDMA();
   void UpdateDSPSlice(int cycles);
 
+  // True from the AR_DMA_CNT_L write that starts an ARAM DMA until the
+  // "ARAMint" completion event fires (the data copy itself is immediate, but
+  // the game does not learn of completion until the interrupt).
+  bool IsARAMDMAInProgress() const { return m_dsp_control.DMAState != 0; }
+
 private:
   void GenerateDSPInterrupt(u64 DSPIntType, s64 cyclesLate);
   static void GlobalGenerateDSPInterrupt(Core::System& system, u64 DSPIntType, s64 cyclesLate);

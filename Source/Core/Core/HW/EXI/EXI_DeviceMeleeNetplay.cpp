@@ -16,6 +16,9 @@
 #include "Common/Thread.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
+#include "Core/HW/DSP.h"
+#include "Core/HW/DVD/DVDInterface.h"
+#include "Core/HW/DVD/DVDThread.h"
 #include "Core/HW/Memmap.h"
 #include "Core/System.h"
 
@@ -490,9 +493,10 @@ void CEXIMeleeNetplay::ReportStalls()
   {
     INFO_LOG_FMT(EXPANSIONINTERFACE,
                  "MeleeNetplay: rollback stats: predicted={} validated_ok={} rollbacks={} "
-                 "max_depth={} refused_scene={} checksums_skipped={} frontier_lag={}",
+                 "max_depth={} refused_scene={} refused_io={} checksums_skipped={} "
+                 "frontier_lag={}",
                  m_predicted_ticks, m_validated_ok, m_rollback_count, m_rollback_depth_max,
-                 m_rollback_refused_scene, m_checksums_skipped,
+                 m_rollback_refused_scene, m_restore_refused_io, m_checksums_skipped,
                  m_serve_tick - m_confirmed_frontier);
   }
 
@@ -625,7 +629,15 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       {
         const u32 target = m_confirmed_frontier;
         const u32 depth = m_serve_tick - target;
-        if (!m_rollback.IsLoaded() || !m_rollback.SameScene(m_system, target))
+        if (!AsyncIOQuiescent())
+        {
+          // In-flight ARAM/DVD transfer (see AsyncIOQuiescent). Unlike the
+          // scene case this is recoverable: the transfer completes in bounded
+          // emulated time, so leave m_rollback_needed set and retry at the
+          // next POLL — the game plays on predictions a tick longer.
+          m_restore_refused_io++;
+        }
+        else if (!m_rollback.IsLoaded() || !m_rollback.SameScene(m_system, target))
         {
           // Unrecoverable: the mispredicted ticks straddle a scene change (or
           // there is no snapshot machinery). Accept the divergence loudly —
@@ -820,6 +832,21 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
   }
 }
 
+bool CEXIMeleeNetplay::AsyncIOQuiescent() const
+{
+  // Restoring memory while an ARAM DMA or DVD read is in flight rolls the
+  // game's request bookkeeping back to before the request, but the
+  // emulator-level completion interrupt belongs to the OLD request and will
+  // not re-fire for the restored one — the game then waits on a callback
+  // that never comes, outside the exchange, forever (observed ~1/200
+  // tortures). All three signals are CoreTiming-event-backed, so a pending
+  // transfer always completes in bounded emulated time; callers defer or
+  // skip, never block.
+  return !m_system.GetDSP().IsARAMDMAInProgress() &&
+         !m_system.GetDVDThread().HasPendingReads() &&
+         !m_system.GetDVDInterface().IsCommandPending();
+}
+
 void CEXIMeleeNetplay::MaybeTorture()
 {
   // R0a (mode 1): restore the snapshot captured microseconds ago for THIS
@@ -864,6 +891,16 @@ void CEXIMeleeNetplay::MaybeTorture()
     {
       INFO_LOG_FMT(EXPANSIONINTERFACE,
                    "MeleeRollback: torture skipped at tick {} (scene changed in window)",
+                   m_serve_tick);
+    }
+    else if (!AsyncIOQuiescent())
+    {
+      // See AsyncIOQuiescent: restoring under an in-flight ARAM/DVD transfer
+      // wedges the game on a completion that never re-fires. Skip this
+      // interval; the next one is a tick-count away.
+      m_restore_refused_io++;
+      INFO_LOG_FMT(EXPANSIONINTERFACE,
+                   "MeleeRollback: torture skipped at tick {} (async I/O in flight)",
                    m_serve_tick);
     }
     else if (m_rollback.Restore(m_system, target))

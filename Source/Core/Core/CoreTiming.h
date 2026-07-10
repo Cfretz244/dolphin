@@ -124,6 +124,10 @@ public:
   void RemoveEvent(EventType* event_type);
   void RemoveAllEvents(EventType* event_type);
 
+  // True while an event of this type sits in the queue. CPU thread only; does
+  // not see events staged from other threads before the next MoveEvents().
+  bool IsScheduled(EventType* event_type) const;
+
   // Advance must be called at the beginning of dispatcher loops, not the end. Advance() ends
   // the previous timing slice and begins the next one, you must Advance from the previous
   // slice to the current one before executing any cycles. CoreTiming starts in slice -1 so an
