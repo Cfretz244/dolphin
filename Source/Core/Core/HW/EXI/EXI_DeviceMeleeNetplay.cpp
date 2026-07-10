@@ -752,6 +752,12 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
     {
       SendInputs(ReadBE32(buf), buf + 4);
       EnsureSeedTraceArmed("CMD_SEND");
+      // Per-tick markers interleave with the MBP stream so each traced write
+      // attributes to an exact game tick (checksum lines are 60-coarse and
+      // stop entirely at a desync -- exactly where attribution matters most).
+      if (m_trace_seed_addr != 0)
+        NOTICE_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: trace tick={} replaying={}",
+                       m_serve_tick, m_replay_serving);
       // Snapshot point: the game is parked in this transaction at the top of
       // tick m_serve_tick, before that tick's inputs are injected or its
       // logic runs — ring[T] is the pre-state of tick T.
