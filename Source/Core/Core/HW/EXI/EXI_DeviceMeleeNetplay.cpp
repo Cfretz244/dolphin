@@ -696,7 +696,17 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
           m_park_di_target =
               dvdi.IsCommandPending() ? dvdi.GetNonDTKCommandsCompleted() + 1 : 0;
         }
+        // ARAM must be fully IDLE, not just first-wave-complete: ARQ loads
+        // are CASCADES (chunk N's completion callback issues chunk N+1), and
+        // restoring between chunks rolls the game's queue bookkeeping back
+        // mid-chain -- observed as the lbarq queue-head pointer differing
+        // across peers right after a short-park rollback (smoke #10). The
+        // game's ARQ interrupt handler keeps running while we park (the EXI
+        // spin executes with interrupts enabled), so the cascade drains in
+        // a few ms; unlike DVD streaming, ARAM traffic is sparse, so
+        // idle-wait converges.
         const bool parked_io_pending =
+            dsp.IsARAMDMAInProgress() ||
             (m_park_aram_target != 0 &&
              dsp.GetARAMDMACompletionCount() < m_park_aram_target) ||
             dvdt.GetNonDTKReadsCompleted() < m_park_dvd_target ||
