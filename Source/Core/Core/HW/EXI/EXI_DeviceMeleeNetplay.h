@@ -124,6 +124,15 @@ private:
   std::thread m_net_thread;
   Common::Flag m_running;
 
+  // --- wedge diagnostics: logs the emulated PC/LR while the exchange is
+  // stalled. The disc5/disc9 wedge signature is the game running frames at
+  // full speed but never reaching the exchange again; native samples only
+  // show anonymous JIT blocks, so name the loop from the PPC side instead.
+  // PC/LR reads are cross-thread and racy — diagnostic only.
+  std::thread m_diag_thread;
+  std::atomic<s64> m_last_exchange_us{0};
+  void DiagThread();
+
   // --- simulated network conditions (testing only; 0 = disabled)
   int m_fake_latency_ms = 0;
   int m_fake_jitter_ms = 0;

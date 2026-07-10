@@ -135,6 +135,7 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
 
   m_running.Set();
   m_net_thread = std::thread(&CEXIMeleeNetplay::NetThread, this);
+  m_diag_thread = std::thread(&CEXIMeleeNetplay::DiagThread, this);
 }
 
 CEXIMeleeNetplay::~CEXIMeleeNetplay()
@@ -143,6 +144,33 @@ CEXIMeleeNetplay::~CEXIMeleeNetplay()
   m_socket.disconnect();
   if (m_net_thread.joinable())
     m_net_thread.join();
+  if (m_diag_thread.joinable())
+    m_diag_thread.join();
+}
+
+void CEXIMeleeNetplay::DiagThread()
+{
+  Common::SetCurrentThreadName("MeleeNetplayDiag");
+  while (m_running.IsSet())
+  {
+    Common::SleepCurrentThread(500);
+    if (!m_session_ready.load())
+      continue;
+    const s64 last = m_last_exchange_us.load();
+    if (last == 0)
+      continue;
+    const s64 now = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    if (now - last < 2'000'000)
+      continue;
+    const auto& ppc = m_system.GetPPCState();
+    NOTICE_LOG_FMT(EXPANSIONINTERFACE,
+                   "MeleeNetplay: exchange stalled {} ms: serve_tick={} pc={:08x} lr={:08x} "
+                   "pending_replay={} replay_serving={} rollback_needed={}",
+                   (now - last) / 1000, m_serve_tick, ppc.pc, LR(ppc), m_pending_replay,
+                   m_replay_serving, m_rollback_needed);
+  }
 }
 
 bool CEXIMeleeNetplay::IsPresent() const
@@ -910,6 +938,9 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
   case CMD_SEND:
     if (size >= 4 + 4 * PAD_BYTES)
     {
+      m_last_exchange_us.store(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
       SendInputs(ReadBE32(buf), buf + 4);
       EnsureSeedTraceArmed("CMD_SEND");
       // Per-tick markers interleave with the MBP stream so each traced write
