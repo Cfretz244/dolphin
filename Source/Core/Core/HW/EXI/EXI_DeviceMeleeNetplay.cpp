@@ -723,7 +723,14 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
              dsp.GetARAMDMACompletionCount() < m_park_aram_target) ||
             dvdt.GetNonDTKReadsCompleted() < m_park_dvd_target ||
             (m_park_di_target != 0 && dvdi.GetNonDTKCommandsCompleted() < m_park_di_target);
-        if (parked_io_pending && m_rollback_io_defer_streak < 1200)
+        // Cap tight: a rollback landing during an ARAM scene-load cascade
+        // otherwise parks for the whole burst (smoke #17: one park hit the
+        // old 1200 cap = 13.7s stall, 17 ticks/s run, gate starved). NOTE
+        // every desync previously attributed to restore-under-in-flight-I/O
+        // predates the input-clobber fix -- this cap doubles as the
+        // experiment: if desyncs stay gone with ~0.5s parks, the io hazard
+        // was misattributed and the parks are a politeness, not a shield.
+        if (parked_io_pending && m_rollback_io_defer_streak < 60)
         {
           m_restore_refused_io++;
           m_rollback_io_defer_streak++;
