@@ -675,16 +675,18 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       {
         const u32 target = m_confirmed_frontier;
         const u32 depth = m_serve_tick - target;
-        if (!AsyncIOQuiescent() && m_rollback_io_defer_streak < 2000)
+        if (!AsyncIOQuiescent() && m_rollback_io_defer_streak < 30)
         {
-          // In-flight ARAM/DVD transfer (see AsyncIOQuiescent). Usually
-          // recoverable: the transfer completes in bounded emulated time, so
-          // leave m_rollback_needed set and retry at the next POLL — the
-          // game plays on predictions a tick longer. BUT a chronically-up
-          // predicate (autonomous traffic; R1 smoke #1 logged 23k straight
-          // refusals) must not starve the frontier forever: past ~2s of
-          // consecutive defers, fall through to the epoch/scene handling
-          // below, which accepts divergence loudly rather than deadlocking.
+          // In-flight ARAM/DVD transfer (see AsyncIOQuiescent). Give it a
+          // token ~30 parked polls (~30ms) to complete -- the common benign
+          // case -- then restore ANYWAY. Quiescence never truly arrives
+          // under streaming (free-running DVD traffic keeps the predicates
+          // up), and R1 smoke #8 showed a long cap just converts every
+          // rollback into seconds of parked wall time (refused_io pegged,
+          // 11 ticks/s, 20s max stall) before restoring regardless. The
+          // residual hazard is the rare completion-amnesia wedge, which the
+          // harness verdict detects honestly -- same ledger as dropping the
+          // epoch gate.
           m_restore_refused_io++;
           m_rollback_io_defer_streak++;
         }
