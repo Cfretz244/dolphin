@@ -114,9 +114,17 @@ private:
   std::map<u32, Frame> m_frames;
   std::map<u32, u32> m_local_crcs;
   std::map<u32, u32> m_remote_crcs;
-  // Submitted but not yet confirmed by the frontier; transmitted on drain.
-  std::map<u32, u32> m_local_crcs_pending;
-  void DrainConfirmedChecksumsLocked();
+  // Device-side sync oracle: every HASH_INTERVAL ticks, hash the ring
+  // snapshot of the newest CONFIRMED hash tick (SnapshotChecksum) and
+  // exchange it. Snapshot hashes only ever cover confirmed, immutable
+  // pre-tick state, so no defer/park/discard protocol is needed — the
+  // game-side CMD_CHECKSUM hash-at-submission was speculative under
+  // prediction and produced false desyncs at byte-identical sims (target
+  // run 3). m_hash_tick = last hash tick emitted (or skipped).
+  static constexpr u32 HASH_INTERVAL = 60;
+  u32 m_hash_tick = 0;
+  void EmitSnapshotChecksumsLocked();
+  void CompareChecksumLocked(u32 tick, u32 local_crc, u32 remote_crc);
 
   // --- transport
   sf::TcpSocket m_socket;

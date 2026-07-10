@@ -34,9 +34,9 @@ public:
   // comfortably above any playable prediction window.
   static constexpr size_t RING_SIZE = 16;
 
-  // Parses the region table (region/exclude/heapptr lines). Returns false
-  // with *error set on malformed input. Exclusions are carved out of the
-  // regions at load time, yielding a flat copy plan.
+  // Parses the region table (region/exclude/heapptr/hash/watch lines).
+  // Returns false with *error set on malformed input. Exclusions are carved
+  // out of the regions at load time, yielding a flat copy plan.
   bool LoadRegionTable(const std::string& path, std::string* error);
 
   bool IsLoaded() const { return !m_regions.empty(); }
@@ -80,6 +80,18 @@ public:
   // region tables (same generated file for the same DOL), so cross-peer
   // equality is meaningful. Host-speed; cheap enough for every-60-ticks.
   u32 LiveChecksum(Core::System& system) const;
+
+  // Cross-peer sync oracle over CONFIRMED state ("hash" lines): FNV-1a over
+  // the hash spans as recorded in the ring entry for `tick`. Unlike a hash of
+  // live memory (the game's CMD_CHECKSUM), a snapshot hash is immutable once
+  // the tick is confirmed — it can never cover speculative or render-cadence-
+  // dependent bytes, so it is safe to exchange under prediction without any
+  // defer/park/discard protocol. Returns false if the ring no longer holds
+  // `tick` (or the table has no hash spans). Bytes a hash span shares with an
+  // exclusion are not captured and are silently skipped — identically on both
+  // peers, since they run the same generated table.
+  bool SnapshotChecksum(u32 tick, u32* out) const;
+  bool HasHashSpans() const { return !m_hash_spans.empty(); }
 
   // Replay-fidelity oracle: memcmp the LIVE regions against the ring entry
   // for `tick` and log every differing span (region label + offset + first
@@ -133,6 +145,7 @@ private:
   std::vector<Watch> m_watches;
   std::vector<Region> m_raw_regions;   // as parsed, pre-exclusion
   std::vector<Region> m_excludes;      // as parsed
+  std::vector<Region> m_hash_spans;    // as parsed (SnapshotChecksum input)
   std::vector<Region> m_regions;       // carved, final copy plan
   u32 m_heapptr_lo = 0;                // emu addr holding heap start (u32be)
   u32 m_heapptr_hi = 0;                // emu addr holding heap end (u32be)

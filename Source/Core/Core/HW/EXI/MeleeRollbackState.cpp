@@ -59,6 +59,7 @@ bool MeleeRollbackState::LoadRegionTable(const std::string& path, std::string* e
   m_excludes.clear();
   m_regions.clear();
   m_watches.clear();
+  m_hash_spans.clear();
   m_heap_resolved = false;
 
   std::string line;
@@ -87,14 +88,17 @@ bool MeleeRollbackState::LoadRegionTable(const std::string& path, std::string* e
       return false;
     }
 
-    if (kind == "region" || kind == "exclude")
+    if (kind == "region" || kind == "exclude" || kind == "hash")
     {
       if (!SaneRange(start, end))
       {
         *error = "line " + std::to_string(lineno) + ": range outside MEM1";
         return false;
       }
-      (kind == "region" ? m_raw_regions : m_excludes).push_back({start, end, label});
+      if (kind == "hash")
+        m_hash_spans.push_back({start, end, label});
+      else
+        (kind == "region" ? m_raw_regions : m_excludes).push_back({start, end, label});
     }
     else if (kind == "heapptr")
     {
@@ -133,6 +137,15 @@ bool MeleeRollbackState::LoadRegionTable(const std::string& path, std::string* e
 
   // The static copy plan (heap region joins at first capture).
   FinalizeCopyPlan();
+  if (!m_hash_spans.empty())
+  {
+    size_t hash_bytes = 0;
+    for (const Region& h : m_hash_spans)
+      hash_bytes += h.end - h.start;
+    INFO_LOG_FMT(EXPANSIONINTERFACE,
+                 "MeleeRollback: device-side sync oracle: {} hash spans, {} bytes",
+                 m_hash_spans.size(), hash_bytes);
+  }
   return true;
 }
 
@@ -359,6 +372,40 @@ int MeleeRollbackState::VerifyAgainstRing(Core::System& system, u32 tick) const
   if (spans == 0)
     INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeRollback: verify tick {}: replay byte-exact", tick);
   return spans;
+}
+
+bool MeleeRollbackState::SnapshotChecksum(u32 tick, u32* out) const
+{
+  if (m_hash_spans.empty())
+    return false;
+  const Slot& slot = m_ring[tick % RING_SIZE];
+  if (!slot.valid || slot.tick != tick || slot.data.size() != m_snapshot_bytes)
+    return false;
+
+  // Walk the copy plan once per hash span to find the captured bytes it
+  // overlaps. Plan order (and thus hash order) is deterministic and identical
+  // across peers for the static regions the hash spans live in; the heap
+  // region joins the plan at the END, so a runtime heap-bound difference can
+  // never reorder the spans hashed here.
+  u32 hash = 0x811C9DC5;
+  for (const Region& h : m_hash_spans)
+  {
+    size_t off = 0;
+    for (const Region& r : m_regions)
+    {
+      const u32 lo = std::max(h.start, r.start);
+      const u32 hi = std::min(h.end, r.end);
+      if (lo < hi)
+      {
+        const u8* p = slot.data.data() + off + (lo - r.start);
+        for (u32 i = 0; i < hi - lo; i++)
+          hash = (hash ^ p[i]) * 0x01000193;
+      }
+      off += r.end - r.start;
+    }
+  }
+  *out = hash;
+  return true;
 }
 
 u32 MeleeRollbackState::LiveChecksum(Core::System& system) const

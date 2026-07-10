@@ -397,26 +397,7 @@ void CEXIMeleeNetplay::HandleMessage(u8 type, u8 mask, u32 tick, const u8* paylo
     m_remote_crcs[tick] = remote_crc;
     const auto local = m_local_crcs.find(tick);
     if (local != m_local_crcs.end())
-    {
-      if (local->second != remote_crc)
-      {
-        ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: DESYNC at tick {} ({:08x} != {:08x})",
-                      tick, local->second, remote_crc);
-        Core::DisplayMessage(fmt::format("MeleeNetplay: DESYNC at tick {}", tick), 20000);
-        if (!m_desync_dumped && m_dump_armed_tick < 0)
-          m_dump_armed_tick = tick;
-      }
-      else
-      {
-        // A matching checksum only demonstrates determinism if the state it
-        // hashes is actually changing: a constant crc means both peers are
-        // parked on a static screen, not that the cores agree under load.
-        INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: checksum ok tick={} crc={:08x}", tick,
-                     remote_crc);
-      }
-      m_local_crcs.erase(m_local_crcs.begin(), m_local_crcs.upper_bound(tick));
-      m_remote_crcs.erase(m_remote_crcs.begin(), m_remote_crcs.upper_bound(tick));
-    }
+      CompareChecksumLocked(tick, local->second, remote_crc);
     break;
   }
   default:
@@ -642,34 +623,66 @@ void CEXIMeleeNetplay::ValidateSpeculationLocked()
   // Nothing speculative below the frontier: keep the map from growing if the
   // peer vanished mid-speculation.
   m_speculative.erase(m_speculative.begin(), m_speculative.lower_bound(m_confirmed_frontier));
-  DrainConfirmedChecksumsLocked();
+  EmitSnapshotChecksumsLocked();
 }
 
-// Transmit + compare every parked checksum whose tick the confirmed frontier
-// has passed (see CMD_CHECKSUM). m_frames_lock held by the caller.
-void CEXIMeleeNetplay::DrainConfirmedChecksumsLocked()
+// One comparison per hash tick, from whichever side completes the pair:
+// EmitSnapshotChecksumsLocked (remote already arrived) or the MSG_CHECKSUM
+// handler (local already emitted). Both erase the compared entries, so the
+// other side never re-fires. m_frames_lock held by the caller.
+void CEXIMeleeNetplay::CompareChecksumLocked(u32 tick, u32 local_crc, u32 remote_crc)
 {
-  while (!m_local_crcs_pending.empty())
+  if (local_crc != remote_crc)
   {
-    const auto it = m_local_crcs_pending.begin();
-    const u32 tick = it->first;
-    if (m_window != 0 && m_confirmed_frontier < tick)
-      break;
-    const u32 crc = it->second;
-    m_local_crcs_pending.erase(it);
+    ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: DESYNC at tick {} ({:08x} != {:08x})", tick,
+                  local_crc, remote_crc);
+    Core::DisplayMessage(fmt::format("MeleeNetplay: DESYNC at tick {}", tick), 20000);
+    if (!m_desync_dumped && m_dump_armed_tick < 0)
+      m_dump_armed_tick = tick;
+  }
+  else
+  {
+    // A matching checksum only demonstrates determinism if the state it
+    // hashes is actually changing: a constant crc means both peers are
+    // parked on a static screen, not that the cores agree under load.
+    INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: checksum ok tick={} crc={:08x}", tick,
+                 remote_crc);
+  }
+  m_local_crcs.erase(m_local_crcs.begin(), m_local_crcs.upper_bound(tick));
+  m_remote_crcs.erase(m_remote_crcs.begin(), m_remote_crcs.upper_bound(tick));
+}
+
+// Hash + transmit + compare every hash tick the confirmed boundary has
+// passed. ring[T] is the pre-state of tick T, so it is FINAL the moment
+// every tick < T is confirmed — under prediction that is the validated
+// frontier; in lockstep everything served is confirmed. A hash tick whose
+// window was corrected by a rollback is covered too: replayed RECVs
+// re-capture their slots, and the frontier can only pass T after the replay
+// that corrected it ran. m_frames_lock held by the caller.
+void CEXIMeleeNetplay::EmitSnapshotChecksumsLocked()
+{
+  if (!m_rollback.HasHashSpans())
+    return;
+  const u32 confirmed = m_window != 0 ? m_confirmed_frontier : m_serve_tick;
+  while (m_hash_tick + HASH_INTERVAL <= confirmed)
+  {
+    const u32 tick = m_hash_tick + HASH_INTERVAL;
+    m_hash_tick = tick;
+    u32 crc = 0;
+    if (!m_rollback.SnapshotChecksum(tick, &crc))
+    {
+      // Slot already recycled (frontier stalled longer than the ring is
+      // deep) — the interval goes honestly uncompared.
+      m_checksums_skipped++;
+      continue;
+    }
     u8 payload[4];
     WriteBE32(payload, crc);
     SendMessageRaw(MSG_CHECKSUM, 0, tick, payload, 4);
     m_local_crcs[tick] = crc;
     const auto remote = m_remote_crcs.find(tick);
-    if (remote != m_remote_crcs.end() && remote->second != crc)
-    {
-      ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: DESYNC at tick {} ({:08x} != {:08x})",
-                    tick, crc, remote->second);
-      Core::DisplayMessage(fmt::format("MeleeNetplay: DESYNC at tick {}", tick), 20000);
-      if (!m_desync_dumped && m_dump_armed_tick < 0)
-        m_dump_armed_tick = tick;
-    }
+    if (remote != m_remote_crcs.end())
+      CompareChecksumLocked(tick, crc, remote->second);
   }
 }
 
@@ -827,19 +840,6 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
             else
               m_speculative.erase(t);
           }
-          // Parked checksums at/after the target hash state from the pass
-          // this rollback just invalidated, and the game submits checksums
-          // from the EXCHANGE path only (nw_ExchangeMaster) -- replayed
-          // ticks never re-submit. Draining them later would compare stale
-          // hashes against the peer's correct ones: a FALSE desync at
-          // byte-identical state (smoke #12: dump diff showed zero unmasked
-          // player_slots differences at the "desync"). Discard them; the
-          // crossed interval simply goes uncompared.
-          for (auto it = m_local_crcs_pending.lower_bound(target);
-               it != m_local_crcs_pending.end(); it = m_local_crcs_pending.erase(it))
-          {
-            m_checksums_skipped++;
-          }
           INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: ROLLBACK tick {} -> {} (replay {})",
                        m_serve_tick, target, depth);
           m_serve_tick = target;
@@ -963,6 +963,14 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
                        m_rollback.SnapshotBytes() / (1024.0 * 1024.0),
                        m_rollback.LastCaptureMicros());
         }
+        // Emit before any torture rewind: in torture mode the ORIGINAL pass
+        // is the canonical timeline (replay is a fidelity test of it), so
+        // ring[T], just captured, is final right now. Under prediction this
+        // drains whatever the frontier has confirmed since the last poll.
+        {
+          std::lock_guard lk(m_frames_lock);
+          EmitSnapshotChecksumsLocked();
+        }
         MaybeTorture();
       }
     }
@@ -1002,29 +1010,28 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
         INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: watch {}={:08x} tick={}", watch.label,
                      m_rollback.ReadWatch(m_system, watch), tick);
       }
-      // Confirmed-frontier policy, deferred form: a checksum computed while
-      // any earlier tick was still speculative may hash mispredicted state —
-      // but SKIPPING it starves the oracle completely under sustained
-      // latency (the frontier trails the serve tick by the latency floor,
-      // so every submission is contaminated at submission time; R1 smoke #3
-      // skipped 510/510). Instead PARK it and transmit once the frontier
-      // passes its tick: the hash covers state before tick T's body, so it
-      // is final as soon as ticks < T are confirmed. A rollback replay
-      // re-submits corrected values for its span, overwriting the parked
-      // entry before it can ever drain.
-      std::lock_guard lk(m_frames_lock);
-      if (m_window != 0)
+      // The game's live-state hash stays LOCAL-ONLY when the device oracle
+      // is active: it hashes memory at submission time, which under
+      // prediction covers speculative and render-cadence-dependent bytes —
+      // the false-desync class of target run 3 (byte-identical sims,
+      // permanently split transmitted hashes). Cross-peer comparison runs on
+      // ring-snapshot hashes instead (EmitSnapshotChecksumsLocked); this
+      // submission still feeds MatchStateEvolving (the fights-only gate for
+      // torture/prediction), the watch log cadence, and the desync dump
+      // pacing above. Tables without hash lines fall back to exchanging the
+      // game hash — only lockstep runs are honest there, but rollback needs
+      // a region table anyway.
+      if (!m_rollback.HasHashSpans())
       {
-        ValidateSpeculationLocked();
-        if (m_confirmed_frontier < tick)
-        {
-          m_checksums_skipped++;  // stat now counts deferred-at-submission
-          m_local_crcs_pending[tick] = crc;
-          break;
-        }
+        u8 payload[4];
+        WriteBE32(payload, crc);
+        SendMessageRaw(MSG_CHECKSUM, 0, tick, payload, 4);
+        std::lock_guard lk(m_frames_lock);
+        m_local_crcs[tick] = crc;
+        const auto remote = m_remote_crcs.find(tick);
+        if (remote != m_remote_crcs.end())
+          CompareChecksumLocked(tick, crc, remote->second);
       }
-      m_local_crcs_pending[tick] = crc;
-      DrainConfirmedChecksumsLocked();
     }
     break;
   default:
