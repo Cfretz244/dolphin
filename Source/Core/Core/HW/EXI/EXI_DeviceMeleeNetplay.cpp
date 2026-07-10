@@ -688,25 +688,18 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
           m_restore_refused_io++;
           m_rollback_io_defer_streak++;
         }
-        else if (m_rollback.IsLoaded() && !m_rollback.IOEpochUnchanged(m_system, target))
-        {
-          // A completion was DELIVERED inside the window (see the torture
-          // path): this slot is PERMANENTLY unrestorable (the epoch only
-          // grows), and the frontier cannot advance past a mispredicted tick
-          // without the rollback -- deferring here deadlocks the frontier
-          // forever (R1 smoke #1: frontier_lag 24k, 50k refusals, oracle
-          // blind). Degrade like the scene case instead: accept the
-          // divergence loudly and move on; the checksum oracle downstream
-          // reports it if the mispredict mattered.
-          ERROR_LOG_FMT(EXPANSIONINTERFACE,
-                        "MeleeNetplay: ROLLBACK REFUSED at tick {} depth {} (async completion "
-                        "in window; accepting divergence)",
-                        m_serve_tick, depth);
-          m_restore_refused_epoch++;
-          m_rollback_needed = false;
-          m_rollback_io_defer_streak = 0;
-          m_confirmed_frontier++;  // treat the mismatched tick as confirmed-wrong
-        }
+        // NOTE deliberately NO epoch gate here, unlike the torture path: at
+        // R1's exposure (a rollback window is 50-130ms) some async completion
+        // has landed inside it almost ALWAYS (15-55/s during attract), so
+        // gating turns nearly every rollback into an accepted divergence
+        // (R1 smoke #4: refusal storm on both peers, desync within seconds
+        // of the first rollback). The hazard the gate would guard against --
+        // restore erasing the game's record of a delivered completion it
+        // spin-waits on -- is a rare (~1/200-500 replays) WEDGE that the
+        // harness verdict detects honestly. Open item: count only the
+        // genuinely-awaited completion class (address-filter against the
+        // restored region set) and re-enable. m_restore_refused_epoch stays
+        // wired for that future gate.
         else if (!m_rollback.IsLoaded() || !m_rollback.SameScene(m_system, target))
         {
           // Unrecoverable: the mispredicted ticks straddle a scene change (or
