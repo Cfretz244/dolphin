@@ -290,9 +290,9 @@ int MeleeRollbackState::VerifyAgainstRing(Core::System& system, u32 tick) const
         j++;
       spans++;
       ERROR_LOG_FMT(EXPANSIONINTERFACE,
-                    "MeleeRollback: VERIFY DIFF {}+0x{:x} (addr {:08x}) len {} "
+                    "MeleeRollback: VERIFY DIFF tick={} {}+0x{:x} (addr {:08x}) len {} "
                     "live={:02x}{:02x}{:02x}{:02x} want={:02x}{:02x}{:02x}{:02x}",
-                    r.label, i, r.start + i, j - i, live[i], i + 1 < len ? live[i + 1] : 0,
+                    tick, r.label, i, r.start + i, j - i, live[i], i + 1 < len ? live[i + 1] : 0,
                     i + 2 < len ? live[i + 2] : 0, i + 3 < len ? live[i + 3] : 0, want[i],
                     i + 1 < len ? want[i + 1] : 0, i + 2 < len ? want[i + 2] : 0,
                     i + 3 < len ? want[i + 3] : 0);
