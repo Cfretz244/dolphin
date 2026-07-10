@@ -97,6 +97,9 @@ public:
   // never re-fire; snapshotting this count detects that.
   u64 GetNonDTKReadsCompleted() const { return m_non_dtk_reads_completed; }
 
+  // Outstanding non-DTK requests right now (see HasPendingReads).
+  size_t GetPendingNonDTKReadCount() const { return m_pending_non_dtk_reads.size(); }
+
 private:
   void WaitUntilIdle();
 

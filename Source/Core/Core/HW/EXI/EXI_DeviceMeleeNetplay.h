@@ -212,6 +212,11 @@ private:
   u32 m_restore_refused_io = 0;  // deferred/skipped restores: async I/O in flight
   u32 m_restore_refused_epoch = 0;  // deferred/skipped: completion landed in window
   u32 m_rollback_io_defer_streak = 0;  // consecutive in-flight defers (escape valve)
+  // Park targets: completion-counter values that mean "everything in flight
+  // when this rollback began parking has completed" (see the rollback path).
+  u64 m_park_aram_target = 0;
+  u64 m_park_dvd_target = 0;
+  u64 m_park_di_target = 0;
 
   // --- CPU-thread transaction state
   u8 m_command = CMD_ID;

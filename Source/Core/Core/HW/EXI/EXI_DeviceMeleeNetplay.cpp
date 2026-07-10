@@ -675,18 +675,34 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       {
         const u32 target = m_confirmed_frontier;
         const u32 depth = m_serve_tick - target;
-        if (!AsyncIOQuiescent() && m_rollback_io_defer_streak < 30)
+        // Restoring while a transfer is IN FLIGHT is a real, prompt desync
+        // source (A/B proven: smoke #8 always outwaited transfers = 0
+        // desyncs; smoke #9 restored under them = desync at the first
+        // rollbacks): the transfer completes after the restore and delivers
+        // its payload/callback into the rolled-back state on this peer
+        // only. But waiting for GLOBAL quiescence never converges under
+        // free-running streaming (smoke #8: seconds parked per rollback,
+        // 11 ticks/s). Park until exactly what is in flight NOW completes:
+        // each transfer takes ms, and newly-issued traffic does not extend
+        // the wait.
+        auto& dsp = m_system.GetDSP();
+        auto& dvdt = m_system.GetDVDThread();
+        auto& dvdi = m_system.GetDVDInterface();
+        if (m_rollback_io_defer_streak == 0)
         {
-          // In-flight ARAM/DVD transfer (see AsyncIOQuiescent). Give it a
-          // token ~30 parked polls (~30ms) to complete -- the common benign
-          // case -- then restore ANYWAY. Quiescence never truly arrives
-          // under streaming (free-running DVD traffic keeps the predicates
-          // up), and R1 smoke #8 showed a long cap just converts every
-          // rollback into seconds of parked wall time (refused_io pegged,
-          // 11 ticks/s, 20s max stall) before restoring regardless. The
-          // residual hazard is the rare completion-amnesia wedge, which the
-          // harness verdict detects honestly -- same ledger as dropping the
-          // epoch gate.
+          m_park_aram_target =
+              dsp.IsARAMDMAInProgress() ? dsp.GetARAMDMACompletionCount() + 1 : 0;
+          m_park_dvd_target = dvdt.GetNonDTKReadsCompleted() + dvdt.GetPendingNonDTKReadCount();
+          m_park_di_target =
+              dvdi.IsCommandPending() ? dvdi.GetNonDTKCommandsCompleted() + 1 : 0;
+        }
+        const bool parked_io_pending =
+            (m_park_aram_target != 0 &&
+             dsp.GetARAMDMACompletionCount() < m_park_aram_target) ||
+            dvdt.GetNonDTKReadsCompleted() < m_park_dvd_target ||
+            (m_park_di_target != 0 && dvdi.GetNonDTKCommandsCompleted() < m_park_di_target);
+        if (parked_io_pending && m_rollback_io_defer_streak < 1200)
+        {
           m_restore_refused_io++;
           m_rollback_io_defer_streak++;
         }
