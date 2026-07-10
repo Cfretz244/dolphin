@@ -1083,8 +1083,8 @@ void CEXIMeleeNetplay::DMARead(u32 address, u32 size)
         // real inputs there, and a pending rollback needs the whole span.
         if (m_serve_tick > MeleeRollbackState::RING_SIZE)
         {
-          const u32 prune_to =
-              std::min(m_serve_tick - MeleeRollbackState::RING_SIZE, m_confirmed_frontier);
+          const u32 prune_to = std::min(
+              u32(m_serve_tick - MeleeRollbackState::RING_SIZE), m_confirmed_frontier);
           m_frames.erase(m_frames.begin(), m_frames.upper_bound(prune_to));
         }
       }
