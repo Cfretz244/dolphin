@@ -11,8 +11,11 @@
 #include <fmt/format.h>
 
 #include "Common/Logging/Log.h"
+#include "Core/CoreTiming.h"
 #include "Core/HW/Memmap.h"
+#include "Core/HW/SystemTimers.h"
 #include "Core/PowerPC/MMU.h"
+#include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
 namespace ExpansionInterface
@@ -206,6 +209,7 @@ void MeleeRollbackState::Capture(Core::System& system, u32 tick)
   }
   slot.tick = tick;
   slot.scene = m_watches.empty() ? 0 : ReadWatch(system, m_watches.front());
+  slot.timebase = system.GetSystemTimers().GetFakeTimeBase();
   slot.valid = true;
 
   m_total_captures++;
@@ -227,6 +231,22 @@ bool MeleeRollbackState::Restore(Core::System& system, u32 tick)
     memory.CopyToEmu(r.start, slot.data.data() + off, r.end - r.start);
     off += r.end - r.start;
   }
+
+  // Rewind the GAME-VISIBLE time base to the snapshot's value, so replayed
+  // ticks re-read the same mftb/OSGetTime values they saw originally and the
+  // replay ends with tick<->TB in the original relationship. Without this,
+  // every replay leaves the peer's TB permanently ahead (replayed ticks
+  // execute real cycles), and anything the game times against the clock --
+  // scene-load completion, title attract countdowns, the RNG stir -- lands
+  // on a DIFFERENT tick than on the non-rolling peer. Observed as demo
+  // fights starting one tick apart => checksum desync at the fight boundary
+  // with a perfectly synchronized RNG orbit. Emulator-internal scheduling
+  // (CoreTiming events, DVD/ARAM completions) is deliberately NOT rewound.
+  auto& core_timing = system.GetCoreTiming();
+  core_timing.SetFakeTBStartValue(slot.timebase);
+  core_timing.SetFakeTBStartTicks(core_timing.GetTicks());
+  system.GetPowerPC().WriteFullTimeBaseValue(slot.timebase);
+
   return true;
 }
 

@@ -108,6 +108,7 @@ private:
     bool valid = false;
     u32 tick = 0;
     u32 scene = 0;  // first watch (major-scene) at capture time
+    u64 timebase = 0;  // game-visible TB at capture (see Restore)
     std::vector<u8> data;  // concatenated regions, m_snapshot_bytes long
   };
 
