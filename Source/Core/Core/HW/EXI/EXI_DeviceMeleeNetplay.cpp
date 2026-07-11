@@ -83,6 +83,12 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
   m_is_host = Config::Get(Config::MAIN_MELEE_NETPLAY_IS_HOST);
   m_delay = static_cast<u8>(Config::Get(Config::MAIN_MELEE_NETPLAY_DELAY));
 
+  m_players = static_cast<u32>(
+      std::clamp(Config::Get(Config::MAIN_MELEE_NETPLAY_PLAYERS), 2, int(MAX_PLAYERS)));
+
+  // The host deals every client's port in the HELLO census, so a client's
+  // pre-handshake mask is only a placeholder. Only an explicit LocalPorts
+  // override is honored as-is (multi-pad-per-console sessions).
   const int ports_cfg = Config::Get(Config::MAIN_MELEE_NETPLAY_LOCAL_PORTS);
   m_local_mask = ports_cfg != 0 ? static_cast<u8>(ports_cfg) : (m_is_host ? 0x01 : 0x02);
 
@@ -162,7 +168,6 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
 
   m_running.Set();
   m_net_thread = std::thread(&CEXIMeleeNetplay::NetThread, this);
-  m_send_thread = std::thread(&CEXIMeleeNetplay::SendThread, this);
   m_diag_thread = std::thread(&CEXIMeleeNetplay::DiagThread, this);
 }
 
@@ -172,37 +177,61 @@ CEXIMeleeNetplay::~CEXIMeleeNetplay()
     SetMemCheckTraceRing(nullptr);
   SuspendThrottle(false);
   m_running.Clear();
-  m_sendq_cv.notify_all();
-  m_socket.disconnect();
+  for (auto& peer : m_peers)
+  {
+    peer->sendq_cv.notify_all();
+    peer->socket.disconnect();
+  }
   if (m_net_thread.joinable())
     m_net_thread.join();
-  if (m_send_thread.joinable())
-    m_send_thread.join();
+  for (auto& peer : m_peers)
+  {
+    if (peer->rx_thread.joinable())
+      peer->rx_thread.join();
+    if (peer->send_thread.joinable())
+      peer->send_thread.join();
+  }
   if (m_diag_thread.joinable())
     m_diag_thread.join();
 }
 
-// See the header: blocking sends for lock-held producers, serialized with
-// direct sends via m_send_lock inside SendMessageRaw.
-void CEXIMeleeNetplay::SendThread()
+// One send thread per link: see the header. Every outbound message goes through
+// here, so no producer ever blocks on the network.
+void CEXIMeleeNetplay::PeerSendThread(PeerLink* link)
 {
   Common::SetCurrentThreadName("MeleeNetplaySend");
   while (m_running.IsSet())
   {
     std::vector<u8> msg;
     {
-      std::unique_lock lk(m_sendq_lock);
-      m_sendq_cv.wait(lk, [this] { return !m_sendq.empty() || !m_running.IsSet(); });
+      std::unique_lock lk(link->sendq_lock);
+      link->sendq_cv.wait(lk, [&] { return !link->sendq.empty() || !m_running.IsSet(); });
       if (!m_running.IsSet())
         return;
-      msg = std::move(m_sendq.front());
-      m_sendq.pop_front();
+      msg = std::move(link->sendq.front());
+      link->sendq.pop_front();
     }
-    std::lock_guard lk(m_send_lock);
-    m_socket.setBlocking(true);
-    if (!SendAll(m_socket, msg.data(), static_cast<u32>(msg.size())))
-      ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: queued send failed");
-    m_socket.setBlocking(false);
+    link->socket.setBlocking(true);
+    if (!SendAll(link->socket, msg.data(), static_cast<u32>(msg.size())))
+    {
+      ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: send failed to peer (ports {:#x})",
+                    link->mask);
+      return;
+    }
+  }
+}
+
+void CEXIMeleeNetplay::BroadcastRaw(const u8* bytes, u32 len, const PeerLink* exclude)
+{
+  for (auto& peer : m_peers)
+  {
+    if (peer.get() == exclude)
+      continue;
+    {
+      std::lock_guard lk(peer->sendq_lock);
+      peer->sendq.emplace_back(bytes, bytes + len);
+    }
+    peer->sendq_cv.notify_one();
   }
 }
 
@@ -216,11 +245,7 @@ void CEXIMeleeNetplay::EnqueueMessage(u8 type, u8 mask, u32 tick, const u8* payl
   WriteBE32(&buf[4], tick);
   if (len != 0)
     std::memcpy(&buf[8], payload, len);
-  {
-    std::lock_guard lk(m_sendq_lock);
-    m_sendq.push_back(std::move(buf));
-  }
-  m_sendq_cv.notify_one();
+  BroadcastRaw(buf.data(), static_cast<u32>(buf.size()), nullptr);
 }
 
 void CEXIMeleeNetplay::DiagThread()
@@ -273,145 +298,226 @@ void CEXIMeleeNetplay::DoState(PointerWrap& p)
 // Transport
 // ---------------------------------------------------------------------------
 
-bool CEXIMeleeNetplay::EstablishSession(sf::TcpSocket& sock)
+// Accept Players-1 clients, then deal each one its port and the session census.
+// The census is computed only once every client is attached, so the assignment
+// is coherent in one shot (a client cannot infer it, unlike the old 1v1
+// "if the host took my port, take the other one" flip).
+bool CEXIMeleeNetplay::HostHandshake()
 {
-  sock.setBlocking(true);
-  if (m_is_host)
+  const u16 port = static_cast<u16>(Config::Get(Config::MAIN_MELEE_NETPLAY_PORT));
+
+  sf::TcpListener listener;
+  if (listener.listen(port) != sf::Socket::Status::Done)
   {
-    u8 hello[9];
+    ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: failed to listen on port {}", port);
+    return false;
+  }
+  Core::DisplayMessage(
+      fmt::format("MeleeNetplay: waiting for {} peer(s) on port {}", m_players - 1, port), 8000);
+  listener.setBlocking(false);
+
+  while (m_peers.size() < m_players - 1 && m_running.IsSet())
+  {
+    auto link = std::make_unique<PeerLink>();
+    if (listener.accept(link->socket) != sf::Socket::Status::Done)
+    {
+      Common::SleepCurrentThread(5);
+      continue;
+    }
+    m_peers.push_back(std::move(link));
+    Core::DisplayMessage(
+        fmt::format("MeleeNetplay: peer {}/{} connected", m_peers.size(), m_players - 1), 5000);
+  }
+  if (!m_running.IsSet())
+    return false;
+
+  // Deal ports: the host keeps m_local_mask, each client takes the next free
+  // port in ascending order.
+  u8 assigned = m_local_mask;
+  for (auto& peer : m_peers)
+  {
+    u8 mask = 0;
+    for (u32 p = 0; p < MAX_PLAYERS; p++)
+    {
+      if ((assigned & (1 << p)) == 0)
+      {
+        mask = static_cast<u8>(1 << p);
+        break;
+      }
+    }
+    if (mask == 0)
+    {
+      ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: out of ports for {} players", m_players);
+      return false;
+    }
+    peer->mask = mask;
+    assigned |= mask;
+  }
+  m_combined_mask = assigned;
+  m_remote_mask = static_cast<u8>(m_combined_mask & ~m_local_mask);
+
+  // One barrier bit per PEER: the lowest port it owns, which is the block it
+  // stamps its scene-barrier flag into (nw_SceneBarrier).
+  const auto lowest_bit = [](u8 m) -> u8 { return static_cast<u8>(m & (~m + 1)); };
+  m_barrier_mask = lowest_bit(m_local_mask);
+  for (const auto& peer : m_peers)
+    m_barrier_mask |= lowest_bit(peer->mask);
+
+  for (auto& peer : m_peers)
+  {
+    u8 hello[HELLO_BYTES] = {};
     hello[0] = MSG_HELLO;
     hello[1] = PROTO_VERSION;
-    hello[2] = m_local_mask;
+    hello[2] = peer->mask;
     hello[3] = m_delay;
     WriteBE32(&hello[4], m_seed);
     hello[8] = static_cast<u8>(m_window);
-    if (!SendAll(sock, hello, sizeof(hello)))
+    hello[9] = m_combined_mask;
+    hello[10] = m_barrier_mask;
+    hello[11] = static_cast<u8>(m_players);
+    peer->socket.setBlocking(true);
+    if (!SendAll(peer->socket, hello, sizeof(hello)))
       return false;
 
     u8 ack[3];
-    sock.setBlocking(false);
-    if (!RecvAll(sock, ack, sizeof(ack), m_running))
+    peer->socket.setBlocking(false);
+    if (!RecvAll(peer->socket, ack, sizeof(ack), m_running))
       return false;
-    if (ack[0] != MSG_HELLO_ACK || ack[1] != PROTO_VERSION)
+    if (ack[0] != MSG_HELLO_ACK || ack[1] != PROTO_VERSION || ack[2] != peer->mask)
     {
-      ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: bad HELLO_ACK (type {:#x} ver {})", ack[0],
-                    ack[1]);
+      ERROR_LOG_FMT(EXPANSIONINTERFACE,
+                    "MeleeNetplay: bad HELLO_ACK (type {:#x} ver {} mask {:#x}, wanted {:#x})",
+                    ack[0], ack[1], ack[2], peer->mask);
       return false;
     }
-    m_remote_mask = ack[2];
-  }
-  else
-  {
-    u8 hello[9];
-    sock.setBlocking(false);
-    if (!RecvAll(sock, hello, sizeof(hello), m_running))
-      return false;
-    if (hello[0] != MSG_HELLO || hello[1] != PROTO_VERSION)
-    {
-      ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: bad HELLO (type {:#x} ver {})", hello[0],
-                    hello[1]);
-      return false;
-    }
-    m_remote_mask = hello[2];
-    m_delay = hello[3];
-    m_seed = ReadBE32(&hello[4]);
-    m_window = hello[8];
-    // Host assigns; if it claims our default port, take the other one.
-    if ((m_local_mask & m_remote_mask) != 0)
-      m_local_mask = m_remote_mask == 0x01 ? 0x02 : 0x01;
-
-    u8 ack[3] = {MSG_HELLO_ACK, PROTO_VERSION, m_local_mask};
-    sock.setBlocking(true);
-    if (!SendAll(sock, ack, sizeof(ack)))
-      return false;
-    sock.setBlocking(false);
-  }
-
-  if ((m_local_mask & m_remote_mask) != 0)
-  {
-    ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: overlapping port masks {:#x}/{:#x}",
-                  m_local_mask, m_remote_mask);
-    return false;
   }
   return true;
+}
+
+bool CEXIMeleeNetplay::ClientHandshake()
+{
+  const u16 port = static_cast<u16>(Config::Get(Config::MAIN_MELEE_NETPLAY_PORT));
+  const std::string remote = Config::Get(Config::MAIN_MELEE_NETPLAY_REMOTE_HOST);
+  Core::DisplayMessage(fmt::format("MeleeNetplay: connecting to {}:{}", remote, port), 8000);
+
+  const auto remote_addr = sf::IpAddress::resolve(remote);
+  if (!remote_addr)
+  {
+    ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: cannot resolve host '{}'", remote);
+    return false;
+  }
+
+  auto link = std::make_unique<PeerLink>();
+  link->socket.setBlocking(true);
+  while (m_running.IsSet())
+  {
+    if (link->socket.connect(*remote_addr, port, sf::seconds(2)) == sf::Socket::Status::Done)
+      break;
+    Common::SleepCurrentThread(500);
+  }
+  if (!m_running.IsSet())
+    return false;
+
+  u8 hello[HELLO_BYTES];
+  link->socket.setBlocking(false);
+  if (!RecvAll(link->socket, hello, sizeof(hello), m_running))
+    return false;
+  if (hello[0] != MSG_HELLO || hello[1] != PROTO_VERSION)
+  {
+    ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: bad HELLO (type {:#x} ver {})", hello[0],
+                  hello[1]);
+    return false;
+  }
+  m_local_mask = hello[2];
+  m_delay = hello[3];
+  m_seed = ReadBE32(&hello[4]);
+  m_window = hello[8];
+  m_combined_mask = hello[9];
+  m_barrier_mask = hello[10];
+  m_players = hello[11];
+  m_remote_mask = static_cast<u8>(m_combined_mask & ~m_local_mask);
+  // The client's single link is to the host, which owns every other port: the
+  // host relays the other clients' inputs, so from here they are indistinguishable
+  // from the host's own.
+  link->mask = m_remote_mask;
+
+  u8 ack[3] = {MSG_HELLO_ACK, PROTO_VERSION, m_local_mask};
+  link->socket.setBlocking(true);
+  if (!SendAll(link->socket, ack, sizeof(ack)))
+    return false;
+  link->socket.setBlocking(false);
+
+  m_peers.push_back(std::move(link));
+  return true;
+}
+
+void CEXIMeleeNetplay::StartPeerThreads()
+{
+  for (auto& peer : m_peers)
+  {
+    peer->send_thread = std::thread(&CEXIMeleeNetplay::PeerSendThread, this, peer.get());
+    peer->rx_thread = std::thread(&CEXIMeleeNetplay::PeerRecvThread, this, peer.get());
+  }
 }
 
 void CEXIMeleeNetplay::NetThread()
 {
   Common::SetCurrentThreadName("MeleeNetplay");
 
-  const u16 port = static_cast<u16>(Config::Get(Config::MAIN_MELEE_NETPLAY_PORT));
-
-  if (m_is_host)
+  if (!(m_is_host ? HostHandshake() : ClientHandshake()))
   {
-    sf::TcpListener listener;
-    if (listener.listen(port) != sf::Socket::Status::Done)
-    {
-      ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: failed to listen on port {}", port);
-      m_session_failed = true;
-      return;
-    }
-    Core::DisplayMessage(fmt::format("MeleeNetplay: waiting for peer on port {}", port), 8000);
-    listener.setBlocking(false);
-    while (m_running.IsSet())
-    {
-      if (listener.accept(m_socket) == sf::Socket::Status::Done)
-        break;
-      Common::SleepCurrentThread(5);
-    }
-  }
-  else
-  {
-    const std::string remote = Config::Get(Config::MAIN_MELEE_NETPLAY_REMOTE_HOST);
-    Core::DisplayMessage(fmt::format("MeleeNetplay: connecting to {}:{}", remote, port), 8000);
-    const auto remote_addr = sf::IpAddress::resolve(remote);
-    if (!remote_addr)
-    {
-      ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: cannot resolve host '{}'", remote);
-      m_session_failed = true;
-      return;
-    }
-    m_socket.setBlocking(true);
-    while (m_running.IsSet())
-    {
-      if (m_socket.connect(*remote_addr, port, sf::seconds(2)) == sf::Socket::Status::Done)
-        break;
-      Common::SleepCurrentThread(500);
-    }
-  }
-
-  if (!m_running.IsSet())
+    m_session_failed = true;
     return;
-
-  if (!EstablishSession(m_socket))
+  }
+  if (m_local_mask == 0 || (m_local_mask & m_remote_mask) != 0)
   {
+    ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: bad port partition local={:#x} remote={:#x}",
+                  m_local_mask, m_remote_mask);
     m_session_failed = true;
     return;
   }
 
   // Pre-seed the delay window with neutral pads so the game's first POLLs
-  // (ticks 0..delay-1, before either peer's first SEND lands) never deadlock.
+  // (ticks 0..delay-1, before any peer's first SEND lands) never deadlock.
   {
     std::lock_guard lk(m_frames_lock);
     for (u32 t = 0; t < m_delay; t++)
       m_frames[t].have_mask = 0xFF;
   }
 
+  StartPeerThreads();
   m_session_ready = true;
-  Core::DisplayMessage(fmt::format("MeleeNetplay: session up (local ports {:#x}, delay {}, "
-                                   "window {})",
-                                   m_local_mask, m_delay, m_window),
-                       8000);
+  // WARN (not just DisplayMessage): DisplayMessage goes to the OSD and the CORE
+  // log, which the harnesses do not enable -- so a 4-way pairing failure would
+  // have been invisible in the logs the verdict actually reads.
+  WARN_LOG_FMT(EXPANSIONINTERFACE,
+               "MeleeNetplay: session up ({} players, local ports {:#x}, combined {:#x}, "
+               "barrier {:#x}, delay {}, window {})",
+               m_players, m_local_mask, m_combined_mask, m_barrier_mask, m_delay, m_window);
+  Core::DisplayMessage(
+      fmt::format("MeleeNetplay: session up ({} players, local ports {:#x}, combined {:#x}, "
+                  "delay {}, window {})",
+                  m_players, m_local_mask, m_combined_mask, m_delay, m_window),
+      8000);
   if (m_window != 0)
   {
     WARN_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: prediction+rollback ON (window {})", m_window);
   }
+}
 
-  // Receive loop
+// One receive loop per link. On the host this is also the RELAY point: a
+// client's inputs are forwarded to every OTHER client before local ingest, so
+// the extra star hop costs as little as possible. Relaying happens outside
+// m_frames_lock (BroadcastRaw only takes send-queue locks), preserving the
+// no-blocking-send-under-m_frames_lock invariant.
+void CEXIMeleeNetplay::PeerRecvThread(PeerLink* link)
+{
+  Common::SetCurrentThreadName("MeleeNetplayRecv");
+
   while (m_running.IsSet())
   {
     u8 header[8];
-    if (!RecvAll(m_socket, header, sizeof(header), m_running))
+    if (!RecvAll(link->socket, header, sizeof(header), m_running))
       break;
     const u8 type = header[0];
     const u8 mask = header[1];
@@ -423,20 +529,33 @@ void CEXIMeleeNetplay::NetThread()
       break;
     }
     u8 payload[4 * PAD_BYTES];
-    if (len != 0 && !RecvAll(m_socket, payload, len, m_running))
+    if (len != 0 && !RecvAll(link->socket, payload, len, m_running))
       break;
 
-    HandleMessage(type, mask, tick, payload, len);
+    // Star relay: only INPUTS need to reach the other clients. Checksums do
+    // not — every peer compares against the host, and agreement with the host
+    // is transitive (see m_remote_crcs).
+    if (m_is_host && type == MSG_INPUTS && m_peers.size() > 1)
+    {
+      u8 relay[8 + 4 * PAD_BYTES];
+      std::memcpy(relay, header, sizeof(header));
+      if (len != 0)
+        std::memcpy(relay + 8, payload, len);
+      BroadcastRaw(relay, 8u + len, link);
+    }
+
+    HandleMessage(link, type, mask, tick, payload, len);
   }
 
   if (m_running.IsSet())
   {
-    ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: peer disconnected");
+    ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: peer disconnected (ports {:#x})", link->mask);
     Core::DisplayMessage("MeleeNetplay: peer disconnected", 10000);
   }
 }
 
-void CEXIMeleeNetplay::HandleMessage(u8 type, u8 mask, u32 tick, const u8* payload, u32 len)
+void CEXIMeleeNetplay::HandleMessage(PeerLink* from, u8 type, u8 mask, u32 tick, const u8* payload,
+                                     u32 len)
 {
   switch (type)
   {
@@ -475,10 +594,10 @@ void CEXIMeleeNetplay::HandleMessage(u8 type, u8 mask, u32 tick, const u8* paylo
       return;
     const u32 remote_crc = ReadBE32(payload);
     std::lock_guard lk(m_frames_lock);
-    m_remote_crcs[tick] = remote_crc;
+    m_remote_crcs[tick][from->mask] = remote_crc;
     const auto local = m_local_crcs.find(tick);
     if (local != m_local_crcs.end())
-      CompareChecksumLocked(tick, local->second, remote_crc);
+      CompareChecksumLocked(tick, from->mask, local->second, remote_crc);
     break;
   }
   default:
@@ -487,22 +606,12 @@ void CEXIMeleeNetplay::HandleMessage(u8 type, u8 mask, u32 tick, const u8* paylo
   }
 }
 
+// Fans out to every peer. Formerly a direct blocking send on the one socket;
+// with N peers that would let the slowest console stall the CPU thread (and
+// every other link behind it), so all sends now go through the per-peer queues.
 void CEXIMeleeNetplay::SendMessageRaw(u8 type, u8 mask, u32 tick, const u8* payload, u16 len)
 {
-  u8 buf[8 + 4 * PAD_BYTES];
-  buf[0] = type;
-  buf[1] = mask;
-  buf[2] = u8(len >> 8);
-  buf[3] = u8(len);
-  WriteBE32(&buf[4], tick);
-  if (len != 0)
-    std::memcpy(&buf[8], payload, len);
-
-  std::lock_guard lk(m_send_lock);
-  m_socket.setBlocking(true);
-  if (!SendAll(m_socket, buf, 8u + len))
-    ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: send failed (tick {})", tick);
-  m_socket.setBlocking(false);
+  EnqueueMessage(type, mask, tick, payload, len);
 }
 
 void CEXIMeleeNetplay::SendInputs(u32 tick, const u8* pads)
@@ -545,10 +654,21 @@ void CEXIMeleeNetplay::SendInputs(u32 tick, const u8* pads)
   // before the release tick can be served, and pre-stamp barrier evaluations
   // are release-insensitive (both-up needs the local flag, down there).
   {
-    u32 p = 0;
-    while (p < 3 && (m_local_mask & (1 << p)) == 0)
-      p++;
-    const u8 flag_byte = pads[p * PAD_BYTES + 0x42];
+    // The game stamps its flag into PHYSICAL block 0 -- the block that actually
+    // goes on the wire, because SendInputs above maps physical pads onto owned
+    // ports in ascending order (physical 0 -> lowest owned port).
+    //
+    // It used to stamp the block at its NETPLAY port index instead, which for
+    // any peer not owning port 0 is a different block than the one transmitted:
+    // the client stamped block 1 while block 0 went out as its port-1 payload.
+    // Bytes 0x42/0x43 are HSD_PadStatus alignment padding that the pad transform
+    // never writes, so block 0 still held the previous RECV's memcpy -- the
+    // HOST's served flag. The client was echoing the host's own readiness back
+    // at it, and its own never reached the wire. Effect in 1v1: the barrier
+    // degraded to "the host decides" (still deterministic on both peers, hence
+    // no desync -- which is why it survived qualification). Fatal at 4 players,
+    // where 3 of 4 peers own a non-zero port.
+    const u8 flag_byte = pads[0x42];
     const bool stamped = (flag_byte & 1) != 0;
     if (stamped != m_barrier_armed)
     {
@@ -865,16 +985,23 @@ void CEXIMeleeNetplay::ValidateSpeculationLocked()
   EmitSnapshotChecksumsLocked();
 }
 
-// One comparison per hash tick, from whichever side completes the pair:
+// One comparison per (hash tick, peer), from whichever side completes the pair:
 // EmitSnapshotChecksumsLocked (remote already arrived) or the MSG_CHECKSUM
-// handler (local already emitted). Both erase the compared entries, so the
-// other side never re-fires. m_frames_lock held by the caller.
-void CEXIMeleeNetplay::CompareChecksumLocked(u32 tick, u32 local_crc, u32 remote_crc)
+// handler (local already emitted). m_frames_lock held by the caller.
+//
+// Retirement is peer-aware: the tick's entries are only erased once EVERY remote
+// peer's checksum for it has been compared (m_crc_seen accumulates their port
+// bits until it covers m_remote_mask). Erasing on the first comparison — as the
+// 2-peer version did, where "first" and "every" coincided — would have thrown
+// away the other peers' still-in-flight checksums and silently skipped 2 of 3
+// comparisons at 4 players.
+void CEXIMeleeNetplay::CompareChecksumLocked(u32 tick, u8 peer_mask, u32 local_crc, u32 remote_crc)
 {
   if (local_crc != remote_crc)
   {
-    ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: DESYNC at tick {} ({:08x} != {:08x})", tick,
-                  local_crc, remote_crc);
+    ERROR_LOG_FMT(EXPANSIONINTERFACE,
+                  "MeleeNetplay: DESYNC at tick {} vs peer ports {:#x} ({:08x} != {:08x})", tick,
+                  peer_mask, local_crc, remote_crc);
     Core::DisplayMessage(fmt::format("MeleeNetplay: DESYNC at tick {}", tick), 20000);
     if (!m_desync_dumped && m_dump_armed_tick < 0)
       m_dump_armed_tick = tick;
@@ -885,13 +1012,18 @@ void CEXIMeleeNetplay::CompareChecksumLocked(u32 tick, u32 local_crc, u32 remote
   else
   {
     // A matching checksum only demonstrates determinism if the state it
-    // hashes is actually changing: a constant crc means both peers are
+    // hashes is actually changing: a constant crc means the peers are
     // parked on a static screen, not that the cores agree under load.
-    INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: checksum ok tick={} crc={:08x}", tick,
-                 remote_crc);
+    INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: checksum ok tick={} peer={:#x} crc={:08x}",
+                 tick, peer_mask, remote_crc);
   }
+
+  m_crc_seen[tick] |= peer_mask;
+  if (m_crc_seen[tick] != m_remote_mask)
+    return;  // other peers' checksums for this tick are still in flight
   m_local_crcs.erase(m_local_crcs.begin(), m_local_crcs.upper_bound(tick));
   m_remote_crcs.erase(m_remote_crcs.begin(), m_remote_crcs.upper_bound(tick));
+  m_crc_seen.erase(m_crc_seen.begin(), m_crc_seen.upper_bound(tick));
 }
 
 // Write the queued first-mismatch ring dumps (see m_ring_dump_tick). CPU
@@ -949,7 +1081,13 @@ void CEXIMeleeNetplay::EmitSnapshotChecksumsLocked()
     m_local_crcs[tick] = crc;
     const auto remote = m_remote_crcs.find(tick);
     if (remote != m_remote_crcs.end())
-      CompareChecksumLocked(tick, crc, remote->second);
+    {
+      // Compare against every peer whose checksum for this tick already landed.
+      // Copy first: CompareChecksumLocked may retire (erase) the tick's map.
+      const std::map<u8, u32> arrived = remote->second;
+      for (const auto& [peer_mask, peer_crc] : arrived)
+        CompareChecksumLocked(tick, peer_mask, crc, peer_crc);
+    }
   }
   m_tick_hashes.erase(m_tick_hashes.begin(), m_tick_hashes.upper_bound(m_hash_tick));
 }
@@ -1485,7 +1623,11 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
         m_local_crcs[tick] = crc;
         const auto remote = m_remote_crcs.find(tick);
         if (remote != m_remote_crcs.end())
-          CompareChecksumLocked(tick, crc, remote->second);
+        {
+          const std::map<u8, u32> arrived = remote->second;
+          for (const auto& [peer_mask, peer_crc] : arrived)
+            CompareChecksumLocked(tick, peer_mask, crc, peer_crc);
+        }
       }
     }
     break;
@@ -1673,6 +1815,12 @@ void CEXIMeleeNetplay::DMARead(u32 address, u32 size)
     blob[7] = PROTO_VERSION;
     WriteBE32(&blob[8], m_seed);
     WriteBE32(&blob[12], 0);  // flags
+    // Session census (v4). Without these the game had to hardcode the
+    // participating ports (nw.combined_mask = 0x3, "MVP is 1v1"), which forced
+    // ports 2/3 to PAD_ERR_NO_CONTROLLER on every RECV.
+    blob[16] = m_combined_mask;
+    blob[17] = m_barrier_mask;
+    blob[18] = static_cast<u8>(m_players);
     memory.CopyToEmu(address, blob, std::min<u32>(size, sizeof(blob)));
     break;
   }

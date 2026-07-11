@@ -172,6 +172,10 @@ const Info<int> MAIN_MELEE_NETPLAY_PORT{{System::Main, "MeleeNetplay", "Port"}, 
 const Info<int> MAIN_MELEE_NETPLAY_DELAY{{System::Main, "MeleeNetplay", "Delay"}, 2};
 const Info<u32> MAIN_MELEE_NETPLAY_SEED{{System::Main, "MeleeNetplay", "Seed"}, 0};
 const Info<int> MAIN_MELEE_NETPLAY_LOCAL_PORTS{{System::Main, "MeleeNetplay", "LocalPorts"}, 0};
+// Total participating consoles (2..4). Host-side only: the host waits for
+// Players-1 clients before dealing the port census in the HELLO. Clients learn
+// the census from the host and ignore this.
+const Info<int> MAIN_MELEE_NETPLAY_PLAYERS{{System::Main, "MeleeNetplay", "Players"}, 2};
 // Testing knobs: hold inbound input messages to simulate one-way network
 // latency (and jitter on top), so the delay-window headroom can be measured on
 // loopback without a second device or root-level traffic shaping.

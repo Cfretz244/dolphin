@@ -61,8 +61,9 @@ private:
   };
 
   static constexpr u32 DEVICE_ID = 0x4D4E4554;  // 'MNET'; unknown to CARD -> "no card"
-  static constexpr u8 PROTO_VERSION = 3;        // v3: POLL status word + replay serving
+  static constexpr u8 PROTO_VERSION = 4;        // v4: N-peer port census in the HELLO
   static constexpr u32 PAD_BYTES = 0x44;  // sizeof(HSD_PadStatus): full post-transform entry
+  static constexpr u32 MAX_PLAYERS = 4;
 
   // v3 POLL return word: status<<24 | arg. v2's bare 0/1 map onto WAIT/READY.
   enum : u8
@@ -76,11 +77,22 @@ private:
   // Wire message types
   enum : u8
   {
-    MSG_HELLO = 0x10,   // host->client {u8 ver, u8 host_mask, u8 delay, u8 pad, u32be seed}
+    // v4 HELLO carries the whole session census, because with >2 peers a client
+    // can no longer infer the port map from its own mask plus the host's.
+    // 12 bytes, host->client:
+    //   [0] type  [1] ver  [2] your_mask  [3] delay  [4..7] seed (BE32)
+    //   [8] window  [9] combined_mask  [10] barrier_mask  [11] players
+    // your_mask     - ports THIS client owns (host assigns; no guess-and-collide)
+    // combined_mask - every participating port, session-wide
+    // barrier_mask  - one bit per PEER: that peer's first-owned port, i.e. the
+    //                 block it stamps its scene-barrier flag into. Equals
+    //                 combined_mask when every peer owns exactly one pad.
+    MSG_HELLO = 0x10,
     MSG_HELLO_ACK = 0x11,  // client->host {u8 ver, u8 client_mask}
     MSG_INPUTS = 0x01,     // {tick} payload: 68B per set mask bit, ascending port order
     MSG_CHECKSUM = 0x02,   // {tick} payload: 4B crc
   };
+  static constexpr u32 HELLO_BYTES = 12;
 
   struct Frame
   {
@@ -95,22 +107,51 @@ private:
     std::chrono::steady_clock::time_point visible_at{};
   };
 
+  // One link to one remote console. The host holds Players-1 of these (one per
+  // client) and RELAYS inputs between them; a client holds exactly one (the
+  // host). Star topology: clients never talk to each other directly. See
+  // research/4player-design.md for why not mesh.
+  //
+  // Each link owns its send queue and threads, so a blocking send NEVER runs on
+  // a receive thread or under m_frames_lock -- with N peers a single shared send
+  // path would let one slow console stall every other link (and the original
+  // 2-peer deadlock, documented below, gets N times more ways to bite).
+  struct PeerLink
+  {
+    sf::TcpSocket socket;
+    u8 mask = 0;  // ports this peer owns
+    std::mutex sendq_lock;
+    std::condition_variable sendq_cv;
+    std::deque<std::vector<u8>> sendq;
+    std::thread send_thread;
+    std::thread rx_thread;
+  };
+
   void NetThread();
-  bool EstablishSession(sf::TcpSocket& sock);
-  void HandleMessage(u8 type, u8 mask, u32 tick, const u8* payload, u32 len);
+  bool HostHandshake();    // accept Players-1 clients, deal the census
+  bool ClientHandshake();  // connect to the host, learn the census
+  void StartPeerThreads();
+  void PeerSendThread(PeerLink* link);
+  void PeerRecvThread(PeerLink* link);
+  // Queue a framed message to every peer except `exclude` (nullptr = all).
+  void BroadcastRaw(const u8* bytes, u32 len, const PeerLink* exclude);
+  void HandleMessage(PeerLink* from, u8 type, u8 mask, u32 tick, const u8* payload, u32 len);
   void SendInputs(u32 tick, const u8* pads);
   void SendMessageRaw(u8 type, u8 mask, u32 tick, const u8* payload, u16 len);
   bool FrameReady(u32 tick);
   bool RemoteArrivedLocked(u32 tick) const;  // real remote data present & visible
   void ValidateSpeculationLocked();          // advance frontier; detect mispredicts
-  void PredictIntoLocked(u32 tick);          // fill remote half from newest confirmed
+  void PredictIntoLocked(u32 tick);          // fill remote ports from newest confirmed
 
   // --- session (written by net thread before m_session_ready, read-only after)
   std::atomic<bool> m_session_ready{false};
   std::atomic<bool> m_session_failed{false};
   bool m_is_host = false;
+  u32 m_players = 2;
   u8 m_local_mask = 0x01;
-  u8 m_remote_mask = 0x02;
+  u8 m_remote_mask = 0x02;   // union of every OTHER peer's ports
+  u8 m_combined_mask = 0x03;  // every participating port
+  u8 m_barrier_mask = 0x03;   // one bit per peer: its first-owned port
   u8 m_delay = 2;
   u32 m_seed = 0;
 
@@ -118,7 +159,16 @@ private:
   std::mutex m_frames_lock;
   std::map<u32, Frame> m_frames;
   std::map<u32, u32> m_local_crcs;
-  std::map<u32, u32> m_remote_crcs;
+  // tick -> (peer mask -> crc). Per-PEER, not per-tick-scalar: with 3 remotes a
+  // single slot would be clobbered by whichever peer's checksum landed last, and
+  // two of the three comparisons would silently never happen. Every peer
+  // compares against the HOST's value (single authority ⇒ transitive: if A and B
+  // both agree with the host they agree with each other), so a fork is caught on
+  // both the forker and the host, and the log names which peer diverged.
+  std::map<u32, std::map<u8, u32>> m_remote_crcs;
+  // tick -> OR of the port bits of peers whose checksum we have already
+  // compared. A tick retires only once this covers m_remote_mask.
+  std::map<u32, u8> m_crc_seen;
   // Device-side sync oracle: every HASH_INTERVAL ticks, hash the ring
   // snapshot of the newest CONFIRMED hash tick (SnapshotChecksum) and
   // exchange it. Snapshot hashes only ever cover confirmed, immutable
@@ -143,25 +193,20 @@ private:
   std::map<u32, u32> m_tick_hashes;
   void HashCapturedTick(u32 tick);
   void EmitSnapshotChecksumsLocked();
-  void CompareChecksumLocked(u32 tick, u32 local_crc, u32 remote_crc);
+  void CompareChecksumLocked(u32 tick, u8 peer_mask, u32 local_crc, u32 remote_crc);
 
   // --- transport
-  sf::TcpSocket m_socket;
-  std::mutex m_send_lock;
-  std::thread m_net_thread;
+  std::vector<std::unique_ptr<PeerLink>> m_peers;  // host: N-1 clients; client: {host}
+  std::thread m_net_thread;                        // session setup, then idle
   Common::Flag m_running;
-  // Deferred sends for messages produced UNDER m_frames_lock (checksums).
-  // A blocking send while holding that lock deadlocks distributed-ly: the
-  // peer's net thread needs its m_frames_lock to process our message, so it
-  // stops draining its socket, our send never completes, and both peers park
-  // symmetrically (target9 wedge: CPU thread sampled inside the EXI CR MMIO
-  // write for 54 minutes). The sender thread does the blocking sends; no
-  // thread ever blocks on the network while holding m_frames_lock.
-  std::thread m_send_thread;
-  std::mutex m_sendq_lock;
-  std::condition_variable m_sendq_cv;
-  std::deque<std::vector<u8>> m_sendq;
-  void SendThread();
+  // Sends are ALWAYS deferred onto a peer's queue and performed by that peer's
+  // send thread. A blocking send while holding m_frames_lock deadlocks
+  // distributed-ly: the peer's receive thread needs ITS m_frames_lock to process
+  // our message, so it stops draining its socket, our send never completes, and
+  // both peers park symmetrically (target9 wedge: CPU thread sampled inside the
+  // EXI CR MMIO write for 54 minutes). No thread ever blocks on the network while
+  // holding m_frames_lock -- and with N peers, no console can stall another's
+  // link either.
   void EnqueueMessage(u8 type, u8 mask, u32 tick, const u8* payload, u16 len);
 
   // --- wedge diagnostics: logs the emulated PC/LR while the exchange is
