@@ -915,7 +915,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       const u32 k = m_pending_replay;
       m_pending_replay = 0;
       m_replay_serving = k;
-      if (m_match_pacing == 1)
+      if (m_match_pacing == 1 || m_match_pacing == 3)
         SuspendThrottle(true);
       m_burst_start = std::chrono::steady_clock::now();
       m_burst_start_cycles = static_cast<u64>(m_system.GetCoreTiming().GetTicks());
@@ -1028,7 +1028,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
                        m_serve_tick, target, depth);
           m_serve_tick = target;
           m_replay_serving = depth;
-          if (m_match_pacing == 1)
+          if (m_match_pacing == 1 || m_match_pacing == 3)
             SuspendThrottle(true);
           m_burst_start = std::chrono::steady_clock::now();
           m_burst_start_cycles = static_cast<u64>(m_system.GetCoreTiming().GetTicks());
@@ -1059,6 +1059,8 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
         // depth 45, frontier deadlocked 24k ticks). Parking bounds depth at
         // ~W, keeps history alive, and the game spinning at POLL still
         // advances CoreTiming, so the in-flight transfer actually drains.
+        if (m_match_pacing == 3)
+          SuspendThrottle(true);
         Common::SleepCurrentThread(1);
         return u32(POLL_WAIT) << 24;
       }
@@ -1076,6 +1078,8 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       {
         RecordStall(0);  // peer's inputs were already here: zero stall
       }
+      if (m_match_pacing == 3 && m_throttle_suspended)
+        SuspendThrottle(false);
       NoteServeCycles();
       return u32(POLL_READY) << 24;
     }
@@ -1097,6 +1101,8 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
         PredictIntoLocked(m_serve_tick);
         RecordStall(0);
         m_stall_active = false;
+        if (m_match_pacing == 3 && m_throttle_suspended)
+          SuspendThrottle(false);
         NoteServeCycles();
         return u32(POLL_READY) << 24;
       }
@@ -1106,6 +1112,17 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       m_stall_start = std::chrono::steady_clock::now();
       m_stall_active = true;
     }
+    // Mode 3: the WAIT spin advances the emulated clock (measured 2.3x wall
+    // in pace9 -- 6.6 fields burned per 48ms window-edge park), and the
+    // throttle then bills those fields against wall time after the park,
+    // freezing the game (~123ms observed). That, not the replay burst
+    // (mid ~0.4 fields), is the ~7-field-per-rollback pacing cost: both
+    // peers' post-park freezes delay their sends, interlocking at ~30
+    // ticks/s. Suspending here re-anchors the reference continuously, so
+    // spin-burned emulated time is forgiven and serves resume debt-free at
+    // the next READY.
+    if (m_match_pacing == 3)
+      SuspendThrottle(true);
     // Be polite to the host CPU while the game spins on us.
     Common::SleepCurrentThread(1);
     return u32(POLL_WAIT) << 24;

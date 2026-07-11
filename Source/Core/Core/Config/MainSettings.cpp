@@ -203,7 +203,11 @@ const Info<int> MAIN_MELEE_NETPLAY_WINDOW{{System::Main, "MeleeNetplay", "Window
 // Rollback pacing policy. 0 = default: throttle always on (the target12c
 // qualification configuration). 1 = throttle suspended during a replay burst
 // (restore -> first post-replay POLL). 2 = throttle suspended for the whole
-// match (diagnostic ceiling; audio/VI pacing degrades).
+// match (diagnostic ceiling; audio/VI pacing degrades). 3 = mode 1 plus
+// suspension while parked at POLL WAIT, released at the next READY serve --
+// pace9 attribution showed the per-rollback cost is the WAIT spin advancing
+// the emulated clock ~2.3x wall (6.6 fields per window-edge park) which the
+// throttle then bills back as a post-park freeze; mode 3 forgives it.
 // Measured (pace2/pace6): bursts are CHEAP either way (~6ms wall, ~50 of the
 // ~1100 emulated fields per 600-tick window) -- the in-match rate is pinned
 // at ~30/s by NORMAL serves costing ~1.8 VI fields of emulated time each,
