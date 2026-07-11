@@ -112,6 +112,12 @@ public:
   // provide, since it only sees one peer's memory.
   bool DumpLive(Core::System& system, const std::string& path) const;
 
+  // Same file format as DumpLive, but from the ring entry for `tick` instead
+  // of live memory: the PRE-state of the first divergent tick, byte-comparable
+  // across peers by construction (both peers hold the same tick in their
+  // rings). Returns false if the ring no longer holds `tick`.
+  bool DumpSnapshot(u32 tick, const std::string& path) const;
+
   // Diagnostic watches ("watch" lines): u32 globals logged with checksums.
   struct Watch
   {

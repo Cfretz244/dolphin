@@ -447,4 +447,22 @@ bool MeleeRollbackState::DumpLive(Core::System& system, const std::string& path)
   }
   return out.good();
 }
+
+bool MeleeRollbackState::DumpSnapshot(u32 tick, const std::string& path) const
+{
+  const Slot& slot = m_ring[tick % RING_SIZE];
+  if (!slot.valid || slot.tick != tick || slot.data.size() != m_snapshot_bytes)
+    return false;
+  std::ofstream out(path, std::ios::binary);
+  if (!out)
+    return false;
+  std::ostringstream hdr;
+  for (const Region& r : m_regions)
+    hdr << fmt::format("{:08x} {:08x} {}\n", r.start, r.end, r.label);
+  hdr << "\n";
+  const std::string h = hdr.str();
+  out.write(h.data(), h.size());
+  out.write(reinterpret_cast<const char*>(slot.data.data()), slot.data.size());
+  return out.good();
+}
 }  // namespace ExpansionInterface

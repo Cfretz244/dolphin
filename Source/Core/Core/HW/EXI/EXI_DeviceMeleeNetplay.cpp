@@ -846,6 +846,8 @@ void CEXIMeleeNetplay::CompareChecksumLocked(u32 tick, u32 local_crc, u32 remote
     Core::DisplayMessage(fmt::format("MeleeNetplay: DESYNC at tick {}", tick), 20000);
     if (!m_desync_dumped && m_dump_armed_tick < 0)
       m_dump_armed_tick = tick;
+    if (!m_ring_dumped && m_ring_dump_tick < 0)
+      m_ring_dump_tick = tick;
     DumpSeedTraceRing(tick);
   }
   else
@@ -858,6 +860,27 @@ void CEXIMeleeNetplay::CompareChecksumLocked(u32 tick, u32 local_crc, u32 remote
   }
   m_local_crcs.erase(m_local_crcs.begin(), m_local_crcs.upper_bound(tick));
   m_remote_crcs.erase(m_remote_crcs.begin(), m_remote_crcs.upper_bound(tick));
+}
+
+// Write the queued first-mismatch ring dumps (see m_ring_dump_tick). CPU
+// thread only — the ring has no lock of its own and Capture runs here.
+void CEXIMeleeNetplay::MaybeDumpDesyncRing()
+{
+  u32 tick = 0;
+  {
+    std::lock_guard lk(m_frames_lock);
+    if (m_ring_dumped || m_ring_dump_tick < 0)
+      return;
+    m_ring_dumped = true;
+    tick = static_cast<u32>(m_ring_dump_tick);
+  }
+  for (const u32 t : {tick - 1, tick})
+  {
+    const std::string path = File::GetUserPath(D_USER_IDX) + fmt::format("desync-ring-{}.bin", t);
+    const bool ok = m_rollback.DumpSnapshot(t, path);
+    ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: desync ring dump {} -> {}",
+                  ok ? "written" : "FAILED (tick left the ring)", path);
+  }
 }
 
 // Hash + transmit + compare every hash tick the confirmed boundary has
@@ -1285,6 +1308,7 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
           std::lock_guard lk(m_frames_lock);
           EmitSnapshotChecksumsLocked();
         }
+        MaybeDumpDesyncRing();
         MaybeTorture();
       }
     }

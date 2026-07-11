@@ -126,7 +126,11 @@ private:
   // game-side CMD_CHECKSUM hash-at-submission was speculative under
   // prediction and produced false desyncs at byte-identical sims (target
   // run 3). m_hash_tick = last hash tick emitted (or skipped).
-  static constexpr u32 HASH_INTERVAL = 60;
+  // INTERVAL 1 = every tick: the class-(B) hunt needs the FIRST divergent
+  // tick, not a 60-coarse bracket — the entry spans are only visible in the
+  // pre-state of that exact tick (~20KB FNV per tick, trivial next to the
+  // 0.5ms captures; wire cost 12 bytes/tick).
+  static constexpr u32 HASH_INTERVAL = 1;
   u32 m_hash_tick = 0;
   // Hash ticks are hashed AT CAPTURE (ring[tick] is fresh then) and parked
   // here until the frontier confirms them. Hashing at emission from the ring
@@ -218,6 +222,15 @@ private:
   // m_frames_lock (armed from the net thread, consumed on the CPU thread).
   s64 m_dump_armed_tick = -1;
   bool m_desync_dumped = false;
+  // Entry-tick forensics (per-tick oracle): the FIRST mismatching hash tick T
+  // also queues a RING dump — ring[T] is the pre-state of the first divergent
+  // tick, and ring[T-1] the last-agreed reference, identical capture points on
+  // both peers. Queued under m_frames_lock (compare can run on the net
+  // thread); written on the CPU thread at the next CMD_SEND, while the ring
+  // still holds the ticks (detection lags T by ~latency << RING_SIZE).
+  s64 m_ring_dump_tick = -1;
+  bool m_ring_dumped = false;
+  void MaybeDumpDesyncRing();
   bool MatchStateEvolving() const
   {
     return m_game_crc_seen && m_game_crc_last != m_game_crc_prev;
