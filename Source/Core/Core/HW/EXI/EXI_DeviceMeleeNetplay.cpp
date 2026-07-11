@@ -529,12 +529,23 @@ void CEXIMeleeNetplay::SendInputs(u32 tick, const u8* pads)
     u32 p = 0;
     while (p < 3 && (m_local_mask & (1 << p)) == 0)
       p++;
-    const bool stamped = (pads[p * PAD_BYTES + 0x42] & 1) != 0;
+    const u8 flag_byte = pads[p * PAD_BYTES + 0x42];
+    const bool stamped = (flag_byte & 1) != 0;
     if (stamped != m_barrier_armed)
     {
       m_barrier_armed = stamped;
       INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: barrier fence {} at tick {}",
                    stamped ? "armed" : "disarmed", tick);
+    }
+    // Bit 7: match-end quiesce stamp (GAME! through scene exit). The game
+    // issues results-screen loads in this window whose completion flags live
+    // in restored heap; treat it exactly like an armed barrier fence.
+    const bool quiesce = (flag_byte & 0x80) != 0;
+    if (quiesce != m_quiesce_stamped)
+    {
+      m_quiesce_stamped = quiesce;
+      INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: match-end quiesce {} at tick {}",
+                   quiesce ? "armed" : "disarmed", tick);
     }
   }
   // Log non-neutral input. A peer whose controller never reaches the exchange
@@ -1229,7 +1240,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       }
     }
     const bool payload_fenced = m_serve_tick < m_payload_fence_until;
-    if ((m_barrier_armed || payload_fenced) && m_window != 0)
+    if ((m_barrier_armed || m_quiesce_stamped || payload_fenced) && m_window != 0)
     {
       std::lock_guard lk(m_frames_lock);
       if (m_confirmed_frontier < m_serve_tick)
@@ -1268,7 +1279,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
     // completion-amnesia wedge hazard); local inputs must already be looped
     // back (they always are: the game SENDs tick+delay before polling tick).
     if (m_window != 0 && m_rollback.IsLoaded() && InRealMatch() && !m_barrier_armed &&
-        !payload_fenced)
+        !m_quiesce_stamped && !payload_fenced)
     {
       std::lock_guard lk(m_frames_lock);
       const u32 ahead = m_serve_tick - m_confirmed_frontier;

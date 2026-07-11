@@ -327,6 +327,9 @@ private:
   // owned port's block). While armed, prediction is suppressed so no
   // speculative window can span a barrier release (see the predict gate).
   bool m_barrier_armed = false;
+  // Match-end quiesce stamp (flag byte 0x42 bit 7): GAME! through scene
+  // exit. Same treatment as an armed barrier fence.
+  bool m_quiesce_stamped = false;
   // Polls parked draining outstanding speculation behind an armed barrier
   // stamp (see the barrier drain block in CMD_POLL): once a barrier flag is
   // up, no unconfirmed tick may remain behind it, or a mispredict rollback
