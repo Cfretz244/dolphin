@@ -17,6 +17,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <thread>
@@ -26,6 +27,8 @@
 #include "Common/Flag.h"
 #include "Core/HW/EXI/EXI_Device.h"
 #include "Core/HW/EXI/MeleeRollbackState.h"
+
+struct MemCheckTraceRing;
 
 namespace ExpansionInterface
 {
@@ -247,6 +250,11 @@ private:
   u32 m_sched_anchor_tick = 0;
   bool m_sched_valid = false;
   void UpdateSchedulePacing();
+  // Quiet seed-write tracing (TraceSeedQuiet): memcheck hits append to this
+  // ring instead of NOTICE-logging; dumped as seedtrace.txt at first desync.
+  std::unique_ptr<MemCheckTraceRing> m_seed_trace_ring;
+  bool m_seed_trace_dumped = false;
+  void DumpSeedTraceRing(u32 desync_tick);
   // Burst cost instrumentation: wall time from a REPLAY directive to the
   // first post-replay POLL (= restore + all replayed tick bodies + their
   // re-captures). pace1 arithmetic said ~120ms/burst ~= depth x 16.7ms,

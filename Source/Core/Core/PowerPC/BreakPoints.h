@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <optional>
 #include <string>
@@ -25,6 +26,31 @@ struct TBreakPoint
   bool break_on_hit = false;
   std::optional<Expression> condition;
 };
+
+// Log-free watchpoint tracing. The Melee RNG-seed watchpoint fires hundreds
+// of times per frame from the particle VM; per-hit NOTICE logging crawls the
+// game below 1 tick/s. When a ring is registered, memcheck hits append here
+// instead, and the owner (the netplay EXI device) dumps it on desync.
+struct MemCheckTraceRing
+{
+  static constexpr size_t CAPACITY = 1 << 18;
+  struct Entry
+  {
+    u32 pc;     // 0 = tick marker: lr=replay depth, value=tick
+    u32 lr;
+    u32 addr;
+    u32 value;
+  };
+  std::vector<Entry> entries = std::vector<Entry>(CAPACITY);
+  std::atomic<u64> head{0};
+  void Push(u32 pc, u32 lr, u32 addr, u32 value)
+  {
+    const u64 i = head.fetch_add(1, std::memory_order_relaxed);
+    entries[i % CAPACITY] = {pc, lr, addr, value};
+  }
+};
+void SetMemCheckTraceRing(MemCheckTraceRing* ring);  // nullptr to clear
+MemCheckTraceRing* GetMemCheckTraceRing();
 
 struct TMemCheck
 {

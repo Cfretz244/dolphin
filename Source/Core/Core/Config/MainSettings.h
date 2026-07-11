@@ -126,6 +126,7 @@ extern const Info<int> MAIN_MELEE_NETPLAY_TORTURE_DEPTH;
 extern const Info<int> MAIN_MELEE_NETPLAY_WINDOW;
 extern const Info<int> MAIN_MELEE_NETPLAY_MATCH_PACING;
 extern const Info<u32> MAIN_MELEE_NETPLAY_TRACE_SEED_WRITES;
+extern const Info<bool> MAIN_MELEE_NETPLAY_TRACE_SEED_QUIET;
 const Info<SerialInterface::SIDevices>& GetInfoForSIDevice(int channel);
 const Info<bool>& GetInfoForAdapterRumble(int channel);
 const Info<bool>& GetInfoForSimulateKonga(int channel);

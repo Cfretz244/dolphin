@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <random>
 #include <vector>
 
@@ -86,6 +87,16 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
   m_local_mask = ports_cfg != 0 ? static_cast<u8>(ports_cfg) : (m_is_host ? 0x01 : 0x02);
 
   m_trace_seed_addr = Config::Get(Config::MAIN_MELEE_NETPLAY_TRACE_SEED_WRITES);
+  if (m_trace_seed_addr != 0 && Config::Get(Config::MAIN_MELEE_NETPLAY_TRACE_SEED_QUIET))
+  {
+    // Quiet tracing: per-hit NOTICE lines crawl the game below 1 tick/s once
+    // a fight starts (the particle VM rolls the seed hundreds of times per
+    // frame). Hits append to this ring instead; DumpSeedTraceRing() writes it
+    // out at the first desync, giving full within-tick caller attribution
+    // exactly where it matters.
+    m_seed_trace_ring = std::make_unique<MemCheckTraceRing>();
+    SetMemCheckTraceRing(m_seed_trace_ring.get());
+  }
   EnsureSeedTraceArmed("device init");
 
   m_fake_latency_ms = std::max(0, Config::Get(Config::MAIN_MELEE_NETPLAY_FAKE_LATENCY_MS));
@@ -144,6 +155,8 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
 
 CEXIMeleeNetplay::~CEXIMeleeNetplay()
 {
+  if (m_seed_trace_ring)
+    SetMemCheckTraceRing(nullptr);
   SuspendThrottle(false);
   m_running.Clear();
   m_sendq_cv.notify_all();
@@ -550,6 +563,39 @@ void CEXIMeleeNetplay::SuspendThrottle(bool on)
   m_system.GetCoreTiming().SetSpeedUnlimitedOverride(on);
 }
 
+// Write the quiet seed-trace ring out as text lines in the exact format
+// diff-seed-writes.py already parses (MBP + trace-tick markers). Once per
+// run, at the first desync -- the ring holds the last ~256k writes, which at
+// particle-flood rates still spans hundreds of ticks around the fork.
+void CEXIMeleeNetplay::DumpSeedTraceRing(u32 desync_tick)
+{
+  if (!m_seed_trace_ring || m_seed_trace_dumped)
+    return;
+  m_seed_trace_dumped = true;
+  const std::string path = File::GetUserPath(D_LOGS_IDX) + "seedtrace.txt";
+  std::ofstream f(path);
+  if (!f)
+  {
+    ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: cannot open {}", path);
+    return;
+  }
+  auto& ring = *m_seed_trace_ring;
+  const u64 head = ring.head.load(std::memory_order_relaxed);
+  const u64 count = std::min<u64>(head, MemCheckTraceRing::CAPACITY);
+  f << fmt::format("seedtrace dump at desync tick={} entries={}\n", desync_tick, count);
+  for (u64 i = head - count; i < head; i++)
+  {
+    const auto& e = ring.entries[i % MemCheckTraceRing::CAPACITY];
+    if (e.pc == 0)
+      f << fmt::format("trace tick={} replaying={}\n", e.value, e.lr);
+    else
+      f << fmt::format("MBP {:08x} ( ) Write32 {:x} at {:08x} lr={:08x}\n", e.pc, e.value, e.addr,
+                       e.lr);
+  }
+  ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: seed trace ring dumped to {} ({} entries)",
+                path, count);
+}
+
 void CEXIMeleeNetplay::UpdateSchedulePacing()
 {
   if (!InRealMatch())
@@ -800,6 +846,7 @@ void CEXIMeleeNetplay::CompareChecksumLocked(u32 tick, u32 local_crc, u32 remote
     Core::DisplayMessage(fmt::format("MeleeNetplay: DESYNC at tick {}", tick), 20000);
     if (!m_desync_dumped && m_dump_armed_tick < 0)
       m_dump_armed_tick = tick;
+    DumpSeedTraceRing(tick);
   }
   else
   {
@@ -1198,7 +1245,9 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
       // Per-tick markers interleave with the MBP stream so each traced write
       // attributes to an exact game tick (checksum lines are 60-coarse and
       // stop entirely at a desync -- exactly where attribution matters most).
-      if (m_trace_seed_addr != 0)
+      if (m_seed_trace_ring)
+        m_seed_trace_ring->Push(0, m_replay_serving, 0, m_serve_tick);
+      else if (m_trace_seed_addr != 0)
         NOTICE_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: trace tick={} replaying={}",
                        m_serve_tick, m_replay_serving);
       // Snapshot point: the game is parked in this transaction at the top of

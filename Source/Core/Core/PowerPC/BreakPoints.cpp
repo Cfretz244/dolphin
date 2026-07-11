@@ -422,6 +422,18 @@ bool MemChecks::OverlapsMemcheck(u32 address, u32 length) const
   });
 }
 
+static std::atomic<MemCheckTraceRing*> s_trace_ring{nullptr};
+
+void SetMemCheckTraceRing(MemCheckTraceRing* ring)
+{
+  s_trace_ring.store(ring, std::memory_order_release);
+}
+
+MemCheckTraceRing* GetMemCheckTraceRing()
+{
+  return s_trace_ring.load(std::memory_order_acquire);
+}
+
 bool TMemCheck::Action(Core::System& system, u64 value, u32 addr, bool write, size_t size, u32 pc)
 {
   if (!is_enabled)
@@ -430,6 +442,11 @@ bool TMemCheck::Action(Core::System& system, u64 value, u32 addr, bool write, si
   if (((write && is_break_on_write) || (!write && is_break_on_read)) &&
       EvaluateCondition(system, this->condition))
   {
+    if (MemCheckTraceRing* ring = GetMemCheckTraceRing())
+    {
+      ring->Push(pc, LR(system.GetPPCState()), addr, static_cast<u32>(value));
+      return false;  // quiet: no log line, never break
+    }
     if (log_on_hit)
     {
       auto& ppc_symbol_db = system.GetPPCSymbolDB();

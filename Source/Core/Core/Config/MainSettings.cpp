@@ -233,6 +233,11 @@ const Info<int> MAIN_MELEE_NETPLAY_MATCH_PACING{{System::Main, "MeleeNetplay", "
 // (watchpoint-aware) JIT memory path; expect a big slowdown.
 const Info<u32> MAIN_MELEE_NETPLAY_TRACE_SEED_WRITES{
     {System::Main, "MeleeNetplay", "TraceSeedWrites"}, 0};
+// Quiet variant: hits append to an in-memory ring (dumped as seedtrace.txt at
+// the first desync) instead of NOTICE lines -- in-match particle rolls are
+// hundreds per frame and per-hit log I/O crawls the game below 1 tick/s.
+const Info<bool> MAIN_MELEE_NETPLAY_TRACE_SEED_QUIET{
+    {System::Main, "MeleeNetplay", "TraceSeedQuiet"}, false};
 
 const Info<SerialInterface::SIDevices>& GetInfoForSIDevice(int channel)
 {
