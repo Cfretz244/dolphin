@@ -23,6 +23,8 @@
 
 #include "Core/HW/DSP.h"
 
+#include "Core/HW/EXI/MeleeRollbackState.h"
+
 #include <memory>
 
 #include "AudioCommon/AudioCommon.h"
@@ -478,6 +480,11 @@ void DSPManager::Do_ARAM_DMA()
     m_aram_dma.ARAddr &= 0x3ffffff;
     m_aram_dma.MMAddr &= 0x3ffffff;
 
+    // For Melee-netplay rollback payload re-delivery (journal the MRAM span
+    // this download writes; see MeleeRollbackState::NotifyPayloadWrite).
+    const u32 dma_mram_start = m_aram_dma.MMAddr;
+    const u32 dma_total = m_aram_dma.Cnt.count;
+
     if (m_aram_dma.ARAddr < m_aram.size)
     {
       while (m_aram_dma.Cnt.count)
@@ -515,6 +522,8 @@ void DSPManager::Do_ARAM_DMA()
         m_aram_dma.Cnt.count -= 8;
       }
     }
+    ExpansionInterface::MeleeRollbackState::NotifyPayloadWrite(m_system, dma_mram_start,
+                                                               dma_total);
   }
   else
   {

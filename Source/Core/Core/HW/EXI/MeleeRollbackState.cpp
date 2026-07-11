@@ -44,7 +44,56 @@ bool SaneRange(u32 start, u32 end)
 {
   return start >= MEM1_BASE && end <= MEM1_END && start < end;
 }
+
+// Payload-journal registration target (see NotifyPayloadWrite). Delivery
+// sites and Capture/Restore all run on the CPU thread — no locking.
+MeleeRollbackState* s_active_rollback_state = nullptr;
 }  // namespace
+
+MeleeRollbackState::~MeleeRollbackState()
+{
+  if (s_active_rollback_state == this)
+    s_active_rollback_state = nullptr;
+}
+
+void MeleeRollbackState::NotifyPayloadWrite(Core::System& system, u32 addr, u32 len)
+{
+  if (s_active_rollback_state != nullptr)
+    s_active_rollback_state->NotePayloadWrite(system, addr, len);
+}
+
+void MeleeRollbackState::NotePayloadWrite(Core::System& system, u32 addr, u32 len)
+{
+  if (m_regions.empty() || !m_heap_resolved || len == 0)
+    return;
+  // Physical (0x00xxxxxx) delivery addresses alias the cached mirror the
+  // region table uses.
+  if (addr < MEM1_BASE)
+    addr |= MEM1_BASE;
+  const u32 addr_end = addr + len;
+  auto& memory = system.GetMemory();
+  // Journal only the spans overlapping RESTORED regions: excluded regions
+  // keep live bytes that may already have advanced past this delivery.
+  for (const Region& r : m_regions)
+  {
+    const u32 lo = std::max(addr, r.start);
+    const u32 hi = std::min(addr_end, r.end);
+    if (lo >= hi)
+      continue;
+    Delivery d;
+    d.seq = ++m_delivery_seq;
+    d.addr = lo;
+    d.bytes.resize(hi - lo);
+    memory.CopyFromEmu(d.bytes.data(), lo, hi - lo);
+    m_delivery_bytes += d.bytes.size();
+    m_deliveries.push_back(std::move(d));
+  }
+  while (m_delivery_bytes > DELIVERY_BYTES_CAP && !m_deliveries.empty())
+  {
+    m_delivery_bytes -= m_deliveries.front().bytes.size();
+    m_deliveries.pop_front();
+  }
+}
 
 bool MeleeRollbackState::LoadRegionTable(const std::string& path, std::string* error)
 {
@@ -146,6 +195,11 @@ bool MeleeRollbackState::LoadRegionTable(const std::string& path, std::string* e
                  "MeleeRollback: device-side sync oracle: {} hash spans, {} bytes",
                  m_hash_spans.size(), hash_bytes);
   }
+  // Arm the payload journal (see NotifyPayloadWrite) on a fresh run.
+  m_deliveries.clear();
+  m_delivery_seq = 0;
+  m_delivery_bytes = 0;
+  s_active_rollback_state = this;
   return true;
 }
 
@@ -245,6 +299,7 @@ void MeleeRollbackState::Capture(Core::System& system, u32 tick)
   slot.epoch_dvd = system.GetDVDThread().GetNonDTKReadsCompleted() +
                    system.GetDVDInterface().GetNonDTKCommandsCompleted();
   slot.aram_int_pending = system.GetDSP().IsARAMDMAInProgress();
+  slot.delivery_seq = m_delivery_seq;
   slot.valid = true;
 
   m_total_captures++;
@@ -265,6 +320,42 @@ bool MeleeRollbackState::Restore(Core::System& system, u32 tick)
   {
     memory.CopyToEmu(r.start, slot.data.data() + off, r.end - r.start);
     off += r.end - r.start;
+  }
+
+  // Re-deliver async payloads written into restored memory since this slot's
+  // capture (see NotifyPayloadWrite): the copy above rolled those bytes back
+  // to pre-payload while the excluded (live) driver/queue bookkeeping says
+  // the transfers are done — nobody will write them again. Payload sources
+  // are pure, so replaying the journal in delivery order makes restored
+  // memory match what the live bookkeeping believes.
+  {
+    const u64 first_retained =
+        m_deliveries.empty() ? m_delivery_seq + 1 : m_deliveries.front().seq;
+    if (slot.delivery_seq + 1 < first_retained)
+    {
+      m_redelivery_gaps++;
+      ERROR_LOG_FMT(EXPANSIONINTERFACE,
+                    "MeleeRollback: payload journal gap on restore to tick {} (need seq > {}, "
+                    "oldest retained {}) — re-delivery incomplete",
+                    tick, slot.delivery_seq, first_retained);
+    }
+    u32 spans = 0;
+    size_t bytes = 0;
+    for (const Delivery& d : m_deliveries)
+    {
+      if (d.seq <= slot.delivery_seq)
+        continue;
+      memory.CopyToEmu(d.addr, d.bytes.data(), d.bytes.size());
+      spans++;
+      bytes += d.bytes.size();
+    }
+    if (spans != 0)
+    {
+      m_redelivered += spans;
+      INFO_LOG_FMT(EXPANSIONINTERFACE,
+                   "MeleeRollback: re-delivered {} payload spans ({} bytes) after restore to {}",
+                   spans, bytes, tick);
+    }
   }
 
   // Rewind the GAME-VISIBLE time base to the snapshot's value, so replayed

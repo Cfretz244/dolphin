@@ -21,6 +21,7 @@
 #include "Core/CoreTiming.h"
 #include "Core/HW/DVD/DVDInterface.h"
 #include "Core/HW/DVD/FileMonitor.h"
+#include "Core/HW/EXI/MeleeRollbackState.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/IOS/ES/Formats.h"
@@ -267,7 +268,8 @@ void DVDThread::FinishRead(u64 id, s64 cycles_late)
   }
   // We have now obtained the right ReadResult.
 
-  if (m_pending_non_dtk_reads.erase(id) != 0)
+  const bool non_dtk = m_pending_non_dtk_reads.erase(id) != 0;
+  if (non_dtk)
   {
     m_non_dtk_reads_completed++;
     // Survey line for the Melee-netplay DVD re-delivery design: names where
@@ -306,6 +308,14 @@ void DVDThread::FinishRead(u64 id, s64 cycles_late)
     {
       auto& memory = m_system.GetMemory();
       memory.CopyToEmu(request.output_address, buffer.data(), request.length);
+      // Journal the payload for Melee-netplay rollback re-delivery (a restore
+      // across this delivery rolls the destination back while the live driver
+      // bookkeeping says the read is done).
+      if (non_dtk)
+      {
+        ExpansionInterface::MeleeRollbackState::NotifyPayloadWrite(
+            m_system, request.output_address, request.length);
+      }
     }
 
     interrupt = DVD::DIInterruptType::TCINT;

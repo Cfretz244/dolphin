@@ -15,6 +15,7 @@
 #pragma once
 
 #include <array>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,8 @@ namespace ExpansionInterface
 class MeleeRollbackState
 {
 public:
+  ~MeleeRollbackState();
+
   // Ring depth bounds the rollback window; 16 ticks ≈ 267 ms at 60 Hz,
   // comfortably above any playable prediction window.
   static constexpr size_t RING_SIZE = 16;
@@ -117,6 +120,27 @@ public:
   u64 TotalCaptures() const { return m_total_captures; }
   u64 LastCaptureMicros() const { return m_last_capture_us; }
 
+  // ---- Async payload re-delivery -----------------------------------------
+  // A DVD read (or ARAM->MRAM DMA) delivered between a slot's capture and a
+  // restore of that slot writes payload into RESTORED memory: the restore
+  // rolls the destination back to pre-payload bytes while the (excluded,
+  // live) driver/queue bookkeeping says the transfer is done — nobody will
+  // ever write it again, and the consumer reads garbage or spin-waits
+  // (v17q1: both peers symmetrically wedged in the post-match scene load
+  // after rollbacks straddled the GAME!-window preload reads). Payload
+  // sources are PURE (disc reads, ARAM contents), so re-writing the
+  // journaled bytes after the region copy makes the restored memory match
+  // what the live bookkeeping believes. Only the spans overlapping restored
+  // regions are journaled: excluded regions keep live bytes that may have
+  // advanced PAST the delivery (e.g. streaming double-buffers) and must not
+  // be rewound to an older payload.
+  // Delivery sites (CPU thread, same as Capture/Restore — no locking):
+  // DVDThread::FinishRead (non-DTK, copy_to_ram) and DSPManager::
+  // Do_ARAM_DMA (ARAM->MRAM direction) call NotifyPayloadWrite.
+  static void NotifyPayloadWrite(Core::System& system, u32 addr, u32 len);
+  u64 RedeliveredSpans() const { return m_redelivered; }
+  u64 RedeliveryGaps() const { return m_redelivery_gaps; }
+
   // Cross-peer divergence forensics: dump the LIVE region set (with a small
   // header naming each region's bounds) to a file. Both peers dump at the
   // same tick on a DESYNC; scripts/diff-desync-dumps.py names the exact
@@ -159,7 +183,15 @@ private:
     // the snapshot holds the transferred data). If it fires before a restore
     // of this slot, the delivery must be re-raised (see the R1 restore path).
     bool aram_int_pending = false;
+    u64 delivery_seq = 0;  // payload journal position at capture
     std::vector<u8> data;  // concatenated regions, m_snapshot_bytes long
+  };
+
+  struct Delivery
+  {
+    u64 seq = 0;
+    u32 addr = 0;  // emu VA (cached mirror)
+    std::vector<u8> bytes;
   };
 
   void ResolveHeapRegion(Core::System& system);
@@ -176,8 +208,19 @@ private:
   bool m_heap_resolved = false;
   size_t m_snapshot_bytes = 0;
 
+  void NotePayloadWrite(Core::System& system, u32 addr, u32 len);
+
   std::array<Slot, RING_SIZE> m_ring;
   u64 m_total_captures = 0;
   u64 m_last_capture_us = 0;
+
+  // Payload journal (see NotifyPayloadWrite). Byte-capped ring; a restore
+  // needing evicted entries logs a gap (honest failure, counted).
+  static constexpr size_t DELIVERY_BYTES_CAP = 16 * 1024 * 1024;
+  std::deque<Delivery> m_deliveries;
+  u64 m_delivery_seq = 0;
+  size_t m_delivery_bytes = 0;
+  u64 m_redelivered = 0;
+  u64 m_redelivery_gaps = 0;
 };
 }  // namespace ExpansionInterface

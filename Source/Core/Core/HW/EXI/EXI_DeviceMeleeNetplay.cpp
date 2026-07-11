@@ -740,11 +740,12 @@ void CEXIMeleeNetplay::ReportStalls()
     INFO_LOG_FMT(EXPANSIONINTERFACE,
                  "MeleeNetplay: rollback stats: predicted={} validated_ok={} rollbacks={} "
                  "max_depth={} refused_scene={} refused_io={} refused_epoch={} "
-                 "aram_redelivered={} checksums_skipped={} frontier_lag={} barrier_drain={}",
+                 "aram_redelivered={} checksums_skipped={} frontier_lag={} barrier_drain={} "
+                 "payload_redelivered={} payload_gaps={}",
                  m_predicted_ticks, m_validated_ok, m_rollback_count, m_rollback_depth_max,
                  m_rollback_refused_scene, m_restore_refused_io, m_restore_refused_epoch,
                  m_aram_redelivered, m_checksums_skipped, m_serve_tick - m_confirmed_frontier,
-                 m_barrier_drain_polls);
+                 m_barrier_drain_polls, m_rollback.RedeliveredSpans(), m_rollback.RedeliveryGaps());
     // Where a replay burst's wall time goes (cumulative since boot). A burst
     // spans REPLAY directive -> first post-replay POLL; depth_avg gives the
     // replayed tick count that wall time bought.
