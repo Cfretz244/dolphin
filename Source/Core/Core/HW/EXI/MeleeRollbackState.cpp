@@ -65,6 +65,15 @@ void MeleeRollbackState::NotifyPayloadWrite(Core::System& system, u32 addr, u32 
 
 void MeleeRollbackState::NotePayloadWrite(Core::System& system, u32 addr, u32 len, bool from_dvd)
 {
+  // DVD payloads only. ARAM->MRAM downloads (fighter animation streaming)
+  // are TIME-EVOLVED sim-read state: at the restore target tick the buffer
+  // legitimately held the PREVIOUS contents, and the replay must re-read
+  // those — stomping the future payload over the restored past corrupts the
+  // rolling peer only (v17d q1: 1317 desyncs, every rollback crossing an
+  // anim load). The game's own replay re-requests ARAM loads it needs;
+  // thousands of clean rollbacks ran with no ARAM re-delivery at all.
+  if (!from_dvd)
+    return;
   if (m_regions.empty() || !m_heap_resolved || len == 0)
     return;
   // Physical (0x00xxxxxx) delivery addresses alias the cached mirror the
