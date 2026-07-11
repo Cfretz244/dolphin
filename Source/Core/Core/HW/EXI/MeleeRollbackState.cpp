@@ -82,8 +82,20 @@ void MeleeRollbackState::NotePayloadWrite(Core::System& system, u32 addr, u32 le
     addr |= MEM1_BASE;
   const u32 addr_end = addr + len;
   auto& memory = system.GetMemory();
-  // Journal only the spans overlapping RESTORED regions: excluded regions
-  // keep live bytes that may already have advanced past this delivery.
+  // Destination classes:
+  //   RESTORED regions  -> journal (payload rewrite on restore) + fence.
+  //   EXCLUDED regions  -> ignore entirely: music streaming (devcom
+  //                        double-buffers) lands here constantly in fights,
+  //                        and excluded bytes are live/correct by design.
+  //   UNTRACKED memory  -> fence only. Preload/archive buffers can live in
+  //                        arenas outside the region table while their
+  //                        BOOKKEEPING (preloadCache entries, heap
+  //                        cmdblocks) is restored — a rollback across the
+  //                        delivery orphans the waiter with the journal
+  //                        blind (v18q3: lbFile spin at scene exit,
+  //                        payload_redelivered=0, poisoned in the
+  //                        fight-start load tail).
+  bool journaled = false;
   for (const Region& r : m_regions)
   {
     const u32 lo = std::max(addr, r.start);
@@ -97,8 +109,22 @@ void MeleeRollbackState::NotePayloadWrite(Core::System& system, u32 addr, u32 le
     memory.CopyFromEmu(d.bytes.data(), lo, hi - lo);
     m_delivery_bytes += d.bytes.size();
     m_deliveries.push_back(std::move(d));
-    if (from_dvd)
-      m_dvd_delivery_seq++;
+    m_dvd_delivery_seq++;
+    journaled = true;
+  }
+  if (!journaled)
+  {
+    bool excluded = false;
+    for (const Region& r : m_excludes)
+    {
+      if (addr < r.end && addr_end > r.start)
+      {
+        excluded = true;
+        break;
+      }
+    }
+    if (!excluded)
+      m_dvd_delivery_seq++;  // untracked destination: arm the fence
   }
   while (m_delivery_bytes > DELIVERY_BYTES_CAP && !m_deliveries.empty())
   {
