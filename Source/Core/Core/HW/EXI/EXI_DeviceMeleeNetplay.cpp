@@ -1210,7 +1210,26 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
     // confirms everything behind the stamp: no unconfirmed tick may remain
     // once a barrier flag is up. Cost: one latency-floor stall per barrier
     // arming, at a scene transition where it is imperceptible.
-    if (m_barrier_armed && m_window != 0)
+    // Payload fence: a journaled delivery (async payload landing in RESTORED
+    // memory — scene preloads during the GAME!/victory window are the big
+    // source) means a rollback right now could orphan an in-flight or
+    // just-delivered transfer whose completion flags live in restored heap
+    // (payload re-delivery fixes the BYTES; nothing can re-fire the flags).
+    // Quiesce prediction and drain speculation while such traffic is
+    // landing; renewed per delivery, expires PAYLOAD_FENCE_TICKS after the
+    // last one. Music streaming never trips this (devcom buffers are
+    // excluded, so those deliveries are not journaled).
+    if (m_window != 0 && m_rollback.IsLoaded())
+    {
+      const u64 seq = m_rollback.DeliverySeq();
+      if (seq != m_last_delivery_seq)
+      {
+        m_last_delivery_seq = seq;
+        m_payload_fence_until = m_serve_tick + PAYLOAD_FENCE_TICKS;
+      }
+    }
+    const bool payload_fenced = m_serve_tick < m_payload_fence_until;
+    if ((m_barrier_armed || payload_fenced) && m_window != 0)
     {
       std::lock_guard lk(m_frames_lock);
       if (m_confirmed_frontier < m_serve_tick)
@@ -1248,7 +1267,8 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
     // memcard/DVD-heavy scene traffic makes any rollback there a
     // completion-amnesia wedge hazard); local inputs must already be looped
     // back (they always are: the game SENDs tick+delay before polling tick).
-    if (m_window != 0 && m_rollback.IsLoaded() && InRealMatch() && !m_barrier_armed)
+    if (m_window != 0 && m_rollback.IsLoaded() && InRealMatch() && !m_barrier_armed &&
+        !payload_fenced)
     {
       std::lock_guard lk(m_frames_lock);
       const u32 ahead = m_serve_tick - m_confirmed_frontier;

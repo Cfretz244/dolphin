@@ -332,6 +332,12 @@ private:
   // up, no unconfirmed tick may remain behind it, or a mispredict rollback
   // can erase the game's scene-exit request after the stamp is on the wire.
   u64 m_barrier_drain_polls = 0;
+  // Payload fence (see CMD_POLL): prediction quiesced while async payloads
+  // are landing in restored memory (scene preloads); renewed per journaled
+  // delivery, expires this many ticks after the last one.
+  static constexpr u32 PAYLOAD_FENCE_TICKS = 90;
+  u64 m_last_delivery_seq = 0;
+  u32 m_payload_fence_until = 0;
   // stats (CPU thread only)
   u64 m_predicted_ticks = 0;
   u64 m_validated_ok = 0;

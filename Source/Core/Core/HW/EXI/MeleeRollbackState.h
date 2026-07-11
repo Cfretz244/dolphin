@@ -140,6 +140,11 @@ public:
   static void NotifyPayloadWrite(Core::System& system, u32 addr, u32 len);
   u64 RedeliveredSpans() const { return m_redelivered; }
   u64 RedeliveryGaps() const { return m_redelivery_gaps; }
+  // Monotonic count of journaled restored-region delivery spans. The device
+  // polls this to arm the payload fence (prediction quiesce): a delivery
+  // into restored memory means async traffic is landing where a rollback
+  // would orphan it — serve confirmed-only until the traffic stops.
+  u64 DeliverySeq() const { return m_delivery_seq; }
 
   // Cross-peer divergence forensics: dump the LIVE region set (with a small
   // header naming each region's bounds) to a file. Both peers dump at the
