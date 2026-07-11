@@ -933,12 +933,12 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       return u32(POLL_READY) << 24;
     }
     // Remote inputs late: predict instead of stalling, if allowed. Gates:
-    // window budget vs the confirmed frontier; fights only (predicting
-    // through menus/movies is pointless and, worse, a rollback there is
-    // unrecoverable — same disc-streaming reasoning as the torture gate);
-    // local inputs must already be looped back (they always are: the game
-    // SENDs tick+delay before polling tick).
-    if (m_window != 0 && m_rollback.IsLoaded() && MatchStateEvolving() && !m_barrier_armed)
+    // window budget vs the confirmed frontier; real matches only (see
+    // InRealMatch — attract demos pass the crc-evolution test, but their
+    // memcard/DVD-heavy scene traffic makes any rollback there a
+    // completion-amnesia wedge hazard); local inputs must already be looped
+    // back (they always are: the game SENDs tick+delay before polling tick).
+    if (m_window != 0 && m_rollback.IsLoaded() && InRealMatch() && !m_barrier_armed)
     {
       std::lock_guard lk(m_frames_lock);
       const u32 ahead = m_serve_tick - m_confirmed_frontier;
@@ -1130,6 +1130,32 @@ bool CEXIMeleeNetplay::AsyncIOQuiescent() const
   return !m_system.GetDSP().IsARAMDMAInProgress() &&
          !m_system.GetDVDThread().HasPendingReads() &&
          !m_system.GetDVDInterface().IsCommandPending();
+}
+
+bool CEXIMeleeNetplay::InRealMatch()
+{
+  // GameRouting bytes via the major-scene watch (first watch by generator
+  // convention, same one SameScene keys on): byte 0 = current major mode,
+  // byte 3 = current minor scene. 0x02 = VS mode; minors 02 = MATCH,
+  // 03 = SUDDEN DEATH (gm_803DD9A0_Scenes). Everything else — boot, title,
+  // attract (0x18, which MatchStateEvolving alone would pass), menus, CSS,
+  // SSS, results — stays lockstep.
+  const auto& watches = m_rollback.Watches();
+  if (watches.empty())
+    return MatchStateEvolving();  // no watch configured: legacy loose gate
+  const u32 routing = m_rollback.ReadWatch(m_system, watches.front());
+  const u32 major = routing >> 24;
+  const u32 minor = routing & 0xFF;
+  const bool in_match =
+      MatchStateEvolving() && major == 0x02 && (minor == 0x02 || minor == 0x03);
+  if (in_match != m_in_match_gate)
+  {
+    m_in_match_gate = in_match;
+    INFO_LOG_FMT(EXPANSIONINTERFACE,
+                 "MeleeNetplay: prediction gate {} (routing={:08x} tick={})",
+                 in_match ? "OPEN (real match)" : "closed", routing, m_serve_tick);
+  }
+  return in_match;
 }
 
 void CEXIMeleeNetplay::MaybeTorture()

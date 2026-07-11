@@ -208,6 +208,15 @@ private:
   {
     return m_game_crc_seen && m_game_crc_last != m_game_crc_prev;
   }
+  // Strict prediction gate: the major-scene watch says we are inside a real
+  // VS match (major 0x02, minor MATCH/SUDDEN DEATH). MatchStateEvolving also
+  // passes attract demos, whose surrounding scenes are memcard/DVD heavy — a
+  // rollback there can erase the game's record of an already-delivered
+  // completion and park both peers in the card/DVD wait loop forever
+  // (target10b). Policy: rollback only inside real matches, lockstep
+  // everywhere else.
+  bool InRealMatch();
+  bool m_in_match_gate = false;  // last InRealMatch() result, for edge logs
   void MaybeTorture();
   // No emulator-level async I/O toward the game is pending (ARAM DMA, DVD
   // reads, DI command completions). Restore/rollback must not run otherwise:
