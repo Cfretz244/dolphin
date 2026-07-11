@@ -173,6 +173,13 @@ public:
   // Throttle the CPU to the specified target cycle.
   void Throttle(const s64 target_cycle);
 
+  // Cumulative wall time the CPU thread has spent asleep inside Throttle's
+  // SleepUntil, for external pacing diagnostics (Melee netplay rate lines).
+  u64 GetThrottleSleepUsTotal() const
+  {
+    return m_throttle_sleep_us_total.load(std::memory_order_relaxed);
+  }
+
   // Force IsSpeedUnlimited() true regardless of config or the hotkey flag.
   // Owned by engine-level consumers (Melee rollback replay bursts) -- the
   // Core::SetIsThrottlerTempDisabled flag can NOT serve them because
@@ -263,6 +270,7 @@ private:
   DT m_max_throttle_skip_time{};
 
   std::atomic_bool m_speed_unlimited_override = false;
+  std::atomic<u64> m_throttle_sleep_us_total{0};
 };
 
 }  // namespace CoreTiming

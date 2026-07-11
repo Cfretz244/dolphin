@@ -18,6 +18,7 @@
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
+#include "Core/HW/SystemTimers.h"
 #include "Core/HW/DSP.h"
 #include "Core/HW/DVD/DVDInterface.h"
 #include "Core/HW/DVD/DVDThread.h"
@@ -549,6 +550,22 @@ void CEXIMeleeNetplay::SuspendThrottle(bool on)
   m_system.GetCoreTiming().SetSpeedUnlimitedOverride(on);
 }
 
+void CEXIMeleeNetplay::NoteServeCycles()
+{
+  const u64 c = static_cast<u64>(m_system.GetCoreTiming().GetTicks());
+  if (m_last_serve_cycles != 0 && c > m_last_serve_cycles)
+  {
+    const double field_cycles = double(m_system.GetSystemTimers().GetTicksPerSecond()) / 60.0;
+    const u32 fields = static_cast<u32>((double(c - m_last_serve_cycles) / field_cycles) + 0.5);
+    const u32 idx = fields <= 1 ? 0 : (fields == 2 ? 1 : 2);
+    m_hist_fields[idx]++;
+    if (idx >= 1 && m_ticks_since_rollback <= 6)
+      m_hist_2plus_near_rb++;
+  }
+  m_last_serve_cycles = c;
+  m_ticks_since_rollback++;
+}
+
 void CEXIMeleeNetplay::RecordStall(u32 micros)
 {
   m_stall_samples_us.push_back(micros);
@@ -563,11 +580,13 @@ void CEXIMeleeNetplay::ReportStalls()
     return;
 
   const auto now = std::chrono::steady_clock::now();
+  const u64 cycles_now = static_cast<u64>(m_system.GetCoreTiming().GetTicks());
   if (m_rate_window_start.time_since_epoch().count() == 0)
   {
     // First window: no elapsed baseline yet, so only arm the counters.
     m_rate_window_start = now;
     m_rate_window_tick = m_serve_tick;
+    m_rate_window_cycles = cycles_now;
     m_stall_samples_us.clear();
     return;
   }
@@ -592,6 +611,34 @@ void CEXIMeleeNetplay::ReportStalls()
                "MeleeNetplay: rate={:.1f} ticks/s ({:.0f}% of 60Hz) | stall us over {} ticks: "
                "p50={} p90={} p99={} max={}",
                rate, 100.0 * rate / 60.0, n, pct(0.50), pct(0.90), pct(0.99), sorted[n - 1]);
+  // Emulated-time cost of a served tick: how many VI fields' worth of
+  // CoreTiming cycles pass per serve. 1.0 = the game makes every field
+  // deadline; ~2.0 = every tick slips to the next field (30Hz cadence) and
+  // the throttle bills the slack as real time.
+  {
+    const u32 tick_delta = m_serve_tick - m_rate_window_tick;
+    const double field_cycles = double(m_system.GetSystemTimers().GetTicksPerSecond()) / 60.0;
+    const double fields_per_tick =
+        tick_delta != 0 ? double(cycles_now - m_rate_window_cycles) / field_cycles / tick_delta :
+                          0.0;
+    // Split the window's wall time: throttle sleeps vs burst execution vs
+    // everything else, and the window's emulated advance vs how much of it
+    // happened inside (suspension-covered) bursts. Deltas since last window.
+    const u64 sleep_us_now = m_system.GetCoreTiming().GetThrottleSleepUsTotal();
+    const double burst_fields = double(m_burst_cycles_total - m_prev_burst_cycles) / field_cycles;
+    INFO_LOG_FMT(EXPANSIONINTERFACE,
+                 "MeleeNetplay: emu-time: {:.2f} fields/tick over {} ticks | throttle_sleep_ms={} "
+                 "burst_fields={:.0f} burst_wall_ms={} | serve fields hist 1/2/3+: {}/{}/{} "
+                 "(2+ near rollback: {})",
+                 fields_per_tick, tick_delta, (sleep_us_now - m_prev_sleep_us) / 1000,
+                 burst_fields, (m_burst_us_total - m_prev_burst_us) / 1000, m_hist_fields[0],
+                 m_hist_fields[1], m_hist_fields[2], m_hist_2plus_near_rb);
+    m_prev_sleep_us = sleep_us_now;
+    m_prev_burst_cycles = m_burst_cycles_total;
+    m_prev_burst_us = m_burst_us_total;
+    m_hist_fields[0] = m_hist_fields[1] = m_hist_fields[2] = 0;
+    m_hist_2plus_near_rb = 0;
+  }
   // Async-I/O epoch source diagnosis: which completion class churns, and how
   // often each in-flight predicate is up at the sample instant. R1 smoke #1
   // showed ~100 completions/s starving both restore gates; the split names
@@ -631,6 +678,7 @@ void CEXIMeleeNetplay::ReportStalls()
   m_stall_samples_us.clear();
   m_rate_window_start = now;
   m_rate_window_tick = m_serve_tick;
+  m_rate_window_cycles = cycles_now;
 }
 
 bool CEXIMeleeNetplay::FrameReady(u32 tick)
@@ -840,6 +888,8 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       m_burst_us_total += static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
                                                std::chrono::steady_clock::now() - m_burst_start)
                                                .count());
+      m_burst_cycles_total +=
+          static_cast<u64>(m_system.GetCoreTiming().GetTicks()) - m_burst_start_cycles;
       m_burst_count++;
       m_burst_active = false;
     }
@@ -856,6 +906,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       if (m_match_pacing == 1)
         SuspendThrottle(true);
       m_burst_start = std::chrono::steady_clock::now();
+      m_burst_start_cycles = static_cast<u64>(m_system.GetCoreTiming().GetTicks());
       m_burst_active = true;
       m_burst_depth_total += k;
       return (u32(POLL_REPLAY) << 24) | k;
@@ -968,8 +1019,10 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
           if (m_match_pacing == 1)
             SuspendThrottle(true);
           m_burst_start = std::chrono::steady_clock::now();
+          m_burst_start_cycles = static_cast<u64>(m_system.GetCoreTiming().GetTicks());
           m_burst_active = true;
           m_burst_depth_total += depth;
+          m_ticks_since_rollback = 0;
           m_rollback_count++;
           m_rollback_depth_max = std::max(m_rollback_depth_max, depth);
           m_rollback_needed = false;
@@ -1011,6 +1064,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       {
         RecordStall(0);  // peer's inputs were already here: zero stall
       }
+      NoteServeCycles();
       return u32(POLL_READY) << 24;
     }
     // Remote inputs late: predict instead of stalling, if allowed. Gates:
@@ -1031,6 +1085,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
         PredictIntoLocked(m_serve_tick);
         RecordStall(0);
         m_stall_active = false;
+        NoteServeCycles();
         return u32(POLL_READY) << 24;
       }
     }

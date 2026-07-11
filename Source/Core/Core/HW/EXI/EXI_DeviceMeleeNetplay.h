@@ -188,6 +188,7 @@ private:
   std::vector<u32> m_stall_samples_us;
   std::chrono::steady_clock::time_point m_rate_window_start{};
   u32 m_rate_window_tick = 0;
+  u64 m_rate_window_cycles = 0;  // CoreTiming cycles at window start
   void RecordStall(u32 micros);
   void ReportStalls();
 
@@ -246,6 +247,22 @@ private:
   u64 m_burst_count = 0;
   u64 m_burst_us_total = 0;
   u64 m_burst_depth_total = 0;
+  u64 m_burst_start_cycles = 0;
+  u64 m_burst_cycles_total = 0;  // emulated cycles consumed inside bursts
+  u64 m_prev_sleep_us = 0;       // per-rate-window deltas
+  u64 m_prev_burst_cycles = 0;
+  u64 m_prev_burst_us = 0;
+  // Per-serve emulated-cost histogram (POLL READY to POLL READY, in VI
+  // fields, rounded) with rollback proximity: in-match window-mode serves
+  // average ~1.8 fields while lockstep holds 1.00 -- the extra cost tracks
+  // the rollback rate (~6 fields per rollback) yet lands OUTSIDE the
+  // measured burst window. This splits post-rollback ticks from steady
+  // -state ticks.
+  u64 m_last_serve_cycles = 0;
+  u32 m_ticks_since_rollback = 1000;
+  u32 m_hist_fields[3] = {};      // serves costing 1 / 2 / >=3 fields
+  u32 m_hist_2plus_near_rb = 0;   // 2+-field serves within 6 ticks of a rollback
+  void NoteServeCycles();
   u64 m_restore_us_total = 0;  // R1 restore memcpy only
   u64 m_suspend_engaged = 0;   // times mode 1 actually flipped the throttle off
   void MaybeTorture();
