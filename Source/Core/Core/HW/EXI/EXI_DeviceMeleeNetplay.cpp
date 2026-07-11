@@ -1236,6 +1236,12 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       if (seq != m_last_delivery_seq)
       {
         m_last_delivery_seq = seq;
+        if (m_serve_tick >= m_payload_fence_until)
+        {
+          INFO_LOG_FMT(EXPANSIONINTERFACE,
+                       "MeleeNetplay: payload fence armed at tick {} (dvd deliveries {})",
+                       m_serve_tick, seq);
+        }
         m_payload_fence_until = m_serve_tick + PAYLOAD_FENCE_TICKS;
       }
     }
