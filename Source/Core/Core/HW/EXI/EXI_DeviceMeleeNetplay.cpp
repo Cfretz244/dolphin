@@ -1127,7 +1127,19 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
         // the ARAM design below + payload rewrite, since DVD copies land at
         // completion time, not issue time); DVDEpochUnchanged and the
         // refused_epoch stat stay wired for it.
-        if (parked_io_pending && m_rollback_io_defer_streak < 60)
+        // Pending non-DTK DVD reads hard-block the restore (generous cap):
+        // the first-wave target is fixed at park start, so a read the
+        // free-running game issued MID-park is invisible to it — and when
+        // the ARAM-churn escape valve forces the restore through, that
+        // read's payload lands AFTER the restore at an erased-timeline
+        // address (v20b round-2 q1: dvd.o executing=DummyCommandBlock
+        // frozen 64s, music stream dead from the fight-start load tail;
+        // every stream-death run shows refused_io at the cap). Reads drain
+        // in ms and are not free-running; 600 polls is a wedged-DVDThread
+        // backstop, not a working budget.
+        const bool dvd_reads_pending = dvdt.GetPendingNonDTKReadCount() != 0;
+        if ((parked_io_pending && m_rollback_io_defer_streak < 60) ||
+            (dvd_reads_pending && m_rollback_io_defer_streak < 600))
         {
           m_restore_refused_io++;
           m_rollback_io_defer_streak++;
