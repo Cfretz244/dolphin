@@ -236,6 +236,18 @@ private:
   int m_match_pacing = 1;
   bool m_throttle_suspended = false;
   void SuspendThrottle(bool on);
+  // Burst cost instrumentation: wall time from a REPLAY directive to the
+  // first post-replay POLL (= restore + all replayed tick bodies + their
+  // re-captures). pace1 arithmetic said ~120ms/burst ~= depth x 16.7ms,
+  // i.e. replayed ticks were still paying full throttle-paced frames --
+  // these counters replace that inference with a measurement.
+  std::chrono::steady_clock::time_point m_burst_start{};
+  bool m_burst_active = false;
+  u64 m_burst_count = 0;
+  u64 m_burst_us_total = 0;
+  u64 m_burst_depth_total = 0;
+  u64 m_restore_us_total = 0;  // R1 restore memcpy only
+  u64 m_suspend_engaged = 0;   // times mode 1 actually flipped the throttle off
   void MaybeTorture();
   // No emulator-level async I/O toward the game is pending (ARAM DMA, DVD
   // reads, DI command completions). Restore/rollback must not run otherwise:

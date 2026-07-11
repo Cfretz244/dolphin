@@ -539,6 +539,8 @@ void CEXIMeleeNetplay::SuspendThrottle(bool on)
   if (m_throttle_suspended == on)
     return;
   m_throttle_suspended = on;
+  if (on)
+    m_suspend_engaged++;
   Core::SetIsThrottlerTempDisabled(on);
 }
 
@@ -606,6 +608,19 @@ void CEXIMeleeNetplay::ReportStalls()
                  m_predicted_ticks, m_validated_ok, m_rollback_count, m_rollback_depth_max,
                  m_rollback_refused_scene, m_restore_refused_io, m_restore_refused_epoch,
                  m_checksums_skipped, m_serve_tick - m_confirmed_frontier);
+    // Where a replay burst's wall time goes (cumulative since boot). A burst
+    // spans REPLAY directive -> first post-replay POLL; depth_avg gives the
+    // replayed tick count that wall time bought.
+    if (m_burst_count != 0)
+    {
+      INFO_LOG_FMT(EXPANSIONINTERFACE,
+                   "MeleeNetplay: burst stats: bursts={} depth_avg={:.1f} burst_avg_ms={:.1f} "
+                   "restore_avg_us={} suspends={} pacing={}",
+                   m_burst_count, double(m_burst_depth_total) / double(m_burst_count),
+                   double(m_burst_us_total) / double(m_burst_count) / 1000.0,
+                   m_rollback_count != 0 ? m_restore_us_total / m_rollback_count : 0,
+                   m_suspend_engaged, m_match_pacing);
+    }
   }
 
   m_stall_samples_us.clear();
@@ -815,6 +830,14 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
     // exchanges) -- the first post-replay POLL is that boundary. Resume
     // wall-clock pacing on a fresh reference (the throttle re-anchored
     // itself continuously while suspended).
+    if (m_burst_active && m_replay_serving == 0 && m_pending_replay == 0)
+    {
+      m_burst_us_total += static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                               std::chrono::steady_clock::now() - m_burst_start)
+                                               .count());
+      m_burst_count++;
+      m_burst_active = false;
+    }
     if (m_throttle_suspended && m_match_pacing == 1 && m_replay_serving == 0 &&
         m_pending_replay == 0)
       SuspendThrottle(false);
@@ -827,6 +850,9 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       m_replay_serving = k;
       if (m_match_pacing == 1)
         SuspendThrottle(true);
+      m_burst_start = std::chrono::steady_clock::now();
+      m_burst_active = true;
+      m_burst_depth_total += k;
       return (u32(POLL_REPLAY) << 24) | k;
     }
     if (m_window != 0)
@@ -910,7 +936,15 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
           m_rollback_io_defer_streak = 0;
           m_confirmed_frontier++;  // treat the mismatched tick as confirmed-wrong
         }
-        else if (m_rollback.Restore(m_system, target))
+        else if ([&] {
+                   const auto t0 = std::chrono::steady_clock::now();
+                   const bool ok = m_rollback.Restore(m_system, target);
+                   m_restore_us_total += static_cast<u64>(
+                       std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - t0)
+                           .count());
+                   return ok;
+                 }())
         {
           // Ticks in the window whose real inputs are still missing get a
           // fresh prediction (newer information than the one they were first
@@ -928,6 +962,9 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
           m_replay_serving = depth;
           if (m_match_pacing == 1)
             SuspendThrottle(true);
+          m_burst_start = std::chrono::steady_clock::now();
+          m_burst_active = true;
+          m_burst_depth_total += depth;
           m_rollback_count++;
           m_rollback_depth_max = std::max(m_rollback_depth_max, depth);
           m_rollback_needed = false;
