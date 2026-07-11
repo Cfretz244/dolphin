@@ -712,15 +712,18 @@ void CEXIMeleeNetplay::EmitSnapshotChecksumsLocked()
   while (m_hash_tick + HASH_INTERVAL <= confirmed)
   {
     const u32 tick = m_hash_tick + HASH_INTERVAL;
-    m_hash_tick = tick;
     const auto parked = m_tick_hashes.find(tick);
     if (parked == m_tick_hashes.end())
     {
-      // Never hashed at capture (device attached mid-run or spans missing)
-      // — the interval goes honestly uncompared.
-      m_checksums_skipped++;
-      continue;
+      // Not captured YET: the frontier only needs ticks < T to pass T, so
+      // emission can run at tick T's own POLL/SEND — before the RECV that
+      // captures and hashes T. Wait for it (the very next RECV parks it and
+      // emission re-runs every poll); advancing past it here is what starved
+      // the oracle to 2-4 comparisons per run (targets 11c/12, and the
+      // ring-read predecessor had the same off-by-one in menus).
+      break;
     }
+    m_hash_tick = tick;
     const u32 crc = parked->second;
     u8 payload[4];
     WriteBE32(payload, crc);
