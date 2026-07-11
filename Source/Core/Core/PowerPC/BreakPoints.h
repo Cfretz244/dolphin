@@ -33,7 +33,10 @@ struct TBreakPoint
 // instead, and the owner (the netplay EXI device) dumps it on desync.
 struct MemCheckTraceRing
 {
-  static constexpr size_t CAPACITY = 1 << 18;
+  // 2M entries (32MB): the in-match particle flood is ~200 writes/tick and
+  // desync detection can lag a latent seed fork by 1300+ ticks (hunt8 run 2:
+  // fork 4913, detection 6240, a 256k ring's oldest entry was tick 4968).
+  static constexpr size_t CAPACITY = 1 << 21;
   struct Entry
   {
     u32 pc;     // 0 = tick marker: lr=replay depth, value=tick
