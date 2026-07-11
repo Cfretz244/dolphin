@@ -550,6 +550,44 @@ void CEXIMeleeNetplay::SuspendThrottle(bool on)
   m_system.GetCoreTiming().SetSpeedUnlimitedOverride(on);
 }
 
+void CEXIMeleeNetplay::UpdateSchedulePacing()
+{
+  if (!InRealMatch())
+  {
+    if (m_sched_valid)
+    {
+      m_sched_valid = false;
+      SuspendThrottle(false);
+    }
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (!m_sched_valid)
+  {
+    m_sched_valid = true;
+    m_sched_anchor_wall = now;
+    m_sched_anchor_tick = m_serve_tick;
+    SuspendThrottle(false);
+    return;
+  }
+  const double elapsed = std::chrono::duration<double>(now - m_sched_anchor_wall).count();
+  const double behind = m_sched_anchor_tick + elapsed * 60.0 - double(m_serve_tick);
+  // Cap the backlog at 2s so a long stall (transport hiccup, scene barrier)
+  // does not turn into a minutes-long unthrottled burst afterwards.
+  if (behind > 120.0)
+  {
+    m_sched_anchor_tick = m_serve_tick;
+    m_sched_anchor_wall = now - std::chrono::seconds(2);
+  }
+  // Hysteresis: suspend while >1 tick behind schedule, resume once caught up.
+  // On-schedule serving runs under the normal wall throttle (A/V pacing
+  // intact); the suspension only ever shortens the lag back to zero.
+  if (behind > 1.0)
+    SuspendThrottle(true);
+  else if (behind <= 0.0)
+    SuspendThrottle(false);
+}
+
 void CEXIMeleeNetplay::NoteServeCycles()
 {
   const u64 c = static_cast<u64>(m_system.GetCoreTiming().GetTicks());
@@ -915,7 +953,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       const u32 k = m_pending_replay;
       m_pending_replay = 0;
       m_replay_serving = k;
-      if (m_match_pacing == 1 || m_match_pacing == 3)
+      if (m_match_pacing == 1 || m_match_pacing >= 3)
         SuspendThrottle(true);
       m_burst_start = std::chrono::steady_clock::now();
       m_burst_start_cycles = static_cast<u64>(m_system.GetCoreTiming().GetTicks());
@@ -1028,7 +1066,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
                        m_serve_tick, target, depth);
           m_serve_tick = target;
           m_replay_serving = depth;
-          if (m_match_pacing == 1 || m_match_pacing == 3)
+          if (m_match_pacing == 1 || m_match_pacing >= 3)
             SuspendThrottle(true);
           m_burst_start = std::chrono::steady_clock::now();
           m_burst_start_cycles = static_cast<u64>(m_system.GetCoreTiming().GetTicks());
@@ -1059,7 +1097,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
         // depth 45, frontier deadlocked 24k ticks). Parking bounds depth at
         // ~W, keeps history alive, and the game spinning at POLL still
         // advances CoreTiming, so the in-flight transfer actually drains.
-        if (m_match_pacing == 3)
+        if (m_match_pacing >= 3)
           SuspendThrottle(true);
         Common::SleepCurrentThread(1);
         return u32(POLL_WAIT) << 24;
@@ -1080,6 +1118,8 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       }
       if (m_match_pacing == 3 && m_throttle_suspended)
         SuspendThrottle(false);
+      if (m_match_pacing == 4)
+        UpdateSchedulePacing();
       NoteServeCycles();
       return u32(POLL_READY) << 24;
     }
@@ -1103,6 +1143,8 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
         m_stall_active = false;
         if (m_match_pacing == 3 && m_throttle_suspended)
           SuspendThrottle(false);
+        if (m_match_pacing == 4)
+          UpdateSchedulePacing();
         NoteServeCycles();
         return u32(POLL_READY) << 24;
       }
@@ -1121,7 +1163,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
     // ticks/s. Suspending here re-anchors the reference continuously, so
     // spin-burned emulated time is forgiven and serves resume debt-free at
     // the next READY.
-    if (m_match_pacing == 3)
+    if (m_match_pacing >= 3)
       SuspendThrottle(true);
     // Be polite to the host CPU while the game spins on us.
     Common::SleepCurrentThread(1);

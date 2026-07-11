@@ -237,6 +237,16 @@ private:
   int m_match_pacing = 1;
   bool m_throttle_suspended = false;
   void SuspendThrottle(bool on);
+  // Mode 4: pace serving against the 60Hz tick SCHEDULE instead of the wall
+  // clock. Wall-anchored throttling makes the peers' rates interlock at
+  // whatever rate the match started with (each peer's window-edge park lasts
+  // until the OTHER sends more ticks -- any common rate is an equilibrium;
+  // pace10 sat at 28.5/s with parks fully debt-forgiven). Suspending while
+  // serving lags the schedule adds the missing restoring force toward 60.
+  std::chrono::steady_clock::time_point m_sched_anchor_wall{};
+  u32 m_sched_anchor_tick = 0;
+  bool m_sched_valid = false;
+  void UpdateSchedulePacing();
   // Burst cost instrumentation: wall time from a REPLAY directive to the
   // first post-replay POLL (= restore + all replayed tick bodies + their
   // re-captures). pace1 arithmetic said ~120ms/burst ~= depth x 16.7ms,

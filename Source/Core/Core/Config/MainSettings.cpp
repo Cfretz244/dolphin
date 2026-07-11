@@ -208,6 +208,12 @@ const Info<int> MAIN_MELEE_NETPLAY_WINDOW{{System::Main, "MeleeNetplay", "Window
 // pace9 attribution showed the per-rollback cost is the WAIT spin advancing
 // the emulated clock ~2.3x wall (6.6 fields per window-edge park) which the
 // throttle then bills back as a post-park freeze; mode 3 forgives it.
+// 4 = mode 3 plus SCHEDULE pacing: suspension whenever in-match serving lags
+// the 60Hz tick schedule (anchored at fight entry, backlog capped at 2s).
+// Debt forgiveness alone cannot break the peers' rate interlock (pace10:
+// 28.5 ticks/s with parks fully forgiven -- each peer's window-edge park
+// lasts until the OTHER sends more ticks, so any common rate is a stable
+// equilibrium); the schedule adds the restoring force toward 60.
 // Measured (pace2/pace6): bursts are CHEAP either way (~6ms wall, ~50 of the
 // ~1100 emulated fields per 600-tick window) -- the in-match rate is pinned
 // at ~30/s by NORMAL serves costing ~1.8 VI fields of emulated time each,
