@@ -200,6 +200,16 @@ const Info<int> MAIN_MELEE_NETPLAY_TORTURE_DEPTH{{System::Main, "MeleeNetplay", 
 // Max rollback window W (ticks the game may run ahead on predicted remote
 // inputs). 0 = pure lockstep. Host-imposed on the client via HELLO, like Delay.
 const Info<int> MAIN_MELEE_NETPLAY_WINDOW{{System::Main, "MeleeNetplay", "Window"}, 0};
+// Rollback pacing policy. The 100%-speed throttle counts replayed ticks as
+// emulated progress (CoreTiming is deliberately not rewound by a restore), so
+// every replay burst demands its span AGAIN in wall time -- under rollback
+// churn that capped confirmed ticks at ~35/s (target12c). 0 = legacy
+// (throttle always on). 1 = throttle suspended during a replay burst, from
+// restore until the last replayed RECV; normal serves stay wall-paced and the
+// throttle re-anchors itself while suspended, forgiving the burst's
+// emulated-time debt. 2 = throttle suspended for the whole match (diagnostic:
+// measures the machine's unthrottled ceiling; audio/VI pacing degrades).
+const Info<int> MAIN_MELEE_NETPLAY_MATCH_PACING{{System::Main, "MeleeNetplay", "MatchPacing"}, 1};
 // Diagnostic: arm a log-only write watchpoint on this address (u32) at device
 // init. Every PPC store there logs PC, value AND LR -- with the game's RNG
 // seed as the target, the log names every HSD_Rand caller in order, so the

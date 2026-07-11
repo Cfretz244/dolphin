@@ -227,6 +227,15 @@ private:
   // everywhere else.
   bool InRealMatch();
   bool m_in_match_gate = false;  // last InRealMatch() result, for edge logs
+  // Rollback pacing (MeleeNetplay.MatchPacing): suspend Dolphin's speed
+  // throttle while a replay burst executes so the replayed ticks' emulated
+  // cycles are not charged against the wall-clock budget (they capped
+  // confirmed ticks at ~35/s in target12c). While suspended the throttle
+  // continuously re-anchors its reference, so re-enabling never demands
+  // catch-up. Mode 2 suspends for the whole match (diagnostic ceiling).
+  int m_match_pacing = 1;
+  bool m_throttle_suspended = false;
+  void SuspendThrottle(bool on);
   void MaybeTorture();
   // No emulator-level async I/O toward the game is pending (ARAM DMA, DVD
   // reads, DI command completions). Restore/rollback must not run otherwise:

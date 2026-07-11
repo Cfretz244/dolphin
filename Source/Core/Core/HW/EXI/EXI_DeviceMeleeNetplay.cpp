@@ -109,6 +109,7 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
     m_window = static_cast<u32>(std::clamp(Config::Get(Config::MAIN_MELEE_NETPLAY_WINDOW), 0,
                                            int(MeleeRollbackState::RING_SIZE) / 2));
   }
+  m_match_pacing = Config::Get(Config::MAIN_MELEE_NETPLAY_MATCH_PACING);
 
   const std::string region_table = Config::Get(Config::MAIN_MELEE_NETPLAY_REGION_TABLE);
   if (!region_table.empty())
@@ -141,6 +142,7 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
 
 CEXIMeleeNetplay::~CEXIMeleeNetplay()
 {
+  SuspendThrottle(false);
   m_running.Clear();
   m_sendq_cv.notify_all();
   m_socket.disconnect();
@@ -532,6 +534,14 @@ void CEXIMeleeNetplay::SendInputs(u32 tick, const u8* pads)
   SendMessageRaw(MSG_INPUTS, m_local_mask, tick, payload, len);
 }
 
+void CEXIMeleeNetplay::SuspendThrottle(bool on)
+{
+  if (m_throttle_suspended == on)
+    return;
+  m_throttle_suspended = on;
+  Core::SetIsThrottlerTempDisabled(on);
+}
+
 void CEXIMeleeNetplay::RecordStall(u32 micros)
 {
   m_stall_samples_us.push_back(micros);
@@ -800,6 +810,14 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
     return DEVICE_ID;
   case CMD_POLL:
   {
+    // A replay burst is only fully paid for once the LAST replayed tick's
+    // body has executed (the replay loop is RECV+inject+run with no
+    // exchanges) -- the first post-replay POLL is that boundary. Resume
+    // wall-clock pacing on a fresh reference (the throttle re-anchored
+    // itself continuously while suspended).
+    if (m_throttle_suspended && m_match_pacing == 1 && m_replay_serving == 0 &&
+        m_pending_replay == 0)
+      SuspendThrottle(false);
     // Replay directive outranks readiness: memory has already been restored,
     // so the game must consume the replayed ticks before anything else.
     if (m_pending_replay != 0)
@@ -807,6 +825,8 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
       const u32 k = m_pending_replay;
       m_pending_replay = 0;
       m_replay_serving = k;
+      if (m_match_pacing == 1)
+        SuspendThrottle(true);
       return (u32(POLL_REPLAY) << 24) | k;
     }
     if (m_window != 0)
@@ -906,6 +926,8 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
                        m_serve_tick, target, depth);
           m_serve_tick = target;
           m_replay_serving = depth;
+          if (m_match_pacing == 1)
+            SuspendThrottle(true);
           m_rollback_count++;
           m_rollback_depth_max = std::max(m_rollback_depth_max, depth);
           m_rollback_needed = false;
@@ -1171,6 +1193,8 @@ bool CEXIMeleeNetplay::InRealMatch()
   if (in_match != m_in_match_gate)
   {
     m_in_match_gate = in_match;
+    if (m_match_pacing == 2)
+      SuspendThrottle(in_match);
     INFO_LOG_FMT(EXPANSIONINTERFACE,
                  "MeleeNetplay: prediction gate {} (routing={:08x} tick={})",
                  in_match ? "OPEN (real match)" : "closed", routing, m_serve_tick);
