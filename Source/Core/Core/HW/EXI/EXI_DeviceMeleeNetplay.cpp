@@ -1082,30 +1082,20 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
         // predates the input-clobber fix -- this cap doubles as the
         // experiment: if desyncs stay gone with ~0.5s parks, the io hazard
         // was misattributed and the parks are a politeness, not a shield.
-        // DVD epoch gate: any non-DTK DVD completion delivered since the
-        // target's capture makes the restore a livelock trap -- the restored
-        // dvd.o state machine re-issues a command the emulator considers
-        // done, forever (v15 requal run 4: cbForStateBusy spin with the DI
-        // counters still climbing ~7/s). Refusal is FREE where it matters:
-        // fights issue ZERO non-DTK DVD traffic (v15q run 5 in-fight
-        // profile; the churn is all menu/load era), so this fires only on
-        // loading tails right at fight entry. The full-sum epoch gate the
-        // torture path keeps is still wrong here: ARAM completes 15-18/s
-        // in-fight and would refuse most rollbacks (smoke #4 refusal
-        // storm); the ARAM flavor is handled by interrupt RE-DELIVERY after
-        // the restore instead (see below).
-        if (m_rollback.IsLoaded() && !m_rollback.DVDEpochUnchanged(m_system, target))
-        {
-          ERROR_LOG_FMT(
-              EXPANSIONINTERFACE,
-              "MeleeNetplay: ROLLBACK REFUSED at tick {} depth {} (dvd completion in window)",
-              m_serve_tick, depth);
-          m_restore_refused_epoch++;
-          m_rollback_needed = false;
-          m_rollback_io_defer_streak = 0;
-          m_confirmed_frontier++;  // treat the mismatched tick as confirmed-wrong
-        }
-        else if (parked_io_pending && m_rollback_io_defer_streak < 60)
+        // NOTE no DVD epoch gate here. It was tried (554e1d1bab) as a
+        // refuse-restore on any non-DTK DVD completion since the target's
+        // capture, to kill the dvd.o cbForStateBusy livelock wedge (v15
+        // requal run 4) -- and immediately desynced (wedgefix run 1,
+        // refused_epoch=70+ per peer): the "fights issue zero non-DTK DVD
+        // traffic" premise from the v15q run 5 profile is STAGE-DEPENDENT
+        // (music streams from disc in chunks on most stages, ~1 read/100
+        // ticks), and every refusal is an accepted wrong-input divergence.
+        // A refusal storm is strictly worse than the rare wedge it
+        // prevents. The durable fix is DVD completion RE-DELIVERY (mirror
+        // the ARAM design below + payload rewrite, since DVD copies land at
+        // completion time, not issue time); DVDEpochUnchanged and the
+        // refused_epoch stat stay wired for it.
+        if (parked_io_pending && m_rollback_io_defer_streak < 60)
         {
           m_restore_refused_io++;
           m_rollback_io_defer_streak++;

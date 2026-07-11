@@ -268,7 +268,15 @@ void DVDThread::FinishRead(u64 id, s64 cycles_late)
   // We have now obtained the right ReadResult.
 
   if (m_pending_non_dtk_reads.erase(id) != 0)
+  {
     m_non_dtk_reads_completed++;
+    // Survey line for the Melee-netplay DVD re-delivery design: names where
+    // each non-DTK payload lands (restored-region reads are the rollback
+    // amnesia hazard; see EXI_DeviceMeleeNetplay's rollback path NOTE).
+    INFO_LOG_FMT(DVDINTERFACE, "non-DTK read done: offset={:#x} out={:#x} len={:#x} to_ram={}",
+                 result.first.dvd_offset, result.first.output_address, result.first.length,
+                 result.first.copy_to_ram);
+  }
 
   const ReadRequest& request = result.first;
   const std::vector<u8>& buffer = result.second;
