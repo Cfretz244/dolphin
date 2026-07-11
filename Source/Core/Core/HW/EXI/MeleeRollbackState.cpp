@@ -56,13 +56,14 @@ MeleeRollbackState::~MeleeRollbackState()
     s_active_rollback_state = nullptr;
 }
 
-void MeleeRollbackState::NotifyPayloadWrite(Core::System& system, u32 addr, u32 len)
+void MeleeRollbackState::NotifyPayloadWrite(Core::System& system, u32 addr, u32 len,
+                                            bool from_dvd)
 {
   if (s_active_rollback_state != nullptr)
-    s_active_rollback_state->NotePayloadWrite(system, addr, len);
+    s_active_rollback_state->NotePayloadWrite(system, addr, len, from_dvd);
 }
 
-void MeleeRollbackState::NotePayloadWrite(Core::System& system, u32 addr, u32 len)
+void MeleeRollbackState::NotePayloadWrite(Core::System& system, u32 addr, u32 len, bool from_dvd)
 {
   if (m_regions.empty() || !m_heap_resolved || len == 0)
     return;
@@ -87,6 +88,8 @@ void MeleeRollbackState::NotePayloadWrite(Core::System& system, u32 addr, u32 le
     memory.CopyFromEmu(d.bytes.data(), lo, hi - lo);
     m_delivery_bytes += d.bytes.size();
     m_deliveries.push_back(std::move(d));
+    if (from_dvd)
+      m_dvd_delivery_seq++;
   }
   while (m_delivery_bytes > DELIVERY_BYTES_CAP && !m_deliveries.empty())
   {

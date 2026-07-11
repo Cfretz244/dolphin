@@ -522,8 +522,8 @@ void DSPManager::Do_ARAM_DMA()
         m_aram_dma.Cnt.count -= 8;
       }
     }
-    ExpansionInterface::MeleeRollbackState::NotifyPayloadWrite(m_system, dma_mram_start,
-                                                               dma_total);
+    ExpansionInterface::MeleeRollbackState::NotifyPayloadWrite(m_system, dma_mram_start, dma_total,
+                                                               /*from_dvd=*/false);
   }
   else
   {

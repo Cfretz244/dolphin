@@ -314,7 +314,7 @@ void DVDThread::FinishRead(u64 id, s64 cycles_late)
       if (non_dtk)
       {
         ExpansionInterface::MeleeRollbackState::NotifyPayloadWrite(
-            m_system, request.output_address, request.length);
+            m_system, request.output_address, request.length, /*from_dvd=*/true);
       }
     }
 

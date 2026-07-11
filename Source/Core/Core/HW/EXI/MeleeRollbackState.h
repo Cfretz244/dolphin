@@ -137,14 +137,17 @@ public:
   // Delivery sites (CPU thread, same as Capture/Restore — no locking):
   // DVDThread::FinishRead (non-DTK, copy_to_ram) and DSPManager::
   // Do_ARAM_DMA (ARAM->MRAM direction) call NotifyPayloadWrite.
-  static void NotifyPayloadWrite(Core::System& system, u32 addr, u32 len);
+  static void NotifyPayloadWrite(Core::System& system, u32 addr, u32 len, bool from_dvd);
   u64 RedeliveredSpans() const { return m_redelivered; }
   u64 RedeliveryGaps() const { return m_redelivery_gaps; }
-  // Monotonic count of journaled restored-region delivery spans. The device
-  // polls this to arm the payload fence (prediction quiesce): a delivery
-  // into restored memory means async traffic is landing where a rollback
-  // would orphan it — serve confirmed-only until the traffic stops.
-  u64 DeliverySeq() const { return m_delivery_seq; }
+  // Monotonic count of journaled restored-region DVD delivery spans. The
+  // device polls this to arm the payload fence (prediction quiesce): a DVD
+  // payload landing in restored memory is scene-preload traffic, whose heap
+  // completion flags a rollback would orphan. ARAM deliveries are journaled
+  // for payload rewrite but do NOT arm the fence — fighter animation streams
+  // ARAM->MRAM constantly in fights (v17c q1: fence never released,
+  // predicted=0 for the whole match) and is empirically rollback-safe.
+  u64 DVDDeliverySeq() const { return m_dvd_delivery_seq; }
 
   // Cross-peer divergence forensics: dump the LIVE region set (with a small
   // header naming each region's bounds) to a file. Both peers dump at the
@@ -213,7 +216,7 @@ private:
   bool m_heap_resolved = false;
   size_t m_snapshot_bytes = 0;
 
-  void NotePayloadWrite(Core::System& system, u32 addr, u32 len);
+  void NotePayloadWrite(Core::System& system, u32 addr, u32 len, bool from_dvd);
 
   std::array<Slot, RING_SIZE> m_ring;
   u64 m_total_captures = 0;
@@ -224,6 +227,7 @@ private:
   static constexpr size_t DELIVERY_BYTES_CAP = 16 * 1024 * 1024;
   std::deque<Delivery> m_deliveries;
   u64 m_delivery_seq = 0;
+  u64 m_dvd_delivery_seq = 0;
   size_t m_delivery_bytes = 0;
   u64 m_redelivered = 0;
   u64 m_redelivery_gaps = 0;

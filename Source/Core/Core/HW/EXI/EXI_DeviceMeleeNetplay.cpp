@@ -1221,7 +1221,7 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
     // excluded, so those deliveries are not journaled).
     if (m_window != 0 && m_rollback.IsLoaded())
     {
-      const u64 seq = m_rollback.DeliverySeq();
+      const u64 seq = m_rollback.DVDDeliverySeq();
       if (seq != m_last_delivery_seq)
       {
         m_last_delivery_seq = seq;
