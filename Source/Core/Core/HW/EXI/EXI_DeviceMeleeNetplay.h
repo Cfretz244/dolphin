@@ -335,6 +335,8 @@ private:
   // up, no unconfirmed tick may remain behind it, or a mispredict rollback
   // can erase the game's scene-exit request after the stamp is on the wire.
   u64 m_barrier_drain_polls = 0;
+  // Stall-diagnostic watch addresses (Dolphin.MeleeNetplay.DiagWatch).
+  std::vector<u32> m_diag_watches;
   // Payload fence (see CMD_POLL): prediction quiesced while async payloads
   // are landing in restored memory (scene preloads); renewed per journaled
   // delivery, expires this many ticks after the last one.

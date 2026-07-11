@@ -238,6 +238,12 @@ const Info<u32> MAIN_MELEE_NETPLAY_TRACE_SEED_WRITES{
 // hundreds per frame and per-hit log I/O crawls the game below 1 tick/s.
 const Info<bool> MAIN_MELEE_NETPLAY_TRACE_SEED_QUIET{
     {System::Main, "MeleeNetplay", "TraceSeedQuiet"}, false};
+// Comma-separated hex emulated addresses whose live u32 values the stall
+// diagnostic appends to its NOTICE lines -- name the flag a wedged game is
+// spinning on without a new build (addresses come from the current DOL's
+// linker map). Empty = off.
+const Info<std::string> MAIN_MELEE_NETPLAY_DIAG_WATCH{
+    {System::Main, "MeleeNetplay", "DiagWatch"}, ""};
 
 const Info<SerialInterface::SIDevices>& GetInfoForSIDevice(int channel)
 {

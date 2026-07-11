@@ -87,6 +87,19 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
   m_local_mask = ports_cfg != 0 ? static_cast<u8>(ports_cfg) : (m_is_host ? 0x01 : 0x02);
 
   m_trace_seed_addr = Config::Get(Config::MAIN_MELEE_NETPLAY_TRACE_SEED_WRITES);
+  {
+    // Stall-diagnostic watch addresses (comma-separated hex, from the DOL's
+    // linker map): their live u32 values ride every stall NOTICE line.
+    const std::string watch_cfg = Config::Get(Config::MAIN_MELEE_NETPLAY_DIAG_WATCH);
+    std::stringstream ws(watch_cfg);
+    std::string tok;
+    while (std::getline(ws, tok, ','))
+    {
+      const u32 a = static_cast<u32>(std::strtoul(tok.c_str(), nullptr, 16));
+      if (a >= 0x80000000 && a < 0x81800000)
+        m_diag_watches.push_back(a);
+    }
+  }
   if (m_trace_seed_addr != 0 && Config::Get(Config::MAIN_MELEE_NETPLAY_TRACE_SEED_QUIET))
   {
     // Quiet tracing: per-hit NOTICE lines crawl the game below 1 tick/s once
@@ -227,11 +240,17 @@ void CEXIMeleeNetplay::DiagThread()
     if (now - last < 2'000'000)
       continue;
     const auto& ppc = m_system.GetPPCState();
+    std::string watches;
+    for (const u32 a : m_diag_watches)
+    {
+      // Racy cross-thread read of emulated RAM -- fine for a diagnostic.
+      watches += fmt::format(" w{:08x}={:08x}", a, m_system.GetMemory().Read_U32(a));
+    }
     NOTICE_LOG_FMT(EXPANSIONINTERFACE,
                    "MeleeNetplay: exchange stalled {} ms: serve_tick={} pc={:08x} lr={:08x} "
-                   "pending_replay={} replay_serving={} rollback_needed={}",
+                   "pending_replay={} replay_serving={} rollback_needed={}{}",
                    (now - last) / 1000, m_serve_tick, ppc.pc, LR(ppc), m_pending_replay,
-                   m_replay_serving, m_rollback_needed);
+                   m_replay_serving, m_rollback_needed, watches);
   }
 }
 
