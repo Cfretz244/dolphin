@@ -135,17 +135,62 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
 
   m_running.Set();
   m_net_thread = std::thread(&CEXIMeleeNetplay::NetThread, this);
+  m_send_thread = std::thread(&CEXIMeleeNetplay::SendThread, this);
   m_diag_thread = std::thread(&CEXIMeleeNetplay::DiagThread, this);
 }
 
 CEXIMeleeNetplay::~CEXIMeleeNetplay()
 {
   m_running.Clear();
+  m_sendq_cv.notify_all();
   m_socket.disconnect();
   if (m_net_thread.joinable())
     m_net_thread.join();
+  if (m_send_thread.joinable())
+    m_send_thread.join();
   if (m_diag_thread.joinable())
     m_diag_thread.join();
+}
+
+// See the header: blocking sends for lock-held producers, serialized with
+// direct sends via m_send_lock inside SendMessageRaw.
+void CEXIMeleeNetplay::SendThread()
+{
+  Common::SetCurrentThreadName("MeleeNetplaySend");
+  while (m_running.IsSet())
+  {
+    std::vector<u8> msg;
+    {
+      std::unique_lock lk(m_sendq_lock);
+      m_sendq_cv.wait(lk, [this] { return !m_sendq.empty() || !m_running.IsSet(); });
+      if (!m_running.IsSet())
+        return;
+      msg = std::move(m_sendq.front());
+      m_sendq.pop_front();
+    }
+    std::lock_guard lk(m_send_lock);
+    m_socket.setBlocking(true);
+    if (!SendAll(m_socket, msg.data(), static_cast<u32>(msg.size())))
+      ERROR_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: queued send failed");
+    m_socket.setBlocking(false);
+  }
+}
+
+void CEXIMeleeNetplay::EnqueueMessage(u8 type, u8 mask, u32 tick, const u8* payload, u16 len)
+{
+  std::vector<u8> buf(8u + len);
+  buf[0] = type;
+  buf[1] = mask;
+  buf[2] = u8(len >> 8);
+  buf[3] = u8(len);
+  WriteBE32(&buf[4], tick);
+  if (len != 0)
+    std::memcpy(&buf[8], payload, len);
+  {
+    std::lock_guard lk(m_sendq_lock);
+    m_sendq.push_back(std::move(buf));
+  }
+  m_sendq_cv.notify_one();
 }
 
 void CEXIMeleeNetplay::DiagThread()
@@ -678,7 +723,7 @@ void CEXIMeleeNetplay::EmitSnapshotChecksumsLocked()
     }
     u8 payload[4];
     WriteBE32(payload, crc);
-    SendMessageRaw(MSG_CHECKSUM, 0, tick, payload, 4);
+    EnqueueMessage(MSG_CHECKSUM, 0, tick, payload, 4);
     m_local_crcs[tick] = crc;
     const auto remote = m_remote_crcs.find(tick);
     if (remote != m_remote_crcs.end())
@@ -1035,7 +1080,7 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
       {
         u8 payload[4];
         WriteBE32(payload, crc);
-        SendMessageRaw(MSG_CHECKSUM, 0, tick, payload, 4);
+        EnqueueMessage(MSG_CHECKSUM, 0, tick, payload, 4);
         std::lock_guard lk(m_frames_lock);
         m_local_crcs[tick] = crc;
         const auto remote = m_remote_crcs.find(tick);

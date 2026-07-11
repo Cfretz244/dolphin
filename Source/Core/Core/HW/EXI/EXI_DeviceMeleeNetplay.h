@@ -13,7 +13,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <random>
@@ -131,6 +133,19 @@ private:
   std::mutex m_send_lock;
   std::thread m_net_thread;
   Common::Flag m_running;
+  // Deferred sends for messages produced UNDER m_frames_lock (checksums).
+  // A blocking send while holding that lock deadlocks distributed-ly: the
+  // peer's net thread needs its m_frames_lock to process our message, so it
+  // stops draining its socket, our send never completes, and both peers park
+  // symmetrically (target9 wedge: CPU thread sampled inside the EXI CR MMIO
+  // write for 54 minutes). The sender thread does the blocking sends; no
+  // thread ever blocks on the network while holding m_frames_lock.
+  std::thread m_send_thread;
+  std::mutex m_sendq_lock;
+  std::condition_variable m_sendq_cv;
+  std::deque<std::vector<u8>> m_sendq;
+  void SendThread();
+  void EnqueueMessage(u8 type, u8 mask, u32 tick, const u8* payload, u16 len);
 
   // --- wedge diagnostics: logs the emulated PC/LR while the exchange is
   // stalled. The disc5/disc9 wedge signature is the game running frames at
