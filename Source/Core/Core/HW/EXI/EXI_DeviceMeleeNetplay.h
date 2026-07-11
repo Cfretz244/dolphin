@@ -327,6 +327,11 @@ private:
   // owned port's block). While armed, prediction is suppressed so no
   // speculative window can span a barrier release (see the predict gate).
   bool m_barrier_armed = false;
+  // Polls parked draining outstanding speculation behind an armed barrier
+  // stamp (see the barrier drain block in CMD_POLL): once a barrier flag is
+  // up, no unconfirmed tick may remain behind it, or a mispredict rollback
+  // can erase the game's scene-exit request after the stamp is on the wire.
+  u64 m_barrier_drain_polls = 0;
   // stats (CPU thread only)
   u64 m_predicted_ticks = 0;
   u64 m_validated_ok = 0;

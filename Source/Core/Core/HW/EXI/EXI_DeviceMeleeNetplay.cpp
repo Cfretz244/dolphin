@@ -740,10 +740,11 @@ void CEXIMeleeNetplay::ReportStalls()
     INFO_LOG_FMT(EXPANSIONINTERFACE,
                  "MeleeNetplay: rollback stats: predicted={} validated_ok={} rollbacks={} "
                  "max_depth={} refused_scene={} refused_io={} refused_epoch={} "
-                 "aram_redelivered={} checksums_skipped={} frontier_lag={}",
+                 "aram_redelivered={} checksums_skipped={} frontier_lag={} barrier_drain={}",
                  m_predicted_ticks, m_validated_ok, m_rollback_count, m_rollback_depth_max,
                  m_rollback_refused_scene, m_restore_refused_io, m_restore_refused_epoch,
-                 m_aram_redelivered, m_checksums_skipped, m_serve_tick - m_confirmed_frontier);
+                 m_aram_redelivered, m_checksums_skipped, m_serve_tick - m_confirmed_frontier,
+                 m_barrier_drain_polls);
     // Where a replay burst's wall time goes (cumulative since boot). A burst
     // spans REPLAY directive -> first post-replay POLL; depth_avg gives the
     // replayed tick count that wall time bought.
@@ -1188,6 +1189,32 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
         // depth 45, frontier deadlocked 24k ticks). Parking bounds depth at
         // ~W, keeps history alive, and the game spinning at POLL still
         // advances CoreTiming, so the in-flight transfer actually drains.
+        if (m_match_pacing >= 3)
+          SuspendThrottle(true);
+        Common::SleepCurrentThread(1);
+        return u32(POLL_WAIT) << 24;
+      }
+    }
+    // Barrier speculation drain. Suppressing NEW predictions from the stamp
+    // on (the !m_barrier_armed gate below) is not enough: up to W ticks of
+    // OUTSTANDING speculation can still be pending behind the stamp, and a
+    // mispredict rollback across the tick that set the game's scene-exit
+    // request (unk_C, restored gm state) erases the request AFTER the ready
+    // stamp went out on the wire irrevocably. The remote then releases at
+    // the stamped tick and exits; the rolled-back peer's outer loop cannot
+    // (nw_SceneBarrier lives outside the replayed tick body) — one peer
+    // leaves the scene, the other re-runs it → permanent split (v16q1:
+    // host exited at 13067, client re-set unk_C at 13069; every "match-end
+    // wedge" back to pace11 run 2 is this). Park serving until the frontier
+    // confirms everything behind the stamp: no unconfirmed tick may remain
+    // once a barrier flag is up. Cost: one latency-floor stall per barrier
+    // arming, at a scene transition where it is imperceptible.
+    if (m_barrier_armed && m_window != 0)
+    {
+      std::lock_guard lk(m_frames_lock);
+      if (m_confirmed_frontier < m_serve_tick)
+      {
+        m_barrier_drain_polls++;
         if (m_match_pacing >= 3)
           SuspendThrottle(true);
         Common::SleepCurrentThread(1);
