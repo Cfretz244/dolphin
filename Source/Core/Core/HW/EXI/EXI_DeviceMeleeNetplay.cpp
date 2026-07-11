@@ -713,14 +713,15 @@ void CEXIMeleeNetplay::EmitSnapshotChecksumsLocked()
   {
     const u32 tick = m_hash_tick + HASH_INTERVAL;
     m_hash_tick = tick;
-    u32 crc = 0;
-    if (!m_rollback.SnapshotChecksum(tick, &crc))
+    const auto parked = m_tick_hashes.find(tick);
+    if (parked == m_tick_hashes.end())
     {
-      // Slot already recycled (frontier stalled longer than the ring is
-      // deep) — the interval goes honestly uncompared.
+      // Never hashed at capture (device attached mid-run or spans missing)
+      // — the interval goes honestly uncompared.
       m_checksums_skipped++;
       continue;
     }
+    const u32 crc = parked->second;
     u8 payload[4];
     WriteBE32(payload, crc);
     EnqueueMessage(MSG_CHECKSUM, 0, tick, payload, 4);
@@ -729,6 +730,19 @@ void CEXIMeleeNetplay::EmitSnapshotChecksumsLocked()
     if (remote != m_remote_crcs.end())
       CompareChecksumLocked(tick, crc, remote->second);
   }
+  m_tick_hashes.erase(m_tick_hashes.begin(), m_tick_hashes.upper_bound(m_hash_tick));
+}
+
+// Hash ring[tick] the moment it is captured (see m_tick_hashes). Runs on the
+// CPU thread right after Capture; replayed re-captures overwrite the parked
+// value with the corrected pass's hash.
+void CEXIMeleeNetplay::HashCapturedTick(u32 tick)
+{
+  if (tick == 0 || tick % HASH_INTERVAL != 0 || !m_rollback.HasHashSpans())
+    return;
+  u32 crc = 0;
+  if (m_rollback.SnapshotChecksum(tick, &crc))
+    m_tick_hashes[tick] = crc;
 }
 
 // Fill tick's remote half with the newest confirmed remote inputs
@@ -1009,7 +1023,10 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
         // nothing but polls between SEND and RECV) and covers normal,
         // replayed, and post-replay-origin serves uniformly.
         if (m_window == 0)
+        {
           m_rollback.Capture(m_system, m_serve_tick);
+          HashCapturedTick(m_serve_tick);
+        }
         if (m_rollback.TotalCaptures() % 600 == 0)
         {
           INFO_LOG_FMT(EXPANSIONINTERFACE,
@@ -1317,11 +1334,17 @@ void CEXIMeleeNetplay::DMARead(u32 address, u32 size)
     // between SEND and RECV).
     const u32 replay_tag = m_replay_serving;
     if (m_window != 0 && m_rollback.IsLoaded())
+    {
       m_rollback.Capture(m_system, m_serve_tick);
+      HashCapturedTick(m_serve_tick);
+    }
     if (m_replay_serving != 0)
     {
       if (m_window == 0 && m_rollback.IsLoaded())
+      {
         m_rollback.Capture(m_system, m_serve_tick);
+        HashCapturedTick(m_serve_tick);
+      }
       m_replay_serving--;
     }
     u8 pads[320] = {};

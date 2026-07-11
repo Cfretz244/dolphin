@@ -125,6 +125,16 @@ private:
   // run 3). m_hash_tick = last hash tick emitted (or skipped).
   static constexpr u32 HASH_INTERVAL = 60;
   u32 m_hash_tick = 0;
+  // Hash ticks are hashed AT CAPTURE (ring[tick] is fresh then) and parked
+  // here until the frontier confirms them. Hashing at emission from the ring
+  // starved the oracle under rollback churn: with a rollback every ~2 ticks
+  // the 16-slot ring recycles a hash tick before the frontier passes it, and
+  // the two peers skip DIFFERENT ticks so pairs almost never complete
+  // (target11c: 2 comparisons out of ~120 in-match intervals). Replayed
+  // RECVs re-capture and re-hash their ticks, so a parked value is corrected
+  // by the same mechanism that corrects the ring. CPU thread only.
+  std::map<u32, u32> m_tick_hashes;
+  void HashCapturedTick(u32 tick);
   void EmitSnapshotChecksumsLocked();
   void CompareChecksumLocked(u32 tick, u32 local_crc, u32 remote_crc);
 
