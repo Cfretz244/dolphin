@@ -885,13 +885,25 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
     // itself continuously while suspended).
     if (m_burst_active && m_replay_serving == 0 && m_pending_replay == 0)
     {
+      const u64 burst_end_cycles = static_cast<u64>(m_system.GetCoreTiming().GetTicks());
       m_burst_us_total += static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
                                                std::chrono::steady_clock::now() - m_burst_start)
                                                .count());
-      m_burst_cycles_total +=
-          static_cast<u64>(m_system.GetCoreTiming().GetTicks()) - m_burst_start_cycles;
+      m_burst_cycles_total += burst_end_cycles - m_burst_start_cycles;
       m_burst_count++;
       m_burst_active = false;
+      // Segment attribution for the ~7-field emulated cost each rollback
+      // carries (pace8 histogram): pre = last normal serve -> REPLAY
+      // directive, mid = the replay burst itself. The post-burst origin
+      // serve's NoteServeCycles delta = pre + mid + post.
+      const double fc = double(m_system.GetSystemTimers().GetTicksPerSecond()) / 60.0;
+      INFO_LOG_FMT(EXPANSIONINTERFACE,
+                   "MeleeNetplay: burst detail tick={}: pre={:.2f} mid={:.2f} fields",
+                   m_serve_tick,
+                   m_last_serve_cycles != 0 ?
+                       double(m_burst_start_cycles - m_last_serve_cycles) / fc :
+                       0.0,
+                   double(burst_end_cycles - m_burst_start_cycles) / fc);
     }
     if (m_throttle_suspended && m_match_pacing == 1 && m_replay_serving == 0 &&
         m_pending_replay == 0)
