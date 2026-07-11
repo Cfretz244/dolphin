@@ -173,6 +173,16 @@ public:
   // Throttle the CPU to the specified target cycle.
   void Throttle(const s64 target_cycle);
 
+  // Force IsSpeedUnlimited() true regardless of config or the hotkey flag.
+  // Owned by engine-level consumers (Melee rollback replay bursts) -- the
+  // Core::SetIsThrottlerTempDisabled flag can NOT serve them because
+  // DolphinQt's HotkeyScheduler rewrites it from the hotkey state every
+  // scheduler pass, silently undoing any programmatic set within ms.
+  void SetSpeedUnlimitedOverride(bool on)
+  {
+    m_speed_unlimited_override.store(on, std::memory_order_relaxed);
+  }
+
   // May be used from CPU or GPU thread.
   void SleepUntil(TimePoint time_point);
 
@@ -251,6 +261,8 @@ private:
   // Used to optionally minimize throttling for improving input latency.
   std::atomic_bool m_throttled_after_presentation = false;
   DT m_max_throttle_skip_time{};
+
+  std::atomic_bool m_speed_unlimited_override = false;
 };
 
 }  // namespace CoreTiming

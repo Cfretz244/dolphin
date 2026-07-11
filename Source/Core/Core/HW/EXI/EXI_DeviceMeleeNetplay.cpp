@@ -17,6 +17,7 @@
 #include "Common/Thread.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
+#include "Core/CoreTiming.h"
 #include "Core/HW/DSP.h"
 #include "Core/HW/DVD/DVDInterface.h"
 #include "Core/HW/DVD/DVDThread.h"
@@ -541,7 +542,11 @@ void CEXIMeleeNetplay::SuspendThrottle(bool on)
   m_throttle_suspended = on;
   if (on)
     m_suspend_engaged++;
-  Core::SetIsThrottlerTempDisabled(on);
+  // NOT Core::SetIsThrottlerTempDisabled: DolphinQt's HotkeyScheduler
+  // rewrites that flag from the hotkey state every pass, so a programmatic
+  // set is stomped back to false within milliseconds (pace1/pace2: suspends
+  // engaged yet 66% of CPU-thread samples still slept in Throttle).
+  m_system.GetCoreTiming().SetSpeedUnlimitedOverride(on);
 }
 
 void CEXIMeleeNetplay::RecordStall(u32 micros)

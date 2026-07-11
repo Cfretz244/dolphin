@@ -410,7 +410,9 @@ TimePoint CoreTimingManager::CalculateTargetHostTimeInternal(s64 target_cycle)
 
 bool CoreTimingManager::IsSpeedUnlimited() const
 {
-  return m_throttle_adj_clock_per_sec == 0 || Core::GetIsThrottlerTempDisabled();
+  return m_throttle_adj_clock_per_sec == 0 ||
+         m_speed_unlimited_override.load(std::memory_order_relaxed) ||
+         Core::GetIsThrottlerTempDisabled();
 }
 
 TimePoint CoreTimingManager::GetTargetHostTime(s64 target_cycle)
