@@ -73,6 +73,18 @@ public:
   // for `tick` was captured — i.e. restoring to it cannot swallow one.
   bool IOEpochUnchanged(Core::System& system, u32 tick) const;
 
+  // DVD classes only (DVDThread non-DTK reads + DI non-DTK commands). A DVD
+  // completion delivered after `tick`'s capture makes restoring that slot
+  // unsafe: the restored dvd.o driver state machine livelocks re-issuing a
+  // command the emulator considers done (v15 requal run 4, cbForStateBusy).
+  // Fights issue ZERO non-DTK DVD traffic (v15q run 5 profile), so gating
+  // rollback on this is free where it matters.
+  bool DVDEpochUnchanged(Core::System& system, u32 tick) const;
+
+  // True if an ARAM DMA completion interrupt was pending when `tick` was
+  // captured (see Slot::aram_int_pending).
+  bool ARAMIntPending(u32 tick) const;
+
   // Oldest restorable tick given the current ring contents, or -1 if none.
   s64 OldestTick() const;
 
@@ -142,6 +154,11 @@ private:
     u32 scene = 0;  // first watch (major-scene) at capture time
     u64 timebase = 0;  // game-visible TB at capture (see Restore)
     u64 io_epoch = 0;  // AsyncIOEpoch at capture (see IOEpochUnchanged)
+    u64 epoch_dvd = 0;  // DVD part only (see DVDEpochUnchanged)
+    // An ARAM DMA interrupt was pending at capture (copy already done, so
+    // the snapshot holds the transferred data). If it fires before a restore
+    // of this slot, the delivery must be re-raised (see the R1 restore path).
+    bool aram_int_pending = false;
     std::vector<u8> data;  // concatenated regions, m_snapshot_bytes long
   };
 

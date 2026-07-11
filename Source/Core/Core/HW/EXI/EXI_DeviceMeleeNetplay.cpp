@@ -740,10 +740,10 @@ void CEXIMeleeNetplay::ReportStalls()
     INFO_LOG_FMT(EXPANSIONINTERFACE,
                  "MeleeNetplay: rollback stats: predicted={} validated_ok={} rollbacks={} "
                  "max_depth={} refused_scene={} refused_io={} refused_epoch={} "
-                 "checksums_skipped={} frontier_lag={}",
+                 "aram_redelivered={} checksums_skipped={} frontier_lag={}",
                  m_predicted_ticks, m_validated_ok, m_rollback_count, m_rollback_depth_max,
                  m_rollback_refused_scene, m_restore_refused_io, m_restore_refused_epoch,
-                 m_checksums_skipped, m_serve_tick - m_confirmed_frontier);
+                 m_aram_redelivered, m_checksums_skipped, m_serve_tick - m_confirmed_frontier);
     // Where a replay burst's wall time goes (cumulative since boot). A burst
     // spans REPLAY directive -> first post-replay POLL; depth_avg gives the
     // replayed tick count that wall time bought.
@@ -1082,23 +1082,34 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
         // predates the input-clobber fix -- this cap doubles as the
         // experiment: if desyncs stay gone with ~0.5s parks, the io hazard
         // was misattributed and the parks are a politeness, not a shield.
-        if (parked_io_pending && m_rollback_io_defer_streak < 60)
+        // DVD epoch gate: any non-DTK DVD completion delivered since the
+        // target's capture makes the restore a livelock trap -- the restored
+        // dvd.o state machine re-issues a command the emulator considers
+        // done, forever (v15 requal run 4: cbForStateBusy spin with the DI
+        // counters still climbing ~7/s). Refusal is FREE where it matters:
+        // fights issue ZERO non-DTK DVD traffic (v15q run 5 in-fight
+        // profile; the churn is all menu/load era), so this fires only on
+        // loading tails right at fight entry. The full-sum epoch gate the
+        // torture path keeps is still wrong here: ARAM completes 15-18/s
+        // in-fight and would refuse most rollbacks (smoke #4 refusal
+        // storm); the ARAM flavor is handled by interrupt RE-DELIVERY after
+        // the restore instead (see below).
+        if (m_rollback.IsLoaded() && !m_rollback.DVDEpochUnchanged(m_system, target))
+        {
+          ERROR_LOG_FMT(
+              EXPANSIONINTERFACE,
+              "MeleeNetplay: ROLLBACK REFUSED at tick {} depth {} (dvd completion in window)",
+              m_serve_tick, depth);
+          m_restore_refused_epoch++;
+          m_rollback_needed = false;
+          m_rollback_io_defer_streak = 0;
+          m_confirmed_frontier++;  // treat the mismatched tick as confirmed-wrong
+        }
+        else if (parked_io_pending && m_rollback_io_defer_streak < 60)
         {
           m_restore_refused_io++;
           m_rollback_io_defer_streak++;
         }
-        // NOTE deliberately NO epoch gate here, unlike the torture path: at
-        // R1's exposure (a rollback window is 50-130ms) some async completion
-        // has landed inside it almost ALWAYS (15-55/s during attract), so
-        // gating turns nearly every rollback into an accepted divergence
-        // (R1 smoke #4: refusal storm on both peers, desync within seconds
-        // of the first rollback). The hazard the gate would guard against --
-        // restore erasing the game's record of a delivered completion it
-        // spin-waits on -- is a rare (~1/200-500 replays) WEDGE that the
-        // harness verdict detects honestly. Open item: count only the
-        // genuinely-awaited completion class (address-filter against the
-        // restored region set) and re-enable. m_restore_refused_epoch stays
-        // wired for that future gate.
         else if (!m_rollback.IsLoaded() || !m_rollback.SameScene(m_system, target))
         {
           // Unrecoverable: the mispredicted ticks straddle a scene change (or
@@ -1122,6 +1133,26 @@ u32 CEXIMeleeNetplay::ImmRead(u32 size)
                    return ok;
                  }())
         {
+          // ARAM interrupt re-delivery: the target slot was captured with an
+          // ARAM DMA interrupt pending (copy already done -- it is IN the
+          // snapshot). If it has since fired, the delivery landed in the
+          // timeline this restore just erased: the restored lbArq/SDK queue
+          // still says "in flight" and would spin-wait forever on an
+          // interrupt the emulator has no reason to re-send (v15 requal
+          // run 6, lbArq_80014BD0 wait loop). Re-raise it: the game's own
+          // ISR pops the restored queue and re-chains queued transfers
+          // (their copies re-execute from state the snapshot holds -- every
+          // request in the restored queue was posted before the capture).
+          // Still-pending is fine: the scheduled CoreTiming event will
+          // deliver it into state that expects it.
+          if (m_rollback.ARAMIntPending(target) && !m_system.GetDSP().IsARAMDMAInProgress())
+          {
+            m_system.GetDSP().RedeliverARAMInterrupt();
+            m_aram_redelivered++;
+            INFO_LOG_FMT(EXPANSIONINTERFACE,
+                         "MeleeNetplay: re-delivered ARAM completion into restored tick {}",
+                         target);
+          }
           // Ticks in the window whose real inputs are still missing get a
           // fresh prediction (newer information than the one they were first
           // served with); the rest replay with the real data now in m_frames.

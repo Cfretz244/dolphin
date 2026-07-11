@@ -242,6 +242,9 @@ void MeleeRollbackState::Capture(Core::System& system, u32 tick)
   slot.scene = m_watches.empty() ? 0 : ReadWatch(system, m_watches.front());
   slot.timebase = system.GetSystemTimers().GetFakeTimeBase();
   slot.io_epoch = AsyncIOEpoch(system);
+  slot.epoch_dvd = system.GetDVDThread().GetNonDTKReadsCompleted() +
+                   system.GetDVDInterface().GetNonDTKCommandsCompleted();
+  slot.aram_int_pending = system.GetDSP().IsARAMDMAInProgress();
   slot.valid = true;
 
   m_total_captures++;
@@ -305,6 +308,21 @@ bool MeleeRollbackState::IOEpochUnchanged(Core::System& system, u32 tick) const
   if (!slot.valid || slot.tick != tick)
     return false;
   return slot.io_epoch == AsyncIOEpoch(system);
+}
+
+bool MeleeRollbackState::DVDEpochUnchanged(Core::System& system, u32 tick) const
+{
+  const Slot& slot = m_ring[tick % RING_SIZE];
+  if (!slot.valid || slot.tick != tick)
+    return false;
+  return slot.epoch_dvd == system.GetDVDThread().GetNonDTKReadsCompleted() +
+                               system.GetDVDInterface().GetNonDTKCommandsCompleted();
+}
+
+bool MeleeRollbackState::ARAMIntPending(u32 tick) const
+{
+  const Slot& slot = m_ring[tick % RING_SIZE];
+  return slot.valid && slot.tick == tick && slot.aram_int_pending;
 }
 
 s64 MeleeRollbackState::OldestTick() const

@@ -113,6 +113,17 @@ public:
   // emulator will never re-fire; snapshotting this count detects that.
   u64 GetARAMDMACompletionCount() const { return m_aram_dma_completion_count; }
 
+  // Re-raise the ARAM DMA completion interrupt without a new completion (no
+  // count bump, DMAState already 0). Melee netplay rollback: a snapshot taken
+  // while a DMA was in flight already contains the transferred data (the copy
+  // is immediate at DMA start; only the interrupt is delayed -- see
+  // IsARAMDMAInProgress), but restoring it after the interrupt fired erases
+  // the game's record of the delivery, and its ARQ driver then spin-waits
+  // forever for an interrupt the emulator has no reason to re-send. Re-raising
+  // it lets the game's own ISR pop its (restored) request queue and re-chain
+  // any queued transfers itself.
+  void RedeliverARAMInterrupt() { GenerateDSPInterrupt(INT_ARAM, 0); }
+
 private:
   void GenerateDSPInterrupt(u64 DSPIntType, s64 cyclesLate);
   static void GlobalGenerateDSPInterrupt(Core::System& system, u64 DSPIntType, s64 cyclesLate);

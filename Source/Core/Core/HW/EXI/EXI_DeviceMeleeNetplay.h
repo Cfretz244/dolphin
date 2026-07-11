@@ -335,7 +335,8 @@ private:
   u32 m_rollback_refused_scene = 0;
   u32 m_checksums_skipped = 0;
   u32 m_restore_refused_io = 0;  // deferred/skipped restores: async I/O in flight
-  u32 m_restore_refused_epoch = 0;  // deferred/skipped: completion landed in window
+  u32 m_restore_refused_epoch = 0;  // R1: refused, DVD completion in window; torture: skipped
+  u32 m_aram_redelivered = 0;       // ARAM completions re-raised into restored state
   u32 m_rollback_io_defer_streak = 0;  // consecutive in-flight defers (escape valve)
   // Park targets: completion-counter values that mean "everything in flight
   // when this rollback began parking has completed" (see the rollback path).
