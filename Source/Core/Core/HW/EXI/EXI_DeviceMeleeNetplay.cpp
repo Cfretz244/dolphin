@@ -1886,11 +1886,14 @@ void CEXIMeleeNetplay::DMARead(u32 address, u32 size)
   {
   case CMD_HANDSHAKE:
   {
-    // Block until the session resolves; the game shows the boot screens meanwhile.
-    using namespace std::chrono;
-    const auto deadline = steady_clock::now() + seconds(60);
-    while (!m_session_ready && !m_session_failed && steady_clock::now() < deadline &&
-           m_running.IsSet())
+    // Block until the session resolves — with no deadline. The link layer
+    // retries forever, so a timed fallback here races human-paced starts (a
+    // joiner boots, the host taps Start >60s later): the game silently drops
+    // to an offline boot, the transport then forms the session anyway, and
+    // the in-session peer wedges at its first exchange (S4 finding,
+    // 2026-07-17). The only exits are resolution or explicit cancellation
+    // (quit → m_running cleared; peer link death → m_session_failed).
+    while (!m_session_ready && !m_session_failed && m_running.IsSet())
     {
       Common::SleepCurrentThread(5);
     }
