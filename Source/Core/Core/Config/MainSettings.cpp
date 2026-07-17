@@ -176,6 +176,15 @@ const Info<int> MAIN_MELEE_NETPLAY_LOCAL_PORTS{{System::Main, "MeleeNetplay", "L
 // Players-1 clients before dealing the port census in the HELLO. Clients learn
 // the census from the host and ignore this.
 const Info<int> MAIN_MELEE_NETPLAY_PLAYERS{{System::Main, "MeleeNetplay", "Players"}, 2};
+// 0 = device-owned TCP sockets (default); 1 = app-owned links pumped through
+// the Dolphin_MeleeNetplay_External* C surface (iOS ad-hoc pairing over
+// Network.framework -- see MeleeNetplayExternalTransport.h).
+const Info<int> MAIN_MELEE_NETPLAY_TRANSPORT{{System::Main, "MeleeNetplay", "Transport"}, 0};
+// Test-only (Transport=1): stand in for the app with a TCP byte pump so the
+// Mac harness can exercise the external-transport path. Host "listen:<port>",
+// client "<host>:<port>". Empty (default) = the app owns the links.
+const Info<std::string> MAIN_MELEE_NETPLAY_EXTERNAL_TEST_TCP{
+    {System::Main, "MeleeNetplay", "ExternalTestTcp"}, ""};
 // Testing knobs: hold inbound input messages to simulate one-way network
 // latency (and jitter on top), so the delay-window headroom can be measured on
 // loopback without a second device or root-level traffic shaping.

@@ -9,7 +9,6 @@
 
 #pragma once
 
-#include <SFML/Network.hpp>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -26,6 +25,7 @@
 #include "Common/CommonTypes.h"
 #include "Common/Flag.h"
 #include "Core/HW/EXI/EXI_Device.h"
+#include "Core/HW/EXI/MeleeNetplayExternalTransport.h"
 #include "Core/HW/EXI/MeleeRollbackState.h"
 
 struct MemCheckTraceRing;
@@ -118,7 +118,10 @@ private:
   // 2-peer deadlock, documented below, gets N times more ways to bite).
   struct PeerLink
   {
-    sf::TcpSocket socket;
+    // TcpLinkStream (device-owned SFML socket) or ExternalLinkStream
+    // (app-pumped mailbox, iOS) -- see MeleeNetplayExternalTransport.h.
+    // shared_ptr because external streams are co-owned by the registry.
+    std::shared_ptr<ILinkStream> stream;
     u8 mask = 0;  // ports this peer owns
     std::mutex sendq_lock;
     std::condition_variable sendq_cv;
@@ -130,6 +133,9 @@ private:
   void NetThread();
   bool HostHandshake();    // accept Players-1 clients, deal the census
   bool ClientHandshake();  // connect to the host, learn the census
+  // External transport: adopt `count` app-attached links (attach order =
+  // census deal order) as fresh PeerLinks. Blocks until they exist.
+  bool AdoptExternalLinks(u32 count);
   void StartPeerThreads();
   void PeerSendThread(PeerLink* link);
   void PeerRecvThread(PeerLink* link);
@@ -147,6 +153,7 @@ private:
   std::atomic<bool> m_session_ready{false};
   std::atomic<bool> m_session_failed{false};
   bool m_is_host = false;
+  bool m_transport_external = false;  // MeleeNetplay.Transport=1: app owns the links
   u32 m_players = 2;
   u8 m_local_mask = 0x01;
   u8 m_remote_mask = 0x02;   // union of every OTHER peer's ports

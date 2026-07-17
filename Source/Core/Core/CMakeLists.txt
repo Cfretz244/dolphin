@@ -215,6 +215,10 @@ add_library(core
   HW/EXI/EXI_DeviceIPL.h
   HW/EXI/EXI_DeviceMeleeNetplay.cpp
   HW/EXI/EXI_DeviceMeleeNetplay.h
+  HW/EXI/MeleeNetplayExternalTestPump.cpp
+  HW/EXI/MeleeNetplayExternalTestPump.h
+  HW/EXI/MeleeNetplayExternalTransport.cpp
+  HW/EXI/MeleeNetplayExternalTransport.h
   HW/EXI/MeleeRollbackState.cpp
   HW/EXI/MeleeRollbackState.h
   HW/EXI/EXI_DeviceMemoryCard.cpp
