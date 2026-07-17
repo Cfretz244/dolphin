@@ -206,6 +206,11 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
       MeleeNetplayExternalTestPump::Start(m_is_host, pump, m_is_host ? m_players - 1 : 1);
   }
 
+  // NOTICE-level boot breadcrumbs (S4 triage): visible at any verbosity so an
+  // on-device boot hang localizes from the log ladder alone.
+  NOTICE_LOG_FMT(EXPANSIONINTERFACE,
+                 "MeleeNetplay: device constructed (host={} transport={} players={} delay={})",
+                 m_is_host, m_transport_external ? "external" : "tcp", m_players, m_delay);
   m_running.Set();
   m_net_thread = std::thread(&CEXIMeleeNetplay::NetThread, this);
   m_diag_thread = std::thread(&CEXIMeleeNetplay::DiagThread, this);
@@ -346,6 +351,7 @@ bool CEXIMeleeNetplay::AdoptExternalLinks(u32 count)
 {
   Core::DisplayMessage(fmt::format("MeleeNetplay: waiting for {} app-provided link(s)", count),
                        8000);
+  NOTICE_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: waiting for {} app-provided link(s)", count);
   std::vector<std::shared_ptr<ExternalLinkStream>> links;
   while (m_running.IsSet())
   {
@@ -368,7 +374,7 @@ bool CEXIMeleeNetplay::AdoptExternalLinks(u32 count)
     link->stream = links[i];
     m_peers.push_back(std::move(link));
   }
-  INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: adopted {} external link(s)", count);
+  NOTICE_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: adopted {} external link(s)", count);
   return true;
 }
 
@@ -552,8 +558,10 @@ void CEXIMeleeNetplay::NetThread()
 {
   Common::SetCurrentThreadName("MeleeNetplay");
 
+  NOTICE_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: net thread up (host={})", m_is_host);
   if (!(m_is_host ? HostHandshake() : ClientHandshake()))
   {
+    NOTICE_LOG_FMT(EXPANSIONINTERFACE, "MeleeNetplay: handshake FAILED — session dead");
     m_session_failed = true;
     return;
   }
@@ -1886,6 +1894,8 @@ void CEXIMeleeNetplay::DMARead(u32 address, u32 size)
   {
   case CMD_HANDSHAKE:
   {
+    NOTICE_LOG_FMT(EXPANSIONINTERFACE,
+                   "MeleeNetplay: game requested handshake; blocking until session resolves");
     // Block until the session resolves — with no deadline. The link layer
     // retries forever, so a timed fallback here races human-paced starts (a
     // joiner boots, the host taps Start >60s later): the game silently drops
