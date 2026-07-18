@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Dolphin is a GameCube/Wii emulator (GPLv2+). This fork adds an **ahead-of-time (AOT) recompilation pipeline** that statically transpiles PPC code to C, compiles it with Clang, and links against Dolphin's runtime — enabling iOS deployment without JIT (no `MAP_JIT`). SSBM runs at full speed on macOS ARM64. The `ios-aot` branch adds iOS platform support for integration with the [Delta emulator](https://github.com/rileytestut/Delta) frontend. The branch is ~70 commits ahead of `master` with ~219K lines added.
+Dolphin is a GameCube/Wii emulator (GPLv2+). This fork adds an **ahead-of-time (AOT) recompilation pipeline** that statically transpiles PPC code to C, compiles it with Clang, and links against Dolphin's runtime — enabling iOS deployment without JIT (no `MAP_JIT`). SSBM runs at full speed on macOS ARM64. Development happens on `master` of the Cfretz244/dolphin fork (the historical `ios-aot` branch was merged into it 2026-07-18 and is dormant), which also carries iOS platform support for integration with the [Delta emulator](https://github.com/rileytestut/Delta) frontend — ~200 commits / ~230K lines ahead of upstream.
 
 ## Build Commands
 
@@ -213,7 +213,7 @@ Config entries via `-C`: `Dolphin.Debug.AOTCfgDbPath`, `Dolphin.Debug.AOTDiffMod
 
 ## iOS Platform Support
 
-The `ios-aot` branch adds support for building Dolphin as a library for integration with the Delta emulator on iOS. Key adaptations:
+This fork adds support for building Dolphin as a library for integration with the Delta emulator on iOS. Key adaptations:
 
 ### Build Differences (`DOLPHIN_IOS_BUILD=ON`)
 
