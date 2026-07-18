@@ -257,6 +257,14 @@ const Info<bool> MAIN_MELEE_NETPLAY_TRACE_SEED_QUIET{
 // linker map). Empty = off.
 const Info<std::string> MAIN_MELEE_NETPLAY_DIAG_WATCH{
     {System::Main, "MeleeNetplay", "DiagWatch"}, ""};
+// Host-side BGM under netplay (the jukebox; see MeleeJukebox.h). Volume is
+// 0..100, default 80: Slippi's 0.8 factor keeps BGM under SFX.
+const Info<bool> MAIN_MELEE_JUKEBOX{{System::Main, "MeleeNetplay", "Jukebox"}, true};
+const Info<int> MAIN_MELEE_JUKEBOX_VOLUME{{System::Main, "MeleeNetplay", "JukeboxVolume"}, 80};
+// Dev-only: when set, the device autoplays this disc path at construction
+// (no game-side command needed) -- the M1 pre-ROM validation hook.
+const Info<std::string> MAIN_MELEE_JUKEBOX_DEBUG_TRACK{
+    {System::Main, "MeleeNetplay", "JukeboxDebugTrack"}, ""};
 
 const Info<SerialInterface::SIDevices>& GetInfoForSIDevice(int channel)
 {

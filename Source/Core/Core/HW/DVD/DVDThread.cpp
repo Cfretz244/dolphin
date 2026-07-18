@@ -27,6 +27,7 @@
 #include "Core/IOS/ES/Formats.h"
 #include "Core/System.h"
 
+#include "DiscIO/Blob.h"
 #include "DiscIO/Enums.h"
 #include "DiscIO/Volume.h"
 
@@ -113,6 +114,13 @@ void DVDThread::SetDisc(std::unique_ptr<DiscIO::Volume> disc)
 bool DVDThread::HasDisc() const
 {
   return m_disc != nullptr;
+}
+
+std::unique_ptr<DiscIO::Volume> DVDThread::CloneDiscForHostReads() const
+{
+  if (!m_disc)
+    return nullptr;
+  return DiscIO::CreateVolume(m_disc->GetBlobReader().CopyReader());
 }
 
 bool DVDThread::HasWiiHashes() const

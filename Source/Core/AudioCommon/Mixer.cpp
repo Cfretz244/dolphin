@@ -171,6 +171,7 @@ std::size_t Mixer::Mix(s16* samples, std::size_t num_samples)
   m_streaming_mixer.Mix(samples, num_samples);
   m_wiimote_speaker_mixer.Mix(samples, num_samples);
   m_skylander_portal_mixer.Mix(samples, num_samples);
+  m_jukebox_mixer.Mix(samples, num_samples);
   for (auto& mixer : m_gba_mixers)
     mixer.Mix(samples, num_samples);
 
@@ -297,6 +298,38 @@ void Mixer::PushGBASamples(std::size_t device_number, const s16* samples, std::s
     m_gba_mixers[device_number].PushSample(samples[0], samples[1]);
     samples += 2;
   }
+}
+
+void Mixer::PushJukeboxSamples(const s16* samples, std::size_t num_samples)
+{
+  if (!IsOutputSampleRateValid())
+    return;
+
+  // The jukebox decode thread pushes host-endian LR-ordered stereo samples.
+
+  while (num_samples--)
+  {
+    m_jukebox_mixer.PushSample(samples[0], samples[1]);
+    samples += 2;
+  }
+}
+
+void Mixer::SetJukeboxVolume(u32 lvolume, u32 rvolume)
+{
+  m_jukebox_mixer.SetVolume(std::clamp<u32>(lvolume, 0x00, 0xff),
+                            std::clamp<u32>(rvolume, 0x00, 0xff));
+}
+
+void Mixer::SetJukeboxInputSampleRate(u32 sample_rate)
+{
+  if (sample_rate != 0)
+    m_jukebox_mixer.SetInputSampleRateDivisor(
+        static_cast<u32>(FIXED_SAMPLE_RATE_DIVIDEND / sample_rate));
+}
+
+std::size_t Mixer::GetJukeboxQueuedFrames() const
+{
+  return m_jukebox_mixer.QueuedGranules() * Mixer::MixerFifo::GetGranuleOverlap();
 }
 
 void Mixer::SetDMAInputSampleRateDivisor(u32 rate_divisor)

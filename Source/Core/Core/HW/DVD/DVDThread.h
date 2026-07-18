@@ -66,6 +66,12 @@ public:
   void SetDisc(std::unique_ptr<DiscIO::Volume> disc);
   bool HasDisc() const;
 
+  // Private cloned volume over a fresh blob reader for HOST-side reads (the
+  // melee-netplay jukebox): never hands out the mounted volume, whose blob
+  // cursor belongs to the DVD thread. Same pattern as AchievementManager /
+  // AMMediaboard. Returns nullptr when no disc is mounted.
+  std::unique_ptr<DiscIO::Volume> CloneDiscForHostReads() const;
+
   bool HasWiiHashes() const;
   DiscIO::Platform GetDiscType() const;
   u64 PartitionOffsetToRawOffset(u64 offset, const DiscIO::Partition& partition);

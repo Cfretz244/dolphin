@@ -24,6 +24,7 @@
 #include "Core/HW/DSP.h"
 #include "Core/HW/DVD/DVDInterface.h"
 #include "Core/HW/DVD/DVDThread.h"
+#include "Core/HW/EXI/MeleeJukebox.h"
 #include "Core/HW/EXI/MeleeNetplayExternalTestPump.h"
 #include "Core/HW/Memmap.h"
 #include "Core/PowerPC/BreakPoints.h"
@@ -204,6 +205,16 @@ CEXIMeleeNetplay::CEXIMeleeNetplay(Core::System& system) : IEXIDevice(system)
     const std::string pump = Config::Get(Config::MAIN_MELEE_NETPLAY_EXTERNAL_TEST_TCP);
     if (!pump.empty())
       MeleeNetplayExternalTestPump::Start(m_is_host, pump, m_is_host ? m_players - 1 : 1);
+  }
+
+  // Dev harness (M1 pre-ROM testing): play a disc path immediately, without
+  // any game-side jukebox command. Debug-gated by the config string.
+  const std::string debug_track = Config::Get(Config::MAIN_MELEE_JUKEBOX_DEBUG_TRACK);
+  if (!debug_track.empty())
+  {
+    WARN_LOG_FMT(EXPANSIONINTERFACE, "MeleeJukebox: DEBUG autoplay of {}", debug_track);
+    if (MeleeJukebox* jukebox = GetJukebox())
+      jukebox->PlayTrack(debug_track);
   }
 
   // NOTICE-level boot breadcrumbs (S4 triage): visible at any verbosity so an
@@ -1239,9 +1250,39 @@ void CEXIMeleeNetplay::PredictIntoLocked(u32 tick)
 // EXI interface (CPU thread)
 // ---------------------------------------------------------------------------
 
+MeleeJukebox* CEXIMeleeNetplay::GetJukebox()
+{
+  if (m_jukebox)
+    return m_jukebox.get();
+  if (m_jukebox_disabled)
+    return nullptr;
+  if (!Config::Get(Config::MAIN_MELEE_JUKEBOX))
+  {
+    INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeJukebox: disabled by config");
+    m_jukebox_disabled = true;
+    return nullptr;
+  }
+  m_jukebox = std::make_unique<MeleeJukebox>(m_system);
+  return m_jukebox.get();
+}
+
 void CEXIMeleeNetplay::ImmWrite(u32 data, u32 size)
 {
   m_command = static_cast<u8>(data >> 24);
+  // The imm-only jukebox commands act here: no DMA phase follows them.
+  if (m_command == CMD_JUKEBOX_STOP)
+  {
+    if (MeleeJukebox* jukebox = GetJukebox())
+      jukebox->Stop();
+  }
+  else if (m_command == CMD_JUKEBOX_VOL)
+  {
+    // Logged unconditionally: the usual first value (254) equals the jukebox
+    // default, so a change-only log cannot prove the wire path works.
+    INFO_LOG_FMT(EXPANSIONINTERFACE, "MeleeJukebox: CMD_JUKEBOX_VOL {}", data & 0xFF);
+    if (MeleeJukebox* jukebox = GetJukebox())
+      jukebox->SetGameVolume(static_cast<u8>(std::min<u32>(data & 0xFF, 254)));
+  }
 }
 
 u32 CEXIMeleeNetplay::ImmRead(u32 size)
@@ -1662,6 +1703,17 @@ void CEXIMeleeNetplay::DMAWrite(u32 address, u32 size)
         MaybeDumpDesyncRing();
         MaybeTorture();
       }
+    }
+    break;
+  case CMD_JUKEBOX_PLAY:
+    // 64B payload {char path[0x3C], u8 vol, u8 track, u8 pad[2]}. vol/track
+    // are informational -- volume authority is the CMD_JUKEBOX_VOL stream.
+    if (size >= 64)
+    {
+      char path[0x3C + 1] = {};
+      std::memcpy(path, buf, 0x3C);
+      if (MeleeJukebox* jukebox = GetJukebox())
+        jukebox->PlayTrack(path);
     }
     break;
   case CMD_CHECKSUM:

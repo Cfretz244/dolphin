@@ -34,6 +34,12 @@ public:
                                  u32 sample_rate_divisor);
   void PushSkylanderPortalSamples(const u8* samples, std::size_t num_samples);
   void PushGBASamples(std::size_t device_number, const s16* samples, std::size_t num_samples);
+  // Melee-netplay jukebox (host-side BGM, outside the emulated sim). Unlike
+  // the game-audio pushes these are host-endian LR-ordered stereo samples
+  // (the HPS decoder produces them natively). Pushed by the jukebox decode
+  // thread only. Deliberately absent from DoState: host-side state, not sim
+  // state -- the savestate format is unchanged.
+  void PushJukeboxSamples(const s16* samples, std::size_t num_samples);
 
   u32 GetSampleRate() const { return m_output_sample_rate; }
   void SetSampleRate(u32 output_sample_rate) { m_output_sample_rate = output_sample_rate; }
@@ -48,6 +54,12 @@ public:
   void SetStreamingVolume(u32 lvolume, u32 rvolume);
   void SetWiimoteSpeakerVolume(u32 lvolume, u32 rvolume);
   void SetGBAVolume(std::size_t device_number, u32 lvolume, u32 rvolume);
+  void SetJukeboxVolume(u32 lvolume, u32 rvolume);
+  void SetJukeboxInputSampleRate(u32 sample_rate);
+  // Approximate count of jukebox input frames buffered but not yet mixed.
+  // Racy by design (atomic head/tail snapshot); used only to pace the jukebox
+  // decode thread against wall-clock playback.
+  std::size_t GetJukeboxQueuedFrames() const;
 
   void StartLogDTKAudio(const std::string& filename);
   void StopLogDTKAudio();
@@ -131,6 +143,16 @@ private:
     void SetVolume(u32 lvolume, u32 rvolume);
     std::pair<s32, s32> GetVolume() const;
 
+    // Granules queued but not yet mixed (each holds GRANULE_OVERLAP new input
+    // frames). Approximate: head/tail are sampled independently.
+    std::size_t QueuedGranules() const
+    {
+      return (m_queue_head.load(std::memory_order_acquire) -
+              m_queue_tail.load(std::memory_order_acquire)) &
+             GRANULE_QUEUE_MASK;
+    }
+    static constexpr std::size_t GetGranuleOverlap() { return GRANULE_OVERLAP; }
+
   private:
     Mixer* m_mixer;
 
@@ -168,6 +190,9 @@ private:
   MixerFifo m_streaming_mixer{this, FIXED_SAMPLE_RATE_DIVIDEND / 48000};
   MixerFifo m_wiimote_speaker_mixer{this, FIXED_SAMPLE_RATE_DIVIDEND / 3000};
   MixerFifo m_skylander_portal_mixer{this, FIXED_SAMPLE_RATE_DIVIDEND / 8000};
+  // Every Melee HPS track is 32kHz; the rate is still set per track from the
+  // HPS header (SetJukeboxInputSampleRate).
+  MixerFifo m_jukebox_mixer{this, FIXED_SAMPLE_RATE_DIVIDEND / 32000};
 
   // GBAs generally use a 65536 sample rate which is not a factor of our FIXED_SAMPLE_RATE_DIVIDEND.
   static constexpr u32 GBA_SAMPLE_RATE_DIVIDEND = 0x1000000;

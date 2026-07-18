@@ -29,6 +29,7 @@
 #include "Core/HW/EXI/MeleeRollbackState.h"
 
 struct MemCheckTraceRing;
+class MeleeJukebox;
 
 namespace ExpansionInterface
 {
@@ -58,10 +59,16 @@ private:
     CMD_POLL = 0x03,       // ImmRead 4B: 1 if serve-tick frame ready
     CMD_RECV = 0x04,       // then DMARead 288B {HSD_PadStatus[4], pad}; advances serve tick
     CMD_CHECKSUM = 0x05,   // then DMAWrite 32B {u32 tick, u32 crc32, pad}
+    // Jukebox: host-side BGM notifications (fire-and-forget, no reply). The
+    // volume rides the imm command word itself (cmd<<24 | vol) so play/stop/
+    // volume all stay outside the tick-exchange DMA sequence.
+    CMD_JUKEBOX_PLAY = 0x06,  // then DMAWrite 64B {char path[0x3C], u8 vol, u8 track, pad}
+    CMD_JUKEBOX_STOP = 0x07,  // imm-only
+    CMD_JUKEBOX_VOL = 0x08,   // imm-only; volume 0..254 in the low byte
   };
 
   static constexpr u32 DEVICE_ID = 0x4D4E4554;  // 'MNET'; unknown to CARD -> "no card"
-  static constexpr u8 PROTO_VERSION = 4;        // v4: N-peer port census in the HELLO
+  static constexpr u8 PROTO_VERSION = 5;        // v5: jukebox cmds (v4: N-peer census)
   static constexpr u32 PAD_BYTES = 0x44;  // sizeof(HSD_PadStatus): full post-transform entry
   static constexpr u32 MAX_PLAYERS = 4;
 
@@ -411,6 +418,14 @@ private:
   u64 m_park_aram_target = 0;
   u64 m_park_dvd_target = 0;
   u64 m_park_di_target = 0;
+
+  // --- jukebox (host-side BGM; see MeleeJukebox.h). Lazily created on the
+  // first jukebox command when MeleeNetplay.Jukebox is enabled (or eagerly by
+  // the JukeboxDebugTrack dev hook); owned by the device so it can never
+  // outlive the session. nullptr when disabled or creation failed.
+  std::unique_ptr<MeleeJukebox> m_jukebox;
+  bool m_jukebox_disabled = false;  // creation refused/failed; don't retry
+  MeleeJukebox* GetJukebox();
 
   // --- CPU-thread transaction state
   u8 m_command = CMD_ID;
