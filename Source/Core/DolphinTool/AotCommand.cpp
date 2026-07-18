@@ -19,6 +19,7 @@
 #include <OptionParser.h>
 #include <fmt/format.h>
 #include <fmt/ostream.h>
+#include <mbedtls/sha256.h>
 #include <sqlite3.h>
 
 #include "Common/CommonTypes.h"
@@ -169,6 +170,20 @@ int AotCommand(const std::vector<std::string>& args)
 
   std::vector<u8> dol_buffer(*dol_size);
   volume->Read(*dol_offset, *dol_size, dol_buffer.data(), DiscIO::PARTITION_NONE);
+
+  // Source-image identity, embedded in the generated library and verified by
+  // AOTCore at launch: a library run against a different image executes
+  // translated code on the wrong layout (crash/silent garbage). The boot DOL
+  // is the exact artifact the translation corresponds to.
+  std::string dol_sha256_hex;
+  {
+    u8 digest[32];
+    mbedtls_sha256_ret(dol_buffer.data(), dol_buffer.size(), digest, 0);
+    dol_sha256_hex.reserve(64);
+    for (const u8 b : digest)
+      dol_sha256_hex += fmt::format("{:02x}", b);
+    fmt::println("Boot DOL sha256: {}", dol_sha256_hex);
+  }
 
   DolReader dol(std::move(dol_buffer));
   if (!dol.IsValid())
@@ -760,6 +775,8 @@ int AotCommand(const std::vector<std::string>& args)
     file << fmt::format(
         "    aot_register_game(\"{}\", {}_dispatch, {}_lookup_block, AOT_ABI_VERSION);\n",
         prefix, prefix, prefix);
+    file << fmt::format("    aot_register_game_image(\"{}\", \"{}\");\n", prefix,
+                        dol_sha256_hex);
     if (!mods.empty())
     {
       file << fmt::format("    aot_register_game_modules(\"{}\", {}_modules, {}u);\n", prefix,

@@ -30,6 +30,10 @@ struct AotGameEntry
   uint32_t block_size_count = 0;
   const AotModuleBlockSize* module_block_sizes = nullptr;
   uint32_t module_block_size_count = 0;
+  // sha256 (lowercase hex) of the boot DOL of the image this library was
+  // generated from; empty for pre-v24 libraries that never registered one.
+  // AOTCore verifies the mounted disc against it before running.
+  std::string dol_sha256;
 };
 
 // Multi-game registry, populated before main() by each linked AOT library's
@@ -45,6 +49,7 @@ public:
   void RegisterModules(const std::string& game_id, const AotModuleDesc* modules, uint32_t count);
   void RegisterBlockSizes(const std::string& game_id, const AotBlockSize* blocks, uint32_t count,
                           const AotModuleBlockSize* module_blocks, uint32_t module_count);
+  void RegisterImageHash(const std::string& game_id, const char* dol_sha256_hex);
   std::optional<AotGameEntry> Find(const std::string& game_id) const;
   std::vector<std::string> GetRegisteredGameIDs() const;
 

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "Common/CommonTypes.h"
 #include "Core/PowerPC/CPUCoreBase.h"
@@ -44,12 +45,23 @@ public:
   const char* GetName() const override { return "AOT"; }
 
 private:
+  // Compares the mounted disc's boot-DOL sha256 against the hash the selected
+  // AOT library was generated from (aot_register_game_image). Runs lazily at
+  // the first Run() slice — the disc is guaranteed mounted there, unlike at
+  // Init(). Returns false on a PROVEN mismatch (hard stop); missing hash or
+  // an unreadable disc only warns.
+  bool VerifyImageIdentity();
+
   Core::System& m_system;
   PowerPC::PowerPCState& m_ppc_state;
 
   using DispatchFunc = void (*)(AOTState*);
   DispatchFunc m_dispatch = nullptr;
   DispatchFunc m_interp_dispatch = nullptr;
+
+  std::string m_expected_dol_sha256;  // from the registry entry; empty = none
+  bool m_image_checked = false;
+  bool m_image_blocked = false;
 
 #ifdef DOLPHIN_AOT_HARNESS
   // Non-null when an AOT_* debug switch or dolphin-tool diff engaged the

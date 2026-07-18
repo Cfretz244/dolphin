@@ -205,6 +205,15 @@ extern void aot_register_game_modules(const char* game_id, const AotModuleDesc* 
 extern void aot_register_block_sizes(const char* game_id, const AotBlockSize* blocks,
                                      uint32_t count, const AotModuleBlockSize* module_blocks,
                                      uint32_t module_count);
+/* Source-image identity: sha256 (lowercase hex) of the boot DOL of the disc
+ * image this library was generated from. AOTCore refuses to run against a
+ * disc whose DOL hashes differently -- a mismatched image otherwise executes
+ * translated code against the wrong layout (crash at best, silence at worst;
+ * the April 2026 Rev0-vs-Rev2 incident). Additive entry point, deliberately
+ * NOT an AOT_ABI_VERSION bump: no existing type or entry point changed, and
+ * pre-existing libraries that never call this must keep registering (they get
+ * a cannot-verify warning instead of the hard gate). */
+extern void aot_register_game_image(const char* game_id, const char* dol_sha256_hex);
 
 // Runtime helpers (implemented in the Dolphin runtime harness)
 extern void aot_interpreter_single_step(AOTState* s);
