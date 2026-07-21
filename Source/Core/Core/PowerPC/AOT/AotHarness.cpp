@@ -1317,6 +1317,10 @@ void AotHarness::RunDiff()
         std::fflush(log);
         if (log != stdout)
           std::fclose(log);
+        // Same shutdown as the max-divergences path: without the queued
+        // Core::Stop, Core stays Running and DiffCommand's wait loop spins
+        // forever after "Stopping." is printed.
+        Core::QueueHostJob([](Core::System& sys) { Core::Stop(sys); });
         cpu.Break();
         return;
       }
