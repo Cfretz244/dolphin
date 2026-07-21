@@ -17,6 +17,13 @@
 namespace DolphinTool
 {
 
+// Chain-inlining caps (see EmitBlockBody). Small bodies only: tiny blocks pay
+// proportionally the most per-block call/guard overhead and duplicate cheaply;
+// large bodies amortize their musttail hop and would bloat the text section.
+static constexpr u32 kMaxInlineBlockInsts = 12;
+static constexpr int kMaxInlineDepth = 16;
+static constexpr u32 kMaxInlineTotalInsts = 192;
+
 AOTCEmitter::AOTCEmitter(const PPCMemoryImage& memory, std::set<u32> known_blocks,
                          std::string prefix)
     : m_memory(memory), m_known_blocks(std::move(known_blocks)), m_prefix(std::move(prefix))
@@ -94,11 +101,16 @@ static bool OpcodeSupportsImmReloc(u32 opcd)
   return opcd == 14 || opcd == 15 || opcd == 24 || opcd == 25 || (opcd >= 32 && opcd <= 55);
 }
 
+void AOTCEmitter::SetInlineHints(std::unordered_map<u32, u32> block_sizes,
+                                 std::unordered_set<u32> inline_targets)
+{
+  m_block_sizes = std::move(block_sizes);
+  m_inline_targets = std::move(inline_targets);
+}
+
 std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bool from_trace)
 {
   std::string out;
-  m_block_cycle_count = 0;
-  m_fpu_checked = false;
   // regular,pure_instructions marks these as code sections — without it the
   // linker won't synthesize branch islands, and once total __TEXT exceeds the
   // ±128MB B/BL range (5+ games linked together) direct branches from AOT
@@ -108,6 +120,23 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
   out += fmt::format("__attribute__((noinline, section(\"{}\")))"
                      " void {}(AOTState* s) {{\n",
                      section, BlockFn(block_addr, false));
+
+  m_inline_depth = 0;
+  m_inline_insts = num_instructions;
+  EmitBlockBody(out, block_addr, num_instructions);
+
+  out += "}\n";
+  return out;
+}
+
+void AOTCEmitter::EmitBlockBody(std::string& out, u32 block_addr, u32 num_instructions)
+{
+  // Per-body state: an inlined body emits exactly the same text as its
+  // standalone function's body (own cycle accounting, own MSR.FP check), so
+  // chain semantics match the pre-inlining musttail path except for the
+  // dropped intermediate edge guards.
+  m_block_cycle_count = 0;
+  m_fpu_checked = false;
 
   for (u32 i = 0; i < num_instructions; i++)
   {
@@ -184,6 +213,40 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
   {
     u32 next_pc = block_addr + num_instructions * 4;
     out += fmt::format("    s->downcount -= {};\n", m_block_cycle_count);
+
+    // Chain inlining: when the fallthrough target's only non-dynamic in-edge
+    // is this edge and its body is small, emit it inline with no intermediate
+    // guard. This collapses the micro-block chains the trace JIT's block
+    // boundaries produce (e.g. OSSaveContext/OSLoadContext split at every GQR
+    // write into 1-2 instruction blocks, each paying a call + guard per
+    // interrupt). Caps: small bodies only (call overhead dominates small
+    // blocks; large ones amortize their musttail fine), bounded chain length,
+    // forward edges only (strictly increasing PCs — cycles impossible, and
+    // every CFG cycle still crosses a guarded backward edge or dispatch).
+    if (!m_module && next_pc > block_addr && m_inline_targets.contains(next_pc) &&
+        m_inline_depth < kMaxInlineDepth)
+    {
+      auto size_it = m_block_sizes.find(next_pc);
+      if (size_it != m_block_sizes.end() && size_it->second <= kMaxInlineBlockInsts &&
+          m_inline_insts + size_it->second <= kMaxInlineTotalInsts)
+      {
+        out += fmt::format("    /* chain-inlined fallthrough: {} */\n", PcStr(next_pc));
+        // Harness builds keep a per-block stop at the chain seam so the diff
+        // harness can compare block-by-block (chains otherwise run past the
+        // interpreter's comparison window and flag phantom divergences).
+        // Production compiles this out — that guard removal is the whole point.
+        out += "#if AOT_HARNESS\n";
+        out += fmt::format("    if(aot_single_block_mode){{ s->pc={}; return; }}\n",
+                           PcStr(next_pc));
+        out += "#endif\n";
+        m_inline_depth++;
+        m_inline_insts += size_it->second;
+        EmitBlockBody(out, next_pc, size_it->second);
+        m_inline_depth--;
+        return;
+      }
+    }
+
     if (m_known_blocks.contains(next_pc))
     {
       // Chain the fall-through edge like a taken static edge (same guard shape
@@ -199,9 +262,6 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
       out += fmt::format("    s->pc = {};\n", PcStr(next_pc));
     }
   }
-
-  out += "}\n";
-  return out;
 }
 
 bool AOTCEmitter::EmitInstruction(std::string& out, UGeckoInstruction inst, u32 pc, bool is_last)

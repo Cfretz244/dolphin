@@ -71,6 +71,18 @@ public:
   // If from_trace is true, the block was observed during trace collection (hot).
   std::string TranslateBlock(u32 block_addr, u32 num_instructions, bool from_trace = true);
 
+  // Chain inlining (DOL mode only): a block in inline_targets has exactly one
+  // non-dynamic CFG in-edge — the fallthrough from its predecessor — so the
+  // predecessor emits the target's body inline instead of a guarded musttail
+  // hop. The target's standalone function and fast_table entry are still
+  // emitted (indirect/dispatch entry, exception resume), so this is purely a
+  // code-layout change; the only semantic delta is that the dropped
+  // intermediate downcount/exception guards extend delivery latency to the
+  // chain end, exactly as if the CFG had one larger block. block_sizes maps
+  // every translatable block to its instruction count.
+  void SetInlineHints(std::unordered_map<u32, u32> block_sizes,
+                      std::unordered_set<u32> inline_targets);
+
   // Get the set of unhandled opcodes encountered during translation.
   const std::map<std::string, u32>& GetUnhandledOpcodes() const { return m_unhandled_opcodes; }
 
@@ -200,12 +212,22 @@ private:
   // opcodes). RAM holds the relocated instruction, so this is always correct.
   void EmitModuleFallback(std::string& out, u32 pc);
 
+  // Emit one block's instruction loop + fallthrough exit (everything between
+  // the function header and closing brace). Re-entered for chain inlining.
+  void EmitBlockBody(std::string& out, u32 block_addr, u32 num_instructions);
+
   const PPCMemoryImage& m_memory;
   std::set<u32> m_known_blocks;
   std::string m_prefix;
   u32 m_block_cycle_count = 0;
   bool m_fpu_checked = false;  // true once the current block emitted its MSR.FP check
   std::map<std::string, u32> m_unhandled_opcodes;
+
+  // Chain inlining state (see SetInlineHints)
+  std::unordered_map<u32, u32> m_block_sizes;
+  std::unordered_set<u32> m_inline_targets;
+  int m_inline_depth = 0;   // nested EmitBlockBody calls in the current function
+  u32 m_inline_insts = 0;   // total instructions emitted into the current function
 
   const ModuleMode* m_module = nullptr;
   const ModuleImmReloc* m_cur_imm = nullptr;          // reloc on the current instruction

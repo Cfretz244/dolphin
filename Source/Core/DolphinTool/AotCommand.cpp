@@ -295,6 +295,51 @@ int AotCommand(const std::vector<std::string>& args)
   // 4. Translate blocks, split into files by address range (64KB granularity)
   AOTCEmitter emitter(memory, known_blocks, prefix);
 
+  // Chain-inlining hints: a block whose only non-dynamic in-edge is the
+  // fallthrough from its predecessor gets its body inlined at that
+  // predecessor's fallthrough exit (its standalone function still exists for
+  // dispatch/exception entry — see AOTCEmitter::SetInlineHints). Dynamic
+  // in-edges don't disqualify: dispatch enters the standalone function.
+  {
+    // A block is branch-entered if any static (branch-taken) or call edge
+    // targets it. Split-boundary fallthroughs (e.g. the trace JIT ending a
+    // block at every GQR write) get NO edge row, so absence of branch entries
+    // is the criterion — the physical fallthrough predecessor (the block
+    // ending at this address) is unique because CFG blocks don't overlap.
+    // Dynamic in-edges don't disqualify: dispatch enters the standalone fn.
+    std::unordered_set<u32> branch_entered;
+    for (const auto& e : cfg_edges)
+    {
+      if (e.edge_type == "static" || e.edge_type == "call")
+        branch_entered.insert(e.to_addr);
+    }
+    std::unordered_map<u32, u32> block_sizes;
+    for (const auto& b : cfg_blocks)
+    {
+      if (b.is_translatable && b.num_instructions > 0)
+        block_sizes[b.ppc_addr] = b.num_instructions;
+    }
+    std::unordered_set<u32> inline_targets;
+    for (const auto& [addr, size] : block_sizes)
+    {
+      if (!branch_entered.contains(addr))
+        inline_targets.insert(addr);
+    }
+    if (std::getenv("AOT_NO_CHAIN_INLINE"))
+    {
+      // Debug knob: emit pre-inlining output (guarded musttail at every edge)
+      // for A/B comparison against the chained code.
+      inline_targets.clear();
+      fmt::println(std::cerr, "Chain inlining: DISABLED (AOT_NO_CHAIN_INLINE)");
+    }
+    else
+    {
+      fmt::println(std::cerr, "Chain inlining: {} fallthrough-only targets",
+                   inline_targets.size());
+    }
+    emitter.SetInlineHints(std::move(block_sizes), std::move(inline_targets));
+  }
+
   // Group blocks by high 16 bits of address
   std::map<u32, std::vector<const CFGBlockInfo*>> groups;
   for (const auto& b : cfg_blocks)
