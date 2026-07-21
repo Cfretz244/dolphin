@@ -60,9 +60,9 @@ The pipeline has four phases, each producing artifacts consumed by the next:
   -C Dolphin.Debug.TraceOutputPath=trace.dpht
 ```
 
-**Phase 2 — CFG Extraction:** Recursive descent disassembly seeded by traces + DOL entry point. Output is a SQLite database.
+**Phase 2 — CFG Extraction:** Recursive descent disassembly seeded by traces + DOL entry point. Output is a SQLite database. `--trace` is repeatable: multiple trace files union into one CFG (keep the broad base trace, add targeted traces for problem scenes; v4 snapshot timelines are rebased sequentially). Overlay-image clustering is opt-in via `--overlays` — pass it ONLY for Camelot-style overlay games (MPT); REL-based games would get garbage images from their REL-resident snapshots. Delete a pre-existing output DB before rerunning — the writer does not drop stale tables.
 ```bash
-./Binaries/dolphin-tool cfg --iso game.iso --trace trace.dpht --output cfg.db
+./Binaries/dolphin-tool cfg --iso game.iso --trace trace.dpht --trace boss_fight.dpht --output cfg.db
 ```
 
 **Phase 3 — PPC-to-C Translation:** Emits C functions per block + O(1) flat dispatch table.
