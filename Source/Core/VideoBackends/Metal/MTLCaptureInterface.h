@@ -3,29 +3,34 @@
 
 #pragma once
 
-// C interface for the blit-based offscreen frame capture used by embedding
+// C interface for the zero-copy offscreen frame capture used by embedding
 // frontends (the Delta iOS app). Implemented in MTLGfx.mm; kept plain C so an
 // ObjC++/ARC bridge can include it without pulling in Dolphin C++ headers.
+//
+// The frontend supplies a ring of IOSurfaces matching the render surface
+// (CAMetalLayer drawable) in size and format (BGRA8). Each present, the video
+// backend blits the drawable into the next ring slot on the GPU and publishes
+// the slot index from the command buffer's completion handler — the frame
+// never touches the CPU. The frontend takes the latest published slot and
+// displays it directly (e.g. via CIImage(ioSurface:)).
 
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
+#include <IOSurface/IOSurfaceRef.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// The frontend owns the buffer; it must hold one full XFB-sized frame
-// (width * height * 4 bytes) and outlive the capture session.
-void Dolphin_SetFrameCaptureBuffer(uint8_t* buffer);
-bool Dolphin_IsFrameReady(void);
-void Dolphin_ClearFrameReady(void);
+// Register the capture ring; enables capture (the backend stops presenting
+// on-screen) until cleared with (NULL, 0). The surfaces are CFRetained until
+// replaced or cleared. Use >= 3 surfaces: the consumer may still be displaying
+// slot N while the GPU writes slot N+1 — with 3, a slot is only rewritten two
+// presents after it was published.
+void Dolphin_SetFrameCaptureSurfaces(const IOSurfaceRef* surfaces, int count);
 
-// Copy the latest captured frame into dst (size bytes) and consume the ready
-// flag as one atomic operation; returns false if no frame is ready. Use this
-// instead of IsFrameReady/ClearFrameReady + a manual copy — that sequence
-// tears against the video thread's writer when Dolphin runs dual-core.
-bool Dolphin_CopyCapturedFrame(uint8_t* dst, size_t size);
+// Return the index of the most recently completed frame's ring slot and
+// consume it (each frame is reported at most once), or -1 if no new frame
+// completed since the last take. Safe to call from any thread.
+int Dolphin_TakeLatestFrameSurface(void);
 
 #ifdef __cplusplus
 }

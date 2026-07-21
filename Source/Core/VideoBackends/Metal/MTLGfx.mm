@@ -29,51 +29,53 @@ void Metal::Gfx::SetFrameCaptureCallback(std::function<void(id<MTLTexture>)> cal
 
 // C-linkage API for ARC-compiled callers (avoids MRCHelpers.h include)
 // The mutex makes the capture handoff safe under dual-core: PresentBackbuffer
-// writes s_capture_buffer on the video thread while the bridge copies it out
-// from the CPU thread's VI hook. (Single-core is sequential and never contends.)
+// publishes the ready slot from Metal's completion thread while the bridge
+// takes it from the CPU thread's VI hook.
 static std::mutex s_capture_mutex;
-static uint8_t* s_capture_buffer = nullptr;
-static bool s_capture_frame_ready = false;
+static constexpr int MAX_CAPTURE_SURFACES = 8;
+static IOSurfaceRef s_capture_surfaces[MAX_CAPTURE_SURFACES];
+static MRCOwned<id<MTLTexture>> s_capture_textures[MAX_CAPTURE_SURFACES];
+static int s_capture_surface_count = 0;
+static int s_capture_write_index = 0;   // video thread only
+static int s_capture_ready_index = -1;  // guarded by s_capture_mutex
 
-extern "C" void Dolphin_SetFrameCaptureBuffer(uint8_t* buffer)
+extern "C" void Dolphin_SetFrameCaptureSurfaces(const IOSurfaceRef* surfaces, int count)
 {
   std::lock_guard<std::mutex> lock(s_capture_mutex);
-  s_capture_buffer = buffer;
-  if (buffer)
+  for (int i = 0; i < s_capture_surface_count; i++)
   {
-    // Non-null sentinel — actual readback happens in PresentBackbuffer()
-    // via blit encoder + shared staging buffer.
+    CFRelease(s_capture_surfaces[i]);
+    s_capture_surfaces[i] = nullptr;
+    s_capture_textures[i] = nullptr;
+  }
+  s_capture_surface_count = 0;
+  s_capture_write_index = 0;
+  s_capture_ready_index = -1;
+
+  if (surfaces && count > 0)
+  {
+    if (count > MAX_CAPTURE_SURFACES)
+      count = MAX_CAPTURE_SURFACES;
+    for (int i = 0; i < count; i++)
+      s_capture_surfaces[i] = (IOSurfaceRef)CFRetain(surfaces[i]);
+    s_capture_surface_count = count;
+    // Non-null sentinel — the actual blit happens in PresentBackbuffer().
+    // (Textures wrapping the surfaces are created lazily there; g_device may
+    // not exist yet when the frontend registers the ring.)
     s_frame_capture_callback = [](id<MTLTexture>) {};
   }
   else
   {
     s_frame_capture_callback = nullptr;
-    s_capture_frame_ready = false;
   }
 }
 
-extern "C" bool Dolphin_IsFrameReady(void)
-{
-  return s_capture_frame_ready;
-}
-
-extern "C" void Dolphin_ClearFrameReady(void)
-{
-  s_capture_frame_ready = false;
-}
-
-// Atomic take: copy the latest captured frame into dst and consume the ready
-// flag, all under the capture mutex. Returns false if no frame is ready.
-// Callers use this instead of the IsFrameReady/memcpy/ClearFrameReady sequence,
-// which tears against the video thread's writer under dual-core.
-extern "C" bool Dolphin_CopyCapturedFrame(uint8_t* dst, size_t size)
+extern "C" int Dolphin_TakeLatestFrameSurface(void)
 {
   std::lock_guard<std::mutex> lock(s_capture_mutex);
-  if (!s_capture_frame_ready || !s_capture_buffer || !dst)
-    return false;
-  memcpy(dst, s_capture_buffer, size);
-  s_capture_frame_ready = false;
-  return true;
+  const int index = s_capture_ready_index;
+  s_capture_ready_index = -1;
+  return index;
 }
 
 Metal::Gfx::Gfx(MRCOwned<CAMetalLayer*> layer) : m_layer(std::move(layer))
@@ -532,52 +534,70 @@ void Metal::Gfx::PresentBackbuffer()
     {
       if (s_frame_capture_callback)
       {
-        // Offscreen capture path: blit drawable texture into a shared-memory staging
-        // buffer, commit + wait for GPU, then memcpy to the capture buffer.
-        // Previous approach called [texture getBytes:] before the command buffer was
-        // committed, which is undefined (texture data not yet rendered by GPU).
+        // Zero-copy offscreen capture path: blit the drawable texture into the
+        // next slot of the frontend's IOSurface ring on the GPU, and publish
+        // the slot index from the command buffer's COMPLETION handler. The
+        // frame never touches the CPU — the frontend displays the IOSurface
+        // directly. (An earlier version blitted to a staging buffer and
+        // memcpy'd it out after WaitForFlushedEncoders — a GPU-completion
+        // stall on the video thread that grew with scene cost, plus two
+        // full-frame CPU copies per present.) The frame the frontend consumes
+        // can trail by one present, which the VI-hook handoff tolerates.
         id<MTLTexture> tex = [m_drawable texture];
-        int w = (int)tex.width;
-        int h = (int)tex.height;
-        size_t bytes_per_row = w * 4;
-        size_t buffer_size = bytes_per_row * h;
+        const int w = (int)tex.width;
+        const int h = (int)tex.height;
 
-        // Lazy-allocate (or reallocate if size changed) the shared staging buffer
-        if (!m_capture_staging_buffer || [m_capture_staging_buffer length] < buffer_size)
+        int slot = -1;
+        id<MTLTexture> dst = nil;
         {
-          m_capture_staging_buffer =
-              MRCTransfer([g_device newBufferWithLength:buffer_size
-                                               options:MTLResourceStorageModeShared]);
+          std::lock_guard<std::mutex> lock(s_capture_mutex);
+          if (s_capture_surface_count > 0 && w > 0 && h > 0)
+          {
+            slot = s_capture_write_index;
+            s_capture_write_index = (slot + 1) % s_capture_surface_count;
+
+            IOSurfaceRef surface = s_capture_surfaces[slot];
+            if (!s_capture_textures[slot] && (int)IOSurfaceGetWidth(surface) == w &&
+                (int)IOSurfaceGetHeight(surface) == h)
+            {
+              MTLTextureDescriptor* desc = [MTLTextureDescriptor
+                  texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                               width:w
+                                              height:h
+                                           mipmapped:NO];
+              s_capture_textures[slot] =
+                  MRCTransfer([g_device newTextureWithDescriptor:desc iosurface:surface plane:0]);
+            }
+            dst = s_capture_textures[slot];
+          }
         }
 
-        // Blit drawable texture → staging buffer (same pattern as StagingTexture::CopyFromTexture)
-        id<MTLBlitCommandEncoder> blit =
-            [g_state_tracker->GetRenderCmdBuf() blitCommandEncoder];
-        [blit copyFromTexture:tex
-                  sourceSlice:0
-                  sourceLevel:0
-                 sourceOrigin:MTLOriginMake(0, 0, 0)
-                   sourceSize:MTLSizeMake(w, h, 1)
-                     toBuffer:m_capture_staging_buffer
-            destinationOffset:0
-       destinationBytesPerRow:bytes_per_row
-     destinationBytesPerImage:buffer_size];
-        [blit endEncoding];
+        if (dst)
+        {
+          id<MTLBlitCommandEncoder> blit =
+              [g_state_tracker->GetRenderCmdBuf() blitCommandEncoder];
+          [blit copyFromTexture:tex
+                    sourceSlice:0
+                    sourceLevel:0
+                   sourceOrigin:MTLOriginMake(0, 0, 0)
+                     sourceSize:MTLSizeMake(w, h, 1)
+                      toTexture:dst
+               destinationSlice:0
+               destinationLevel:0
+              destinationOrigin:MTLOriginMake(0, 0, 0)];
+          [blit endEncoding];
+
+          [g_state_tracker->GetRenderCmdBuf()
+              addCompletedHandler:[slot](id<MTLCommandBuffer>) {
+                std::lock_guard<std::mutex> lock(s_capture_mutex);
+                // Guard against a ring swap between encode and completion.
+                if (slot < s_capture_surface_count)
+                  s_capture_ready_index = slot;
+              }];
+        }
 
         m_backbuffer->UpdateBackbufferTexture(nullptr);
         g_state_tracker->FlushEncoders();
-        g_state_tracker->WaitForFlushedEncoders();
-
-        // GPU is done — staging buffer now has the rendered frame
-        if (w > 0 && h > 0)
-        {
-          std::lock_guard<std::mutex> lock(s_capture_mutex);
-          if (s_capture_buffer)
-          {
-            memcpy(s_capture_buffer, [m_capture_staging_buffer contents], buffer_size);
-            s_capture_frame_ready = true;
-          }
-        }
 
         m_drawable = nullptr;
         return;

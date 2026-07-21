@@ -83,7 +83,6 @@ private:
   MRCOwned<id<CAMetalDrawable>> m_drawable;
   std::unique_ptr<Texture> m_bb_texture;
   std::unique_ptr<Framebuffer> m_backbuffer;
-  MRCOwned<id<MTLBuffer>> m_capture_staging_buffer;
   u32 m_texture_counter = 0;
   u32 m_staging_texture_counter = 0;
   std::array<u32, 4> m_shader_counter = {};
