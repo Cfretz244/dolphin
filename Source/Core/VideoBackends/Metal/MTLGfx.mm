@@ -18,6 +18,7 @@
 #include "VideoCommon/VideoBackendBase.h"
 
 #include <fstream>
+#include <mutex>
 
 static std::function<void(id<MTLTexture>)> s_frame_capture_callback;
 
@@ -27,11 +28,16 @@ void Metal::Gfx::SetFrameCaptureCallback(std::function<void(id<MTLTexture>)> cal
 }
 
 // C-linkage API for ARC-compiled callers (avoids MRCHelpers.h include)
+// The mutex makes the capture handoff safe under dual-core: PresentBackbuffer
+// writes s_capture_buffer on the video thread while the bridge copies it out
+// from the CPU thread's VI hook. (Single-core is sequential and never contends.)
+static std::mutex s_capture_mutex;
 static uint8_t* s_capture_buffer = nullptr;
 static bool s_capture_frame_ready = false;
 
 extern "C" void Dolphin_SetFrameCaptureBuffer(uint8_t* buffer)
 {
+  std::lock_guard<std::mutex> lock(s_capture_mutex);
   s_capture_buffer = buffer;
   if (buffer)
   {
@@ -54,6 +60,20 @@ extern "C" bool Dolphin_IsFrameReady(void)
 extern "C" void Dolphin_ClearFrameReady(void)
 {
   s_capture_frame_ready = false;
+}
+
+// Atomic take: copy the latest captured frame into dst and consume the ready
+// flag, all under the capture mutex. Returns false if no frame is ready.
+// Callers use this instead of the IsFrameReady/memcpy/ClearFrameReady sequence,
+// which tears against the video thread's writer under dual-core.
+extern "C" bool Dolphin_CopyCapturedFrame(uint8_t* dst, size_t size)
+{
+  std::lock_guard<std::mutex> lock(s_capture_mutex);
+  if (!s_capture_frame_ready || !s_capture_buffer || !dst)
+    return false;
+  memcpy(dst, s_capture_buffer, size);
+  s_capture_frame_ready = false;
+  return true;
 }
 
 Metal::Gfx::Gfx(MRCOwned<CAMetalLayer*> layer) : m_layer(std::move(layer))
@@ -549,10 +569,14 @@ void Metal::Gfx::PresentBackbuffer()
         g_state_tracker->WaitForFlushedEncoders();
 
         // GPU is done — staging buffer now has the rendered frame
-        if (s_capture_buffer && w > 0 && h > 0)
+        if (w > 0 && h > 0)
         {
-          memcpy(s_capture_buffer, [m_capture_staging_buffer contents], buffer_size);
-          s_capture_frame_ready = true;
+          std::lock_guard<std::mutex> lock(s_capture_mutex);
+          if (s_capture_buffer)
+          {
+            memcpy(s_capture_buffer, [m_capture_staging_buffer contents], buffer_size);
+            s_capture_frame_ready = true;
+          }
         }
 
         m_drawable = nullptr;

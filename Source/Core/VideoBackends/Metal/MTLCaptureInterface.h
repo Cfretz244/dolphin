@@ -8,6 +8,7 @@
 // ObjC++/ARC bridge can include it without pulling in Dolphin C++ headers.
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -19,6 +20,12 @@ extern "C" {
 void Dolphin_SetFrameCaptureBuffer(uint8_t* buffer);
 bool Dolphin_IsFrameReady(void);
 void Dolphin_ClearFrameReady(void);
+
+// Copy the latest captured frame into dst (size bytes) and consume the ready
+// flag as one atomic operation; returns false if no frame is ready. Use this
+// instead of IsFrameReady/ClearFrameReady + a manual copy — that sequence
+// tears against the video thread's writer when Dolphin runs dual-core.
+bool Dolphin_CopyCapturedFrame(uint8_t* dst, size_t size);
 
 #ifdef __cplusplus
 }
