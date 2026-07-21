@@ -6,13 +6,16 @@
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <list>
 #include <map>
 #include <optional>
 #include <queue>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <OptionParser.h>
@@ -192,6 +195,102 @@ static bool ReadTraceFile(const std::string& path, TraceData& out)
   }
 
   return true;
+}
+
+// ============================================================================
+// Trace merging (multi-trace union)
+// ============================================================================
+
+// Union a later-run trace file into an accumulated one. Coverage data (blocks, edges,
+// seeds, dynamic targets, SMC regions, vertex formats) unions by value. The v4
+// snapshot/invalidation timeline is per-run — the shared event counter restarts for
+// every trace file — so the incoming run's counters are rebased past the accumulated
+// maximum, making runs sequential segments of one timeline: intra-run co-residency
+// ordering is preserved, and cross-run reuse of an arena address resolves through the
+// byte-conflict path (the authoritative generation boundary; see OverlayImages.h).
+static void MergeTraceData(TraceData& dst, TraceData&& src)
+{
+  u64 max_counter = 0;
+  for (const auto& ev : dst.smc_events)
+    max_counter = std::max(max_counter, ev.counter);
+  for (const auto& sb : dst.snapshot_blocks)
+    for (const auto& snap : sb.snapshots)
+      for (u64 e : snap.epochs)
+        max_counter = std::max(max_counter, e);
+  const u64 rebase =
+      (dst.smc_events.empty() && dst.snapshot_blocks.empty()) ? 0 : max_counter + 1;
+
+  std::set<std::pair<u32, u32>> have_blocks;
+  for (const auto& b : dst.blocks)
+    have_blocks.emplace(b.addr, b.size);
+  for (const auto& b : src.blocks)
+    if (have_blocks.emplace(b.addr, b.size).second)
+      dst.blocks.push_back(b);
+
+  std::set<std::tuple<u32, u32, u8>> have_edges;
+  for (const auto& e : dst.edges)
+    have_edges.emplace(e.from, e.to, e.type);
+  for (const auto& e : src.edges)
+  {
+    if (have_edges.emplace(e.from, e.to, e.type).second)
+    {
+      dst.edges.push_back(e);
+      if (e.type == 1)  // dynamic
+        dst.dynamic_targets.emplace(e.from, e.to);
+    }
+  }
+
+  dst.seed_addresses.insert(src.seed_addresses.begin(), src.seed_addresses.end());
+
+  std::set<std::pair<u32, u32>> have_smc;
+  for (const auto& r : dst.smc_regions)
+    have_smc.emplace(r.addr, r.length);
+  for (const auto& r : src.smc_regions)
+    if (have_smc.emplace(r.addr, r.length).second)
+      dst.smc_regions.push_back(r);
+
+  for (auto& ev : src.smc_events)
+  {
+    ev.counter += rebase;
+    dst.smc_events.push_back(ev);
+  }
+
+  std::set<std::tuple<u32, u32, u32, u32, u32>> have_fmts;
+  for (const auto& f : dst.vertex_formats)
+    have_fmts.emplace(f.vtx_desc_low, f.vtx_desc_high, f.vat_g0, f.vat_g1, f.vat_g2);
+  for (const auto& f : src.vertex_formats)
+    if (have_fmts.emplace(f.vtx_desc_low, f.vtx_desc_high, f.vat_g0, f.vat_g1, f.vat_g2).second)
+      dst.vertex_formats.push_back(f);
+
+  std::map<u32, size_t> block_index;
+  for (size_t i = 0; i < dst.snapshot_blocks.size(); i++)
+    block_index.emplace(dst.snapshot_blocks[i].addr, i);
+  for (auto& sb : src.snapshot_blocks)
+  {
+    for (auto& snap : sb.snapshots)
+      for (u64& e : snap.epochs)
+        e += rebase;
+    auto it = block_index.find(sb.addr);
+    if (it == block_index.end())
+    {
+      block_index.emplace(sb.addr, dst.snapshot_blocks.size());
+      dst.snapshot_blocks.push_back(std::move(sb));
+      continue;
+    }
+    auto& dst_sb = dst.snapshot_blocks[it->second];
+    for (auto& snap : sb.snapshots)
+    {
+      auto same = std::find_if(dst_sb.snapshots.begin(), dst_sb.snapshots.end(),
+                               [&](const TraceSnapshot& s) { return s.crc32 == snap.crc32; });
+      // Same content re-observed in a later run: extend that version's epoch list (the
+      // rebased epochs are strictly later, so the list stays sorted). New content — or a
+      // CRC collision with different words — becomes a new version.
+      if (same != dst_sb.snapshots.end() && same->words == snap.words)
+        same->epochs.insert(same->epochs.end(), snap.epochs.begin(), snap.epochs.end());
+      else
+        dst_sb.snapshots.push_back(std::move(snap));
+    }
+  }
 }
 
 // ============================================================================
@@ -1319,7 +1418,9 @@ int CfgCommand(const std::vector<std::string>& args)
   parser.usage("usage: dolphin-tool cfg [options]");
 
   parser.add_option("-i", "--iso").action("store").help("Path to GameCube/Wii disc image");
-  parser.add_option("-t", "--trace").action("store").help("Path to .dpht trace file");
+  parser.add_option("-t", "--trace")
+      .action("append")
+      .help("Path to .dpht trace file (repeatable — multiple traces union into one CFG)");
   parser.add_option("-o", "--output").action("store").help("Path to output SQLite database");
   parser.add_option("-v", "--verbose").action("store_true").help("Print detailed progress");
   parser.add_option("--no-rels")
@@ -1335,9 +1436,12 @@ int CfgCommand(const std::vector<std::string>& args)
       .set_default("8")
       .help("Exclude arena addresses with more than this many content versions as "
             "genuine self-modifying code (default: %default)");
-  parser.add_option("--no-overlays")
+  parser.add_option("--overlays")
       .action("store_true")
-      .help("Skip overlay-image clustering of v4 instruction snapshots");
+      .help("Enable overlay-image clustering of v4 instruction snapshots. Only for "
+            "Camelot-style overlay engines (e.g. Mario Power Tennis) that stream code "
+            "into a RAM arena; games whose out-of-DOL code is REL modules would get "
+            "garbage images from their REL-resident snapshots");
 
   const optparse::Values options = parser.parse_args(args);
 
@@ -1348,11 +1452,11 @@ int CfgCommand(const std::vector<std::string>& args)
   }
 
   const std::string iso_path = options["iso"];
-  const std::string trace_path = options["trace"];
+  const std::list<std::string>& trace_paths = options.all("trace");
   const std::string output_path = options["output"];
   const bool verbose = options.is_set("verbose");
   const bool no_rels = options.is_set("no_rels");
-  const bool no_overlays = options.is_set("no_overlays");
+  const bool overlays = options.is_set("overlays");
   const u32 overlay_gap = static_cast<u32>(std::strtoul(options["overlay_gap"].c_str(), nullptr, 0));
   const u32 overlay_max_versions =
       static_cast<u32>(std::strtoul(options["overlay_max_versions"].c_str(), nullptr, 0));
@@ -1433,10 +1537,27 @@ int CfgCommand(const std::vector<std::string>& args)
                  modules.size(), total_relocs, dol_seeds.size());
   }
 
-  // 3. Read trace data
+  // 3. Read trace data (one or more .dpht files — later files union into the first)
   TraceData trace;
-  if (!ReadTraceFile(trace_path, trace))
-    return EXIT_FAILURE;
+  bool first_trace = true;
+  for (const std::string& path : trace_paths)
+  {
+    if (first_trace)
+    {
+      if (!ReadTraceFile(path, trace))
+        return EXIT_FAILURE;
+      first_trace = false;
+      continue;
+    }
+    TraceData extra;
+    if (!ReadTraceFile(path, extra))
+      return EXIT_FAILURE;
+    const size_t before_blocks = trace.blocks.size();
+    const size_t before_edges = trace.edges.size();
+    MergeTraceData(trace, std::move(extra));
+    fmt::println(std::cerr, "Merged trace {}: +{} new blocks, +{} new edges", path,
+                 trace.blocks.size() - before_blocks, trace.edges.size() - before_edges);
+  }
   trace.static_seeds = std::move(dol_seeds);
 
   u32 dynamic_count = 0;
@@ -1445,8 +1566,8 @@ int CfgCommand(const std::vector<std::string>& args)
     if (e.type == 1)
       dynamic_count++;
   }
-  fmt::println(std::cerr, "Trace: {} seed blocks, {} edges ({} dynamic)", trace.blocks.size(),
-               trace.edges.size(), dynamic_count);
+  fmt::println(std::cerr, "Trace: {} seed blocks, {} edges ({} dynamic) from {} file(s)",
+               trace.blocks.size(), trace.edges.size(), dynamic_count, trace_paths.size());
 
   // 4. Run recursive descent disassembly
   std::map<u32, CFGBlock> blocks;
@@ -1545,10 +1666,26 @@ int CfgCommand(const std::vector<std::string>& args)
   }
 
   // 7. Overlay images from v4 instruction snapshots: cluster the arena (non-DOL)
-  // captures into content-hashed images and build a CFG per image.
+  // captures into content-hashed images and build a CFG per image. Opt-in
+  // (--overlays): only Camelot-style engines stream code into a RAM arena; for
+  // REL-based games the same snapshots are module code already covered by the
+  // static REL pass, and clustering them produces garbage images.
   std::vector<OverlayImage> overlay_images;
   std::vector<OverlayCfg> overlay_cfgs;
-  if (!no_overlays && !trace.snapshot_blocks.empty())
+  if (!overlays && !trace.snapshot_blocks.empty())
+  {
+    const auto arena_count =
+        std::count_if(trace.snapshot_blocks.begin(), trace.snapshot_blocks.end(),
+                      [&](const TraceSnapshotBlock& sb) { return !memory.IsCodeAddress(sb.addr); });
+    if (arena_count > 0)
+    {
+      fmt::println(std::cerr,
+                   "Note: {} non-DOL instruction-snapshot blocks present but overlay clustering "
+                   "is off (pass --overlays for Camelot-style overlay games)",
+                   arena_count);
+    }
+  }
+  if (overlays && !trace.snapshot_blocks.empty())
   {
     std::vector<TraceSnapshotBlock> arena_blocks;
     for (auto& sb : trace.snapshot_blocks)
