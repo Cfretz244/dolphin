@@ -29,6 +29,9 @@ add_library(videometal
 
 find_library(METAL_LIBRARY Metal)
 find_library(QUARTZCORE_LIBRARY QuartzCore)
+# MTLGfx.mm's zero-copy capture path (Dolphin_SetFrameCaptureSurfaces) uses the
+# IOSurface C API; the iOS build links it via the GCDeltaCore Xcode project.
+find_library(IOSURFACE_LIBRARY IOSurface)
 
 target_link_libraries(videometal
 PUBLIC
@@ -39,6 +42,7 @@ PRIVATE
   ${FOUNDATION_LIBRARY}
   ${METAL_LIBRARY}
   ${QUARTZCORE_LIBRARY}
+  ${IOSURFACE_LIBRARY}
 )
 
 target_compile_options(videometal PRIVATE -fno-objc-arc)
