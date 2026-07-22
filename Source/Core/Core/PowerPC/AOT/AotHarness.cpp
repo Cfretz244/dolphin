@@ -984,14 +984,24 @@ void AotHarness::RunDiff()
         }
         if (compare_repeat_count >= 3)
         {
-          // Already verified this block — run AOT without comparison
-          s32 saved_dc = m_ppc_state.downcount;
-          m_ppc_state.downcount = static_cast<s32>(num_instr);
-          aot_single_block_mode = 1;
-          auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
-          aot_block_fn(aot_state);
-          aot_single_block_mode = 0;
-          m_ppc_state.downcount = saved_dc - static_cast<s32>(num_instr);
+          // Already verified this block — run without comparison. Self-diff
+          // mode has no AOT function (aot_block_fn is null by design), so it
+          // drains the loop via the interpreter instead.
+          if (aot_block_fn)
+          {
+            s32 saved_dc = m_ppc_state.downcount;
+            m_ppc_state.downcount = static_cast<s32>(num_instr);
+            aot_single_block_mode = 1;
+            auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
+            aot_block_fn(aot_state);
+            aot_single_block_mode = 0;
+            m_ppc_state.downcount = saved_dc - static_cast<s32>(num_instr);
+          }
+          else
+          {
+            RunInterpreterBlock(interp, block_pc, num_instr);
+            m_ppc_state.downcount -= static_cast<s32>(num_instr);
+          }
           if (m_ppc_state.Exceptions != 0)
           {
             m_ppc_state.npc = m_ppc_state.pc;
@@ -1065,16 +1075,24 @@ void AotHarness::RunDiff()
         // Also save RAM separately for comparison
         std::memcpy(m_ram_shadow, memory.GetRAM(), ram_size);
 
-        // Run AOT single-block with MMIO capture
+        // Run AOT single-block with MMIO capture (self-diff: interpreter
+        // plays the AOT side — aot_block_fn is null by design there)
         MMIOCaptureReset();
         g_mmio_capture_active = true;
         {
           s32 saved_dc = m_ppc_state.downcount;
           m_ppc_state.downcount = static_cast<s32>(num_instr);
-          aot_single_block_mode = 1;
-          auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
-          aot_block_fn(aot_state);
-          aot_single_block_mode = 0;
+          if (aot_block_fn)
+          {
+            aot_single_block_mode = 1;
+            auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
+            aot_block_fn(aot_state);
+            aot_single_block_mode = 0;
+          }
+          else
+          {
+            RunInterpreterBlock(interp, block_pc, num_instr, /*ignore_exceptions=*/true);
+          }
           m_ppc_state.downcount = saved_dc - static_cast<s32>(num_instr);
         }
         g_mmio_capture_active = false;
@@ -1189,14 +1207,21 @@ void AotHarness::RunDiff()
       // 2. Save pre-RAM
       std::memcpy(m_ram_shadow, memory.GetRAM(), ram_size);
 
-      // 3. Run AOT single-block
+      // 3. Run AOT single-block (self-diff: interpreter plays the AOT side)
       {
         s32 saved_dc = m_ppc_state.downcount;
         m_ppc_state.downcount = static_cast<s32>(num_instr);
-        aot_single_block_mode = 1;
-        auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
-        aot_block_fn(aot_state);
-        aot_single_block_mode = 0;
+        if (aot_block_fn)
+        {
+          aot_single_block_mode = 1;
+          auto* aot_state = reinterpret_cast<AOTState*>(&m_ppc_state);
+          aot_block_fn(aot_state);
+          aot_single_block_mode = 0;
+        }
+        else
+        {
+          RunInterpreterBlock(interp, block_pc, num_instr, /*ignore_exceptions=*/false);
+        }
         m_ppc_state.downcount = saved_dc - static_cast<s32>(num_instr);
       }
 
