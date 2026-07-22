@@ -53,6 +53,7 @@ std::vector<u8> MaybeYaz0(std::vector<u8> data, const std::string& name)
 struct DiscoveryState
 {
   const DiscIO::Volume* volume;
+  DiscIO::Partition partition = DiscIO::PARTITION_NONE;
   std::vector<RelFile> modules;
   std::set<u32> seen_ids;
   u32 parse_failures = 0;
@@ -113,8 +114,8 @@ void ScanDirectory(DiscoveryState& state, const DiscIO::FileInfo& directory)
       continue;
 
     std::vector<u8> data(entry.GetSize());
-    const u64 read = DiscIO::ReadFile(*state.volume, DiscIO::PARTITION_NONE, &entry, data.data(),
-                                      data.size());
+    const u64 read =
+        DiscIO::ReadFile(*state.volume, state.partition, &entry, data.data(), data.size());
     if (read != data.size())
     {
       fmt::println(std::cerr, "Warning: short read of {} ({}/{} bytes)", name, read, data.size());
@@ -136,9 +137,12 @@ std::vector<RelFile> DiscoverRelModules(const DiscIO::Volume& volume, bool verbo
 {
   DiscoveryState state;
   state.volume = &volume;
+  // Wii discs keep their filesystem inside the game partition;
+  // GetGamePartition() returns PARTITION_NONE for GC volumes.
+  state.partition = volume.GetGamePartition();
   state.verbose = verbose;
 
-  const DiscIO::FileSystem* fs = volume.GetFileSystem(DiscIO::PARTITION_NONE);
+  const DiscIO::FileSystem* fs = volume.GetFileSystem(state.partition);
   if (!fs || !fs->IsValid())
   {
     fmt::println(std::cerr, "Warning: disc has no readable filesystem; no REL modules scanned");

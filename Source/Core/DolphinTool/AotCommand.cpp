@@ -159,9 +159,15 @@ int AotCommand(const std::vector<std::string>& args)
   else
     prefix = volume->GetGameID();
 
-  auto dol_offset = DiscIO::GetBootDOLOffset(*volume, DiscIO::PARTITION_NONE);
-  auto dol_size = dol_offset ? DiscIO::GetBootDOLSize(*volume, DiscIO::PARTITION_NONE, *dol_offset)
-                             : std::nullopt;
+  // Wii discs keep the boot DOL inside the game partition;
+  // GetGamePartition() returns PARTITION_NONE for GC volumes. The sha256
+  // below must hash the same bytes AOTCore::VerifyImageIdentity() reads —
+  // that path is already partition-aware.
+  const DiscIO::Partition partition = volume->GetGamePartition();
+
+  auto dol_offset = DiscIO::GetBootDOLOffset(*volume, partition);
+  auto dol_size =
+      dol_offset ? DiscIO::GetBootDOLSize(*volume, partition, *dol_offset) : std::nullopt;
   if (!dol_offset || !dol_size)
   {
     fmt::println(std::cerr, "Error: Cannot find/read DOL");
@@ -169,7 +175,7 @@ int AotCommand(const std::vector<std::string>& args)
   }
 
   std::vector<u8> dol_buffer(*dol_size);
-  volume->Read(*dol_offset, *dol_size, dol_buffer.data(), DiscIO::PARTITION_NONE);
+  volume->Read(*dol_offset, *dol_size, dol_buffer.data(), partition);
 
   // Source-image identity, embedded in the generated library and verified by
   // AOTCore at launch: a library run against a different image executes
@@ -356,6 +362,35 @@ int AotCommand(const std::vector<std::string>& args)
       table_max_addr = std::max(table_max_addr, b.ppc_addr);
     }
   }
+  // The flat table spans a single contiguous [base, max] range. A block
+  // outside MEM1 (e.g. Wii MEM2 at 0x90000000) would balloon it to hundreds
+  // of millions of entries, so refuse rather than emit a multi-GB table.
+  // MEM2-resident code must instead reach dispatch through the module
+  // tracker's per-range tables; if a Wii title ever ships static MEM2 text
+  // in its DOL, the fix is per-region tables selected on (pc >> 28), not a
+  // wider extent here.
+  {
+    u32 out_of_range = 0;
+    u32 first_bad_addr = 0;
+    for (const auto& b : cfg_blocks)
+    {
+      if (b.is_translatable && b.ppc_addr >= 0x82000000u)
+      {
+        if (out_of_range == 0)
+          first_bad_addr = b.ppc_addr;
+        out_of_range++;
+      }
+    }
+    if (out_of_range > 0)
+    {
+      fmt::println(std::cerr,
+                   "Error: {} translatable block(s) outside MEM1 (first at {:#010x}); "
+                   "the flat dispatch table cannot span them",
+                   out_of_range, first_bad_addr);
+      return EXIT_FAILURE;
+    }
+  }
+
   // Align base to 4-byte boundary
   table_base &= ~3u;
   const u32 table_entries = ((table_max_addr - table_base) >> 2) + 1;

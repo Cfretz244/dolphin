@@ -1469,14 +1469,18 @@ int CfgCommand(const std::vector<std::string>& args)
     return EXIT_FAILURE;
   }
 
-  auto dol_offset = DiscIO::GetBootDOLOffset(*volume, DiscIO::PARTITION_NONE);
+  // Wii discs keep the boot DOL inside the game partition;
+  // GetGamePartition() returns PARTITION_NONE for GC volumes.
+  const DiscIO::Partition partition = volume->GetGamePartition();
+
+  auto dol_offset = DiscIO::GetBootDOLOffset(*volume, partition);
   if (!dol_offset)
   {
     fmt::println(std::cerr, "Error: Cannot find DOL in disc image");
     return EXIT_FAILURE;
   }
 
-  auto dol_size = DiscIO::GetBootDOLSize(*volume, DiscIO::PARTITION_NONE, *dol_offset);
+  auto dol_size = DiscIO::GetBootDOLSize(*volume, partition, *dol_offset);
   if (!dol_size)
   {
     fmt::println(std::cerr, "Error: Cannot determine DOL size");
@@ -1484,7 +1488,7 @@ int CfgCommand(const std::vector<std::string>& args)
   }
 
   std::vector<u8> dol_buffer(*dol_size);
-  if (!volume->Read(*dol_offset, *dol_size, dol_buffer.data(), DiscIO::PARTITION_NONE))
+  if (!volume->Read(*dol_offset, *dol_size, dol_buffer.data(), partition))
   {
     fmt::println(std::cerr, "Error: Cannot read DOL data");
     return EXIT_FAILURE;
