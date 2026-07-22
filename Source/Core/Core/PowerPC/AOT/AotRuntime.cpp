@@ -139,6 +139,8 @@ static UGeckoInstruction MakeCRInst(int crfd, int fa, int fb)
 
 static u8* s_ram_ptr = nullptr;
 static u32 s_ram_size = 0;
+static u8* s_exram_ptr = nullptr;  // Wii MEM2 host buffer; null on GC
+static u32 s_exram_size = 0;
 static u8* s_l1_ptr = nullptr;
 static u32 s_l1_size = 0;
 
@@ -146,14 +148,17 @@ static u32 s_l1_size = 0;
 static bool s_track_fallbacks = false;
 static std::unordered_map<u32, u64> s_fallback_counts;
 
-// Check if address is in main RAM (cached or uncached mirror)
+// Check if address is in guest RAM: MEM1 (cached or uncached mirror), or on
+// Wii, MEM2 at 0x90000000/0xD0000000. Low-memory (0x0xxxxxxx) and 0x4xxxxxxx
+// accesses must take the slow path: with MSR.DR=1 the interpreter raises a
+// DSI for them (BAT miss), so the fast path must not silently satisfy them
+// from RAM. Must mirror aot_host_ptr in aot_runtime.h exactly.
 static inline bool IsRAMAddress(u32 addr)
 {
-  // 0x80000000-0x81800000 (cached) or 0xC0000000-0xC1800000 (uncached) only.
-  // Low-memory (0x0xxxxxxx) and 0x4xxxxxxx accesses must take the slow path:
-  // with MSR.DR=1 the interpreter raises a DSI for them (BAT miss), so the fast
-  // path must not silently satisfy them from RAM.
-  return ((addr & ~AOT_MEM_UNCACHED_BIT) - AOT_MEM_CACHED_BASE) < s_ram_size;
+  const u32 off1 = (addr & ~AOT_MEM_UNCACHED_BIT) - AOT_MEM_CACHED_BASE;
+  if (off1 < s_ram_size)
+    return true;
+  return (off1 - AOT_MEM2_FOLDED_OFFSET) < s_exram_size;
 }
 
 // Resolve an effective address to a host pointer for fast-path access: main RAM
@@ -165,8 +170,12 @@ static inline bool IsRAMAddress(u32 addr)
 // unmapped) → slow path.
 static inline u8* FastMemHostPtr(u32 addr)
 {
-  if (IsRAMAddress(addr))
-    return s_ram_ptr + (addr & AOT_MEM_OFFSET_MASK);
+  const u32 off1 = (addr & ~AOT_MEM_UNCACHED_BIT) - AOT_MEM_CACHED_BASE;
+  if (off1 < s_ram_size)
+    return s_ram_ptr + off1;
+  const u32 off2 = off1 - AOT_MEM2_FOLDED_OFFSET;
+  if (off2 < s_exram_size)
+    return s_exram_ptr + off2;
   // The +8 guard keeps the largest fast-path access (paired u32) inside the
   // small L1 buffer; the final few bytes fall back to the checked slow path.
   if (s_l1_ptr != nullptr && (addr >> 28) == 0xE && addr + 8 <= 0xE0000000u + s_l1_size)
@@ -184,7 +193,7 @@ extern "C"
 // RAM fast-path descriptor exported to generated code: aot_runtime.h inlines
 // the RAM fast path into every block and calls the aot_*_slow functions below
 // for everything else. AotFastMem itself is defined in aot_runtime.h.
-AotFastMem aot_fast_mem = {nullptr, 0};
+AotFastMem aot_fast_mem = {nullptr, 0, nullptr, 0};
 
 void aot_init_fast_mem()
 {
@@ -193,10 +202,16 @@ void aot_init_fast_mem()
   s_mmu = &s_system->GetMMU();
   s_ram_ptr = s_system->GetMemory().GetRAM();
   s_ram_size = s_system->GetMemory().GetRamSizeReal();
+  // CAUTION: GetExRamSizeReal() reports the retail MEM2 size even on GC —
+  // only the allocation is Wii-gated. Key everything off the pointer.
+  s_exram_ptr = s_system->GetMemory().GetEXRAM();
+  s_exram_size = s_exram_ptr ? s_system->GetMemory().GetExRamSizeReal() : 0;
   s_l1_ptr = s_system->GetMemory().GetL1Cache();
   s_l1_size = s_system->GetMemory().GetL1CacheSize();
   aot_fast_mem.ram = s_ram_ptr;
   aot_fast_mem.size = s_ram_size;
+  aot_fast_mem.exram = s_exram_ptr;
+  aot_fast_mem.exram_size = s_exram_size;
 }
 
 // Counterpart to aot_init_fast_mem, called from AOTCore::Shutdown. The RAM/L1
@@ -209,10 +224,14 @@ void aot_shutdown()
   s_mmu = nullptr;
   s_ram_ptr = nullptr;
   s_ram_size = 0;
+  s_exram_ptr = nullptr;
+  s_exram_size = 0;
   s_l1_ptr = nullptr;
   s_l1_size = 0;
   aot_fast_mem.ram = nullptr;
   aot_fast_mem.size = 0;
+  aot_fast_mem.exram = nullptr;
+  aot_fast_mem.exram_size = 0;
   s_track_fallbacks = false;
   s_fallback_counts.clear();
 }

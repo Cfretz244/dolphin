@@ -72,20 +72,34 @@ void RescanModules()
   auto& memory = Core::System::GetInstance().GetMemory();
   const u8* ram = memory.GetRAM();
   const u32 ram_size = memory.GetRamSizeReal();
+  // GetExRamSizeReal() reports the retail MEM2 size even on GC — only the
+  // allocation is Wii-gated, so key off the pointer.
+  const u8* exram = memory.GetEXRAM();
+  const u32 exram_size = exram ? memory.GetExRamSizeReal() : 0;
   if (!ram)
     return;
 
+  // Resolve an effective address to a host pointer with `size` readable
+  // bytes: MEM1 (0x80000000/0xC0000000 mirrors) or Wii MEM2 (0x90000000/
+  // 0xD0000000). Modules may be loaded into either region.
+  const auto host = [&](u32 addr, u32 size) -> const u8* {
+    const u32 off1 = (addr & ~0x40000000u) - 0x80000000u;
+    if (off1 < ram_size && ram_size - off1 >= size)
+      return ram + off1;
+    const u32 off2 = off1 - 0x10000000u;
+    if (off2 < exram_size && exram_size - off2 >= size)
+      return exram + off2;
+    return nullptr;
+  };
   const auto rd32 = [&](u32 addr) -> u32 {
-    const u32 offset = addr & 0x3FFFFFFFu;
-    if (offset + 4 > ram_size)
+    const u8* p = host(addr, 4);
+    if (!p)
       return 0;
     u32 v;
-    std::memcpy(&v, ram + offset, 4);
+    std::memcpy(&v, p, 4);
     return Common::swap32(v);
   };
-  const auto in_ram = [&](u32 addr) {
-    return ((addr & ~0x40000000u) - 0x80000000u) < ram_size;
-  };
+  const auto in_ram = [&](u32 addr) { return host(addr, 1) != nullptr; };
 
   u32 active = 0;
   u32 cur = rd32(s_queue_head_addr);

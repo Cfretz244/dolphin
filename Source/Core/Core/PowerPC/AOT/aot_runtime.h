@@ -14,7 +14,7 @@
 // re-translate + rebuild every game's AOT library. AotRegistry rejects
 // libraries built against a different version (they fall back to the
 // interpreter instead of corrupting state).
-#define AOT_ABI_VERSION 2
+#define AOT_ABI_VERSION 3
 
 #include <stdint.h>
 
@@ -70,15 +70,28 @@ typedef void (*AOTBlockFunc)(AOTState*);
 // silently satisfy them from RAM.
 // ============================================================================
 
-// Effective-address layout of the mirror pair (see MMU.cpp IsRAMAddress):
-// 0x80000000+ is cached RAM, 0xC0000000+ its uncached mirror. Clearing the
-// mirror bit folds both onto the cached range; masking to the low 30 bits
-// yields the offset into the host RAM buffer.
-#define AOT_MEM_CACHED_BASE  0x80000000u
-#define AOT_MEM_UNCACHED_BIT 0x40000000u
-#define AOT_MEM_OFFSET_MASK  0x3FFFFFFFu
+// Effective-address layout of the mirror pairs (see MMU.cpp IsRAMAddress):
+// MEM1 is 0x80000000+ cached / 0xC0000000+ uncached; Wii MEM2 is 0x90000000+
+// cached / 0xD0000000+ uncached. Clearing the mirror bit folds each pair onto
+// its cached range. MEM1 offsets index the host RAM buffer directly; MEM2 is a
+// SEPARATE host buffer (EXRAM), so its folded address is rebased by the
+// 0x10000000 gap between the folded bases — the low-30-bits mask trick is
+// only valid for MEM1. On GC boots exram is null and exram_size is 0, so the
+// MEM2 arm is a never-taken compare.
+//
+// Like the MEM1 path, the MEM2 fast path assumes the SDK's standard identity
+// BAT mapping; games that remap take the slow path via the range miss.
+#define AOT_MEM_CACHED_BASE    0x80000000u
+#define AOT_MEM_UNCACHED_BIT   0x40000000u
+#define AOT_MEM_OFFSET_MASK    0x3FFFFFFFu
+#define AOT_MEM2_FOLDED_OFFSET 0x10000000u  /* folded MEM2 base - folded MEM1 base */
 
-typedef struct { uint8_t* ram; uint32_t size; } AotFastMem;
+typedef struct {
+    uint8_t* ram;         /* MEM1 host buffer */
+    uint32_t size;        /* MEM1 real size */
+    uint8_t* exram;       /* Wii MEM2 host buffer, NULL on GC */
+    uint32_t exram_size;  /* 0 on GC */
+} AotFastMem;
 extern AotFastMem aot_fast_mem;  // filled by aot_init_fast_mem() before any block runs
 
 extern uint32_t aot_read_u8_slow(AOTState* s, uint32_t addr);
@@ -91,18 +104,34 @@ extern void aot_write_u16_br_slow(AOTState* s, uint32_t val, uint32_t addr);
 extern void aot_write_u32_slow(AOTState* s, uint32_t val, uint32_t addr);
 extern void aot_write_u64_slow(AOTState* s, uint64_t val, uint32_t addr);
 
+// Resolve an effective address to a host pointer: MEM1 first (identical cost
+// to the pre-v3 single-region check), then MEM2. NULL = slow path. Low-memory
+// (0x0xxxxxxx) and 0x4xxxxxxx accesses miss both ranges and stay on the slow
+// path — with MSR.DR=1 the interpreter raises a DSI for them (BAT miss), so
+// the fast path must not silently satisfy them from RAM.
+static inline uint8_t* aot_host_ptr(uint32_t addr) {
+    uint32_t off1 = (addr & ~AOT_MEM_UNCACHED_BIT) - AOT_MEM_CACHED_BASE;
+    if (__builtin_expect(off1 < aot_fast_mem.size, 1))
+        return aot_fast_mem.ram + off1;
+    uint32_t off2 = off1 - AOT_MEM2_FOLDED_OFFSET;
+    if (off2 < aot_fast_mem.exram_size)
+        return aot_fast_mem.exram + off2;
+    return 0;
+}
 static inline int aot_is_ram(uint32_t addr) {
-    return ((addr & ~AOT_MEM_UNCACHED_BIT) - AOT_MEM_CACHED_BASE) < aot_fast_mem.size;
+    return aot_host_ptr(addr) != 0;
 }
 
 static inline uint32_t aot_read_u8(AOTState* s, uint32_t addr) {
-    if (__builtin_expect(aot_is_ram(addr), 1))
-        return aot_fast_mem.ram[addr & AOT_MEM_OFFSET_MASK];
+    uint8_t* p = aot_host_ptr(addr);
+    if (__builtin_expect(p != 0, 1))
+        return *p;
     return aot_read_u8_slow(s, addr);
 }
 static inline uint32_t aot_read_u16(AOTState* s, uint32_t addr) {
-    if (__builtin_expect(aot_is_ram(addr), 1)) {
-        uint16_t v; __builtin_memcpy(&v, aot_fast_mem.ram + (addr & AOT_MEM_OFFSET_MASK), 2);
+    uint8_t* p = aot_host_ptr(addr);
+    if (__builtin_expect(p != 0, 1)) {
+        uint16_t v; __builtin_memcpy(&v, p, 2);
         return __builtin_bswap16(v);
     }
     return aot_read_u16_slow(s, addr);
@@ -111,54 +140,61 @@ static inline uint32_t aot_read_u16_se(AOTState* s, uint32_t addr) {  // sign-ex
     return (uint32_t)(int32_t)(int16_t)aot_read_u16(s, addr);
 }
 static inline uint32_t aot_read_u32(AOTState* s, uint32_t addr) {
-    if (__builtin_expect(aot_is_ram(addr), 1)) {
-        uint32_t v; __builtin_memcpy(&v, aot_fast_mem.ram + (addr & AOT_MEM_OFFSET_MASK), 4);
+    uint8_t* p = aot_host_ptr(addr);
+    if (__builtin_expect(p != 0, 1)) {
+        uint32_t v; __builtin_memcpy(&v, p, 4);
         return __builtin_bswap32(v);
     }
     return aot_read_u32_slow(s, addr);
 }
 static inline uint64_t aot_read_u64(AOTState* s, uint32_t addr) {
-    if (__builtin_expect(aot_is_ram(addr), 1)) {
-        uint64_t v; __builtin_memcpy(&v, aot_fast_mem.ram + (addr & AOT_MEM_OFFSET_MASK), 8);
+    uint8_t* p = aot_host_ptr(addr);
+    if (__builtin_expect(p != 0, 1)) {
+        uint64_t v; __builtin_memcpy(&v, p, 8);
         return __builtin_bswap64(v);
     }
     return aot_read_u64_slow(s, addr);
 }
 static inline void aot_write_u8(AOTState* s, uint32_t val, uint32_t addr) {
-    if (__builtin_expect(aot_is_ram(addr), 1)) {
-        aot_fast_mem.ram[addr & AOT_MEM_OFFSET_MASK] = (uint8_t)val;
+    uint8_t* p = aot_host_ptr(addr);
+    if (__builtin_expect(p != 0, 1)) {
+        *p = (uint8_t)val;
         return;
     }
     aot_write_u8_slow(s, val, addr);
 }
 static inline void aot_write_u16(AOTState* s, uint32_t val, uint32_t addr) {
-    if (__builtin_expect(aot_is_ram(addr), 1)) {
+    uint8_t* p = aot_host_ptr(addr);
+    if (__builtin_expect(p != 0, 1)) {
         uint16_t v = __builtin_bswap16((uint16_t)val);
-        __builtin_memcpy(aot_fast_mem.ram + (addr & AOT_MEM_OFFSET_MASK), &v, 2);
+        __builtin_memcpy(p, &v, 2);
         return;
     }
     aot_write_u16_slow(s, val, addr);
 }
 static inline void aot_write_u16_br(AOTState* s, uint32_t val, uint32_t addr) {
-    if (__builtin_expect(aot_is_ram(addr), 1)) {
+    uint8_t* p = aot_host_ptr(addr);
+    if (__builtin_expect(p != 0, 1)) {
         uint16_t v = (uint16_t)val;  // no swap — byte-reversed store
-        __builtin_memcpy(aot_fast_mem.ram + (addr & AOT_MEM_OFFSET_MASK), &v, 2);
+        __builtin_memcpy(p, &v, 2);
         return;
     }
     aot_write_u16_br_slow(s, val, addr);
 }
 static inline void aot_write_u32(AOTState* s, uint32_t val, uint32_t addr) {
-    if (__builtin_expect(aot_is_ram(addr), 1)) {
+    uint8_t* p = aot_host_ptr(addr);
+    if (__builtin_expect(p != 0, 1)) {
         uint32_t v = __builtin_bswap32(val);
-        __builtin_memcpy(aot_fast_mem.ram + (addr & AOT_MEM_OFFSET_MASK), &v, 4);
+        __builtin_memcpy(p, &v, 4);
         return;
     }
     aot_write_u32_slow(s, val, addr);
 }
 static inline void aot_write_u64(AOTState* s, uint64_t val, uint32_t addr) {
-    if (__builtin_expect(aot_is_ram(addr), 1)) {
+    uint8_t* p = aot_host_ptr(addr);
+    if (__builtin_expect(p != 0, 1)) {
         uint64_t v = __builtin_bswap64(val);
-        __builtin_memcpy(aot_fast_mem.ram + (addr & AOT_MEM_OFFSET_MASK), &v, 8);
+        __builtin_memcpy(p, &v, 8);
         return;
     }
     aot_write_u64_slow(s, val, addr);
@@ -183,6 +219,9 @@ typedef struct AotModuleDesc {
     uint32_t module_id;
     uint32_t num_sections;
     const AotModuleSectionDesc* sections;
+    uint32_t flags;  /* reserved (0); headroom for per-game loader modes
+                        without another ABI bump. Trails the struct so the
+                        emitted positional initializers zero-fill it. */
 } AotModuleDesc;
 
 // Block boundary metadata for the AOT_COMPARE/diff harness. Only emitted (and

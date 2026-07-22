@@ -37,11 +37,76 @@
 
 extern "C" void aot_enable_fallback_tracking();
 
-// GameCube MMIO register window (CP/PE/VI/PI/MI/DSP/DVD/SI/EXI/AI/GP, see
-// ProcessorInterface / the 0x0C00xxxx map in HW/). The heuristics below treat
-// any pointer into this window as hardware access.
+// MMIO register window: GameCube CP/PE/VI/PI/MI/DSP/DVD/SI/EXI/AI/GP at
+// 0xCC00xxxx, plus the Wii Hollywood/IPC/GPIO block at 0xCD00xxxx. The
+// heuristics below treat any pointer into this window as hardware access.
 constexpr u32 MMIO_RANGE_START = 0xCC000000;
-constexpr u32 MMIO_RANGE_END = 0xCD000000;
+constexpr u32 MMIO_RANGE_END = 0xCE000000;
+
+namespace
+{
+// MEM1 (+ Wii MEM2) treated as one logical shadow image: MEM2 follows MEM1 at
+// offset mem1_size in every shadow/dump buffer. GetExRamSizeReal() reports the
+// retail MEM2 size even on GC — only the allocation is Wii-gated — so key off
+// the pointer.
+struct GuestRam
+{
+  u8* mem1;
+  u32 mem1_size;
+  u8* mem2;
+  u32 mem2_size;
+  u32 Total() const { return mem1_size + mem2_size; }
+};
+
+GuestRam GetGuestRam(Memory::MemoryManager& memory)
+{
+  u8* exram = memory.GetEXRAM();
+  return {memory.GetRAM(), memory.GetRamSizeReal(), exram,
+          exram ? memory.GetExRamSizeReal() : 0u};
+}
+
+void SaveGuestRam(const GuestRam& r, u8* dst)
+{
+  std::memcpy(dst, r.mem1, r.mem1_size);
+  if (r.mem2)
+    std::memcpy(dst + r.mem1_size, r.mem2, r.mem2_size);
+}
+
+void RestoreGuestRam(const GuestRam& r, const u8* src)
+{
+  std::memcpy(r.mem1, src, r.mem1_size);
+  if (r.mem2)
+    std::memcpy(r.mem2, src + r.mem1_size, r.mem2_size);
+}
+
+bool GuestRamEquals(const GuestRam& r, const u8* shadow)
+{
+  if (std::memcmp(shadow, r.mem1, r.mem1_size) != 0)
+    return false;
+  return !r.mem2 || std::memcmp(shadow + r.mem1_size, r.mem2, r.mem2_size) == 0;
+}
+
+void DumpGuestRam(const GuestRam& r, FILE* df)
+{
+  std::fwrite(r.mem1, 1, r.mem1_size, df);
+  if (r.mem2)
+    std::fwrite(r.mem2, 1, r.mem2_size, df);
+}
+
+// Guest effective address of a byte offset into a shadow image.
+u32 GuestRamAddr(const GuestRam& r, u32 shadow_off)
+{
+  return shadow_off < r.mem1_size ? 0x80000000u + shadow_off :
+                                    0x90000000u + (shadow_off - r.mem1_size);
+}
+
+// Live host pointer for a shadow offset.
+const u8* GuestRamLivePtr(const GuestRam& r, u32 shadow_off)
+{
+  return shadow_off < r.mem1_size ? r.mem1 + shadow_off :
+                                    r.mem2 + (shadow_off - r.mem1_size);
+}
+}  // namespace
 
 std::atomic<bool> AotHarness::s_shutdown_requested{false};
 
@@ -109,11 +174,12 @@ std::unique_ptr<AotHarness> AotHarness::MaybeCreate(Core::System& system,
 
   if (diff_mode)
   {
-    // RAM shadow buffers + full HW state buffer for the offline diff loop
-    const u32 ram_size = system.GetMemory().GetRamSizeReal();
-    harness->m_ram_shadow = static_cast<u8*>(std::malloc(ram_size));
-    harness->m_ram_shadow_aot = static_cast<u8*>(std::malloc(ram_size));
-    harness->m_state_buffer.resize(64 * 1024 * 1024);  // 64 MB should be plenty
+    // RAM shadow buffers (MEM1 + Wii MEM2) + full HW state buffer for the
+    // offline diff loop
+    const u32 shadow_size = GetGuestRam(system.GetMemory()).Total();
+    harness->m_ram_shadow = static_cast<u8*>(std::malloc(shadow_size));
+    harness->m_ram_shadow_aot = static_cast<u8*>(std::malloc(shadow_size));
+    harness->m_state_buffer.resize(128 * 1024 * 1024);  // Wii savestates exceed 64 MB
   }
 
   return harness;
@@ -183,12 +249,12 @@ void AotHarness::Run()
     // (AOT_DUMP_FRAME's XFB-change trigger never fires on such states).
     if (const char* dump_on_load = std::getenv("AOT_DUMP_ON_LOAD"))
     {
-      auto& mem = m_system.GetMemory();
+      const GuestRam gr = GetGuestRam(m_system.GetMemory());
       if (FILE* df = std::fopen(dump_on_load, "wb"))
       {
-        std::fwrite(mem.GetRAM(), 1, mem.GetRamSizeReal(), df);
+        DumpGuestRam(gr, df);
         std::fclose(df);
-        fmt::print(stderr, "AOT_DUMP_ON_LOAD: Dumped {} bytes to {}\n", mem.GetRamSizeReal(),
+        fmt::print(stderr, "AOT_DUMP_ON_LOAD: Dumped {} bytes to {}\n", gr.Total(),
                    dump_on_load);
       }
     }
@@ -238,7 +304,8 @@ void AotHarness::Run()
   bool found_divergence = false;
   u64 compare_count = 0;
   auto& memory = m_system.GetMemory();
-  const u32 ram_size = memory.GetRamSizeReal();
+  const GuestRam guest_ram = GetGuestRam(memory);
+  const u32 shadow_size = guest_ram.Total();
   u8* compare_ram_shadow = nullptr;
   u8* compare_ram_aot = nullptr;
   // Harness throttles: the full-RAM shadow compare moves ~3x RAM size per block, which
@@ -253,12 +320,12 @@ void AotHarness::Run()
   std::unordered_set<u64> compared_keys;
   if (compare_mode)
   {
-    compare_ram_shadow = static_cast<u8*>(std::malloc(ram_size));
-    compare_ram_aot = static_cast<u8*>(std::malloc(ram_size));
+    compare_ram_shadow = static_cast<u8*>(std::malloc(shadow_size));
+    compare_ram_aot = static_cast<u8*>(std::malloc(shadow_size));
     fmt::print(stderr,
                "AOT_COMPARE: Active, {} block sizes loaded, {}MB RAM shadow x2, "
                "{} visits, full-RAM every {} comparison(s)\n",
-               m_block_sizes.size(), ram_size / (1024 * 1024),
+               m_block_sizes.size(), shadow_size / (1024 * 1024),
                compare_every_visit ? "all" : "first", compare_ram_interval);
   }
 
@@ -274,14 +341,13 @@ void AotHarness::Run()
       if (cur_vi != last_vi_count && cur_vi != 0)
       {
         last_vi_count = cur_vi;
-        u8* ram = memory.GetRAM();
         FILE* df = std::fopen(dump_frame_path, "wb");
         if (df)
         {
-          std::fwrite(ram, 1, ram_size, df);
+          DumpGuestRam(guest_ram, df);
           std::fclose(df);
           fmt::print(stderr, "AOT_DUMP_FRAME: Dumped {} bytes to {}, PC={:#010x}\n",
-                     ram_size, dump_frame_path, m_ppc_state.pc);
+                     shadow_size, dump_frame_path, m_ppc_state.pc);
         }
         dump_waiting = false;
       }
@@ -369,9 +435,8 @@ void AotHarness::Run()
           // Save pre-state (registers, and RAM when sampling)
           PPCSnapshot pre, aot_result, interp_result;
           pre = pre_check;
-          u8* ram = memory.GetRAM();
           if (full_ram)
-            std::memcpy(compare_ram_shadow, ram, ram_size);  // pre-RAM saved
+            SaveGuestRam(guest_ram, compare_ram_shadow);  // pre-RAM saved
 
           // Run AOT single block
           s32 saved_dc = m_ppc_state.downcount;
@@ -384,8 +449,8 @@ void AotHarness::Run()
           if (full_ram)
           {
             // Save AOT's RAM, then restore pre-RAM for an independent interpreter run
-            std::memcpy(compare_ram_aot, ram, ram_size);  // AOT-RAM saved
-            std::memcpy(ram, compare_ram_shadow, ram_size);  // pre-RAM restored
+            SaveGuestRam(guest_ram, compare_ram_aot);        // AOT-RAM saved
+            RestoreGuestRam(guest_ram, compare_ram_shadow);  // pre-RAM restored
           }
           RestoreSnapshot(pre);
 
@@ -399,19 +464,10 @@ void AotHarness::Run()
           // Compare registers
           bool regs_match = CompareSnapshots(aot_result, interp_result, block_pc, nullptr);
 
-          // Compare RAM (AOT result vs interpreter result)
+          // Compare RAM (AOT result vs interpreter result, now live)
           bool ram_match = true;
           if (full_ram)
-          {
-            for (u32 j = 0; j < ram_size; j++)
-            {
-              if (compare_ram_aot[j] != ram[j])
-              {
-                ram_match = false;
-                break;
-              }
-            }
-          }
+            ram_match = GuestRamEquals(guest_ram, compare_ram_aot);
 
           if (regs_match && ram_match && !compare_every_visit)
             compared_keys.insert(compare_key);
@@ -448,12 +504,13 @@ void AotHarness::Run()
             {
               fmt::print(stderr, "\nRAM differences (first 20):\n");
               int ram_diffs = 0;
-              for (u32 j = 0; j < ram_size && ram_diffs < 20; j++)
+              for (u32 j = 0; j < shadow_size && ram_diffs < 20; j++)
               {
-                if (compare_ram_aot[j] != ram[j])
+                const u8 live = *GuestRamLivePtr(guest_ram, j);
+                if (compare_ram_aot[j] != live)
                 {
                   fmt::print(stderr, "  0x{:08x}: AOT=0x{:02x} INTERP=0x{:02x}\n",
-                             0x80000000 + j, compare_ram_aot[j], ram[j]);
+                             GuestRamAddr(guest_ram, j), compare_ram_aot[j], live);
                   ram_diffs++;
                 }
               }
@@ -831,7 +888,8 @@ void AotHarness::RunDiff()
   const u32 max_divergences = Config::Get(Config::MAIN_DEBUG_AOT_DIFF_MAX_DIVERGENCES);
   const u32 filter_min = Config::Get(Config::MAIN_DEBUG_AOT_DIFF_FILTER_MIN);
   const u32 filter_max = Config::Get(Config::MAIN_DEBUG_AOT_DIFF_FILTER_MAX);
-  const u32 ram_size = memory.GetRamSizeReal();
+  const GuestRam guest_ram = GetGuestRam(memory);
+  const u32 shadow_size = guest_ram.Total();
 
   const std::string log_path = Config::Get(Config::MAIN_DEBUG_AOT_DIFF_LOG_PATH);
   FILE* log = stdout;
@@ -855,7 +913,8 @@ void AotHarness::RunDiff()
 
   fmt::print(log, "AOT Diff Harness — {} mode\n", self_diff ? "self-diff" : "AOT-vs-interpreter");
   fmt::print(log, "Block boundaries loaded: {}\n", m_block_sizes.size());
-  fmt::print(log, "RAM size: {} MB\n\n", ram_size / (1024 * 1024));
+  fmt::print(log, "RAM size: {} MB (MEM1 {} MB + MEM2 {} MB)\n\n", shadow_size / (1024 * 1024),
+             guest_ram.mem1_size / (1024 * 1024), guest_ram.mem2_size / (1024 * 1024));
   std::fflush(log);
 
   // Load savestate if specified — allows comparing battle code, not just boot code
@@ -1073,7 +1132,7 @@ void AotHarness::RunDiff()
         }
 
         // Also save RAM separately for comparison
-        std::memcpy(m_ram_shadow, memory.GetRAM(), ram_size);
+        SaveGuestRam(guest_ram, m_ram_shadow);
 
         // Run AOT single-block with MMIO capture (self-diff: interpreter
         // plays the AOT side — aot_block_fn is null by design there)
@@ -1205,7 +1264,7 @@ void AotHarness::RunDiff()
       // FULL COMPARISON: snapshot CPU+RAM, run AOT, save AOT RAM, restore, run interpreter, compare.
 
       // 2. Save pre-RAM
-      std::memcpy(m_ram_shadow, memory.GetRAM(), ram_size);
+      SaveGuestRam(guest_ram, m_ram_shadow);
 
       // 3. Run AOT single-block (self-diff: interpreter plays the AOT side)
       {
@@ -1230,11 +1289,11 @@ void AotHarness::RunDiff()
 
       // 3b. Save AOT's RAM result for comparison
       if (m_ram_shadow_aot)
-        std::memcpy(m_ram_shadow_aot, memory.GetRAM(), ram_size);
+        SaveGuestRam(guest_ram, m_ram_shadow_aot);
 
       // 4. Restore CPU + RAM, run interpreter (stopping where the AOT run exited)
       RestoreSnapshot(pre_snap);
-      std::memcpy(memory.GetRAM(), m_ram_shadow, ram_size);
+      RestoreGuestRam(guest_ram, m_ram_shadow);
 
       RunInterpreterBlock(interp, block_pc, num_instr, /*ignore_exceptions=*/false,
                           /*stop_pc=*/aot_result.pc);
@@ -1261,13 +1320,12 @@ void AotHarness::RunDiff()
       bool ram_diverged = false;
       if (m_ram_shadow_aot)
       {
-        u8* interp_ram = memory.GetRAM();
         int ram_diff_printed = 0;
-        for (u32 i = 0; i < ram_size && ram_diff_printed < 10; i += 4)
+        for (u32 i = 0; i < shadow_size && ram_diff_printed < 10; i += 4)
         {
           u32 aot_val, interp_val;
           std::memcpy(&aot_val, &m_ram_shadow_aot[i], 4);
-          std::memcpy(&interp_val, &interp_ram[i], 4);
+          std::memcpy(&interp_val, GuestRamLivePtr(guest_ram, i), 4);
           if (aot_val != interp_val)
           {
             if (!ram_diverged)
@@ -1275,7 +1333,8 @@ void AotHarness::RunDiff()
             ram_diverged = true;
             ram_diff_printed++;
             fmt::print(log, "    {:#010x}: AOT={:#010x} INTERP={:#010x}\n",
-                       0x80000000 | i, Common::swap32(aot_val), Common::swap32(interp_val));
+                       GuestRamAddr(guest_ram, i), Common::swap32(aot_val),
+                       Common::swap32(interp_val));
           }
         }
         if (ram_diff_printed >= 10)
