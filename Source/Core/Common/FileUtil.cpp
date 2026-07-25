@@ -68,6 +68,14 @@ static std::string s_android_driver_directory;
 static std::string s_android_lib_directory;
 #endif
 
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+// iOS bundles are flat — there is no Contents/Resources layout to derive the
+// Sys path from — and the Sys data ships inside GCDeltaCore.framework rather
+// than the app bundle that CFBundleGetMainBundle() returns. The embedder
+// supplies the path at init instead (same approach as Android).
+static std::string s_ios_sys_directory;
+#endif
+
 #ifdef __APPLE__
 static Common::DynamicLibrary s_security_framework;
 
@@ -773,7 +781,13 @@ static std::string CreateSysDirectoryPath()
 #endif
 #endif
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  // Set by the embedder before any Sys data is read (see SetSysDirectory).
+  // Deliberately not asserted: an empty path simply finds nothing, which is
+  // the same outcome as the unreachable macOS path this used to produce.
+  const std::string sys_directory =
+      s_ios_sys_directory.empty() ? "" : s_ios_sys_directory + DIR_SEP;
+#elif defined(__APPLE__)
   const std::string sys_directory = GetBundleDirectory() + DIR_SEP SYSDATA_DIR DIR_SEP;
 #elif defined(_WIN32) || defined(LINUX_LOCAL_DEV)
   const std::string sys_directory = GetExeDirectory() + DIR_SEP SYSDATA_DIR DIR_SEP;
@@ -793,6 +807,14 @@ const std::string& GetSysDirectory()
   static const std::string sys_directory = CreateSysDirectoryPath();
   return sys_directory;
 }
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+void SetSysDirectory(const std::string& path)
+{
+  INFO_LOG_FMT(COMMON, "Setting Sys directory to {}", path);
+  s_ios_sys_directory = path;
+}
+#endif
 
 #ifdef ANDROID
 void SetSysDirectory(const std::string& path)

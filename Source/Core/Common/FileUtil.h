@@ -12,6 +12,11 @@
 
 #include "Common/CommonTypes.h"
 
+#ifdef __APPLE__
+// Defines TARGET_OS_IPHONE, which gates the settable Sys directory below.
+#include <TargetConditionals.h>
+#endif
+
 #ifdef _WIN32
 #include "Common/StringUtil.h"
 #endif
@@ -240,6 +245,12 @@ const std::string& GetSysDirectory();
 void SetSysDirectory(const std::string& path);
 void SetGpuDriverDirectories(const std::string& path, const std::string& lib_path);
 const std::string GetGpuDriverDirectory(unsigned int dir_index);
+#endif
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+// Must be called before anything reads Sys data — GetSysDirectory() caches its
+// result on first call, so a later change has no effect.
+void SetSysDirectory(const std::string& path);
 #endif
 
 #ifdef __APPLE__
