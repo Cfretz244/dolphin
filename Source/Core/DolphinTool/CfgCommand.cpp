@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <list>
 #include <map>
@@ -760,6 +761,213 @@ static void CollectRelocationSeeds(const std::vector<RelFile>& modules,
       else
         module_seeds[r.target_module].insert(SectAddr(r.target_section, r.addend));
     }
+  }
+}
+
+// Where one module section sat in guest memory during a traced run.
+struct SectionPlacement
+{
+  u32 module_id;
+  u32 section_idx;
+  u32 base;
+  u32 size;
+};
+
+// Relocation seeding alone misses module code that is only ever reached by an
+// indirect branch staying inside one section — jump tables, switch dispatch,
+// same-section virtual calls. Those branches are PC-relative and resolved when
+// the REL is linked, so they leave no relocation for CollectRelocationSeeds to
+// find, and recursive descent cannot guess their targets either. On Mario Kart
+// Wii that stranded hot per-frame code in the interpreter (August 2026): the
+// traces held the addresses all along, but module CFGs never consulted them.
+//
+// Traces record absolute runtime PCs while module CFGs are section-relative, so
+// the two only connect once we know where each section was loaded. The v4
+// snapshot section supplies exactly that: every snapshot carries an absolute
+// address plus the instruction words that lived there, so matching those words
+// against a section image yields the section's load base directly. Matching on
+// content (rather than assuming a fixed address) also keeps this correct for
+// games that swap modules through a shared arena, where one address range backs
+// different modules at different times.
+static std::vector<SectionPlacement>
+DeriveSectionPlacements(const std::vector<RelFile>& modules, const TraceData& trace, bool verbose)
+{
+  std::vector<SectionPlacement> placements;
+  if (trace.snapshot_blocks.empty())
+    return placements;
+
+  // Longest snapshot per address: more words means a more certain match.
+  std::unordered_map<u32, const TraceSnapshot*> by_addr;
+  for (const auto& sb : trace.snapshot_blocks)
+  {
+    for (const auto& snap : sb.snapshots)
+    {
+      auto& slot = by_addr[snap.addr];
+      if (!slot || snap.words.size() > slot->words.size())
+        slot = &snap;
+    }
+  }
+
+  // Long enough that a false content match is not a practical concern, short
+  // enough that ordinary basic blocks qualify.
+  constexpr size_t MIN_MATCH_WORDS = 8;
+  // One corroborated base is not enough: a run of padding or a duplicated
+  // helper could agree by chance.
+  constexpr u32 MIN_VOTES = 3;
+
+  for (const auto& m : modules)
+  {
+    for (size_t si = 0; si < m.sections.size(); si++)
+    {
+      const auto& sec = m.sections[si];
+      if (!sec.executable || sec.data.empty() || sec.size < 4)
+        continue;
+
+      // Index by first instruction word, then verify the rest — the section is
+      // scanned once per module instead of once per snapshot.
+      const size_t num_words = sec.data.size() / 4;
+      std::unordered_multimap<u32, u32> first_word;
+      first_word.reserve(num_words);
+      const auto word_at = [&](size_t idx) {
+        u32 raw;
+        std::memcpy(&raw, sec.data.data() + idx * 4, 4);
+        return Common::swap32(raw);  // section images keep PowerPC byte order
+      };
+      for (size_t w = 0; w < num_words; w++)
+        first_word.emplace(word_at(w), static_cast<u32>(w));
+
+      std::unordered_map<u32, u32> base_votes;
+      for (const auto& [addr, snap] : by_addr)
+      {
+        if (snap->words.size() < MIN_MATCH_WORDS)
+          continue;
+        const auto range = first_word.equal_range(snap->words[0]);
+        for (auto it = range.first; it != range.second; ++it)
+        {
+          const u32 w0 = it->second;
+          if (w0 + snap->words.size() > num_words)
+            continue;
+          bool match = true;
+          for (size_t k = 1; k < snap->words.size() && match; k++)
+            match = word_at(w0 + k) == snap->words[k];
+          if (!match)
+            continue;
+          const u32 off = w0 * 4;
+          if (addr < off)
+            continue;  // implies a base below the start of guest memory
+          base_votes[addr - off]++;
+        }
+      }
+
+      u32 best_base = 0, best_votes = 0, runner_up = 0;
+      for (const auto& [base, votes] : base_votes)
+      {
+        if (votes > best_votes)
+        {
+          runner_up = best_votes;
+          best_base = base;
+          best_votes = votes;
+        }
+        else if (votes > runner_up)
+        {
+          runner_up = votes;
+        }
+      }
+      // Require a decisive winner: an ambiguous base would scatter seeds into
+      // the wrong offsets, which is worse than seeding nothing at all.
+      if (best_votes < MIN_VOTES || best_votes <= runner_up)
+        continue;
+
+      placements.push_back(
+          {m.module_id, static_cast<u32>(si), best_base, static_cast<u32>(sec.size)});
+      if (verbose)
+      {
+        fmt::println(std::cerr, "  module {} section {}: traced at base {:#010x} ({} matches)",
+                     m.module_id, si, best_base, best_votes);
+      }
+    }
+  }
+  return placements;
+}
+
+// Convert traced absolute PCs into section-relative seeds using the derived
+// placements. An address covered by more than one placement is ambiguous (the
+// arena-swapping case), so it is only claimed when its own snapshot content
+// identifies which section it belongs to.
+static void CollectTraceModuleSeeds(const std::vector<SectionPlacement>& placements,
+                                    const std::vector<RelFile>& modules, const TraceData& trace,
+                                    std::unordered_map<u32, std::set<u32>>& module_seeds,
+                                    bool verbose)
+{
+  if (placements.empty())
+    return;
+
+  std::unordered_map<u32, const TraceSnapshot*> by_addr;
+  for (const auto& sb : trace.snapshot_blocks)
+    for (const auto& snap : sb.snapshots)
+      if (!snap.words.empty())
+        by_addr.emplace(snap.addr, &snap);
+
+  const auto section_of = [&](u32 module_id, u32 section_idx) -> const RelSection* {
+    for (const auto& m : modules)
+      if (m.module_id == module_id && section_idx < m.sections.size())
+        return &m.sections[section_idx];
+    return nullptr;
+  };
+
+  // Does the traced content at `addr` actually match this section's image?
+  const auto content_matches = [&](const SectionPlacement& p, u32 addr) {
+    const auto snap_it = by_addr.find(addr);
+    if (snap_it == by_addr.end())
+      return false;
+    const RelSection* sec = section_of(p.module_id, p.section_idx);
+    if (!sec)
+      return false;
+    const u32 off = addr - p.base;
+    const auto& words = snap_it->second->words;
+    if (off + words.size() * 4 > sec->data.size())
+      return false;
+    for (size_t k = 0; k < words.size(); k++)
+    {
+      u32 raw;
+      std::memcpy(&raw, sec->data.data() + off + k * 4, 4);
+      if (Common::swap32(raw) != words[k])
+        return false;
+    }
+    return true;
+  };
+
+  u32 seeded = 0, ambiguous_dropped = 0;
+  for (const auto& b : trace.blocks)
+  {
+    const SectionPlacement* chosen = nullptr;
+    u32 candidates = 0;
+    for (const auto& p : placements)
+    {
+      if (b.addr < p.base || b.addr - p.base >= p.size)
+        continue;
+      candidates++;
+      if (candidates == 1)
+        chosen = &p;
+      else if (content_matches(p, b.addr))
+        chosen = &p;
+    }
+    if (!chosen)
+      continue;
+    if (candidates > 1 && !content_matches(*chosen, b.addr))
+    {
+      ambiguous_dropped++;
+      continue;
+    }
+    module_seeds[chosen->module_id].insert(SectAddr(chosen->section_idx, b.addr - chosen->base));
+    seeded++;
+  }
+
+  fmt::println(std::cerr, "  Trace-seeded module entries: {}", seeded);
+  if (ambiguous_dropped > 0 && verbose)
+  {
+    fmt::println(std::cerr, "  ({} traced addresses spanned overlapping modules, unresolved)",
+                 ambiguous_dropped);
   }
 }
 
@@ -1625,10 +1833,20 @@ int CfgCommand(const std::vector<std::string>& args)
     fmt::println(std::cerr, "  Vertex formats: {}", trace.vertex_formats.size());
   }
 
-  // 6. Per-module CFGs (static, relocation-seeded)
+  // 6. Per-module CFGs (relocation-seeded, plus traced entry points that no
+  // relocation can reveal — see DeriveSectionPlacements).
   std::map<u32, ModuleCfg> module_cfgs;
   if (!modules.empty())
   {
+    const std::vector<SectionPlacement> placements =
+        DeriveSectionPlacements(modules, trace, verbose);
+    if (placements.empty() && !trace.blocks.empty())
+    {
+      fmt::println(std::cerr, "  Note: no module section bases derived from the trace "
+                              "(v3 or older trace?) — module CFGs are relocation-seeded only.");
+    }
+    CollectTraceModuleSeeds(placements, modules, trace, module_seeds, verbose);
+
     u32 total_blocks = 0;
     u64 total_exec = 0, total_covered = 0;
     u32 worst_coverage_id = 0;
