@@ -923,3 +923,8 @@ if(ALL_AOT_LIBS)
     message(STATUS "  (Ensure AOT .c files were compiled with -flto for full benefit)")
   endif()
 endif()
+
+if(ENABLE_PRIMEHACK)
+  target_sources(core PRIVATE PrimeHack/PrimeHack.cpp PrimeHack/PrimeHack.h)
+  target_compile_definitions(core PUBLIC ENABLE_PRIMEHACK)
+endif()

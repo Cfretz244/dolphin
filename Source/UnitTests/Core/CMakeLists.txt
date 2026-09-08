@@ -49,3 +49,7 @@ target_sources(PowerPCTest PRIVATE
   PowerPC/TestValues.h
   StubJit.h
 )
+
+if(ENABLE_PRIMEHACK)
+  target_sources(PowerPCTest PRIVATE PrimeHackTest.cpp)
+endif()

@@ -27,6 +27,7 @@
 #include "Core/HW/WiimoteCommon/WiimoteConstants.h"
 #include "Core/HW/WiimoteCommon/WiimoteHid.h"
 #include "Core/HW/WiimoteEmu/DesiredWiimoteState.h"
+#include "Core/PrimeHack/PrimeHack.h"
 #include "Core/HW/WiimoteEmu/Extension/Classic.h"
 #include "Core/HW/WiimoteEmu/Extension/DesiredExtensionState.h"
 #include "Core/HW/WiimoteEmu/Extension/DrawsomeTablet.h"
@@ -546,6 +547,8 @@ void Wiimote::PrepareInput(WiimoteEmu::DesiredWiimoteState* target_state,
 {
   const auto lock = GetStateLock();
   BuildDesiredWiimoteState(target_state, sensor_bar_state);
+  if (m_index == 0)
+    PrimeHack::PrepareInput(target_state, sensor_bar_state == SensorBarState::Enabled);
 }
 
 void Wiimote::Update(const WiimoteEmu::DesiredWiimoteState& target_state)

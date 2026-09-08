@@ -390,6 +390,7 @@ extern const Info<bool> MAIN_DEBUG_JIT_SYSTEM_REGISTERS_OFF;
 extern const Info<bool> MAIN_DEBUG_JIT_BRANCH_OFF;
 extern const Info<bool> MAIN_DEBUG_JIT_REGISTER_CACHE_OFF;
 extern const Info<bool> MAIN_DEBUG_JIT_ENABLE_PROFILING;
+extern const Info<bool> MAIN_PRIMEHACK_ENABLED;
 extern const Info<bool> MAIN_DEBUG_TRACE_COLLECTION;
 extern const Info<std::string> MAIN_DEBUG_TRACE_OUTPUT_PATH;
 extern const Info<bool> MAIN_DEBUG_AOT_DIFF_MODE;

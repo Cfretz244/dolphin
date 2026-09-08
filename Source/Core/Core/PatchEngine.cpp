@@ -34,6 +34,7 @@
 #include "Core/GeckoCodeConfig.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
+#include "Core/PrimeHack/PrimeHack.h"
 #include "Core/System.h"
 #include "VideoCommon/OnScreenDisplay.h"
 
@@ -343,6 +344,7 @@ bool ApplyFramePatches(Core::System& system)
     return false;
   }
 
+  PrimeHack::Update(guard);
   ApplyPatches(guard, s_on_frame);
   ApplyMemoryPatches(guard, s_on_frame_memory);
 
@@ -355,6 +357,7 @@ bool ApplyFramePatches(Core::System& system)
 
 void Shutdown()
 {
+  PrimeHack::Reset();
   s_on_frame.clear();
   ActionReplay::ApplyCodes({}, "", 0);
   Gecko::Shutdown();
