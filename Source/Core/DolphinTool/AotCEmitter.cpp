@@ -121,6 +121,13 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
                      " void {}(AOTState* s) {{\n",
                      section, BlockFn(block_addr, false));
 
+  if (m_guarded_images)
+  {
+    out += fmt::format("    if (!aot_match_code({:#x}u, {}_words, {}u)) {{ s->pc={:#x}u; "
+                       "[[clang::musttail]] return {}_dispatch(s); }}\n",
+                       block_addr, BlockFn(block_addr, false), num_instructions, block_addr, m_prefix);
+  }
+
   m_inline_depth = 0;
   m_inline_insts = num_instructions;
   EmitBlockBody(out, block_addr, num_instructions);
@@ -223,7 +230,7 @@ void AOTCEmitter::EmitBlockBody(std::string& out, u32 block_addr, u32 num_instru
     // blocks; large ones amortize their musttail fine), bounded chain length,
     // forward edges only (strictly increasing PCs — cycles impossible, and
     // every CFG cycle still crosses a guarded backward edge or dispatch).
-    if (!m_module && next_pc > block_addr && m_inline_targets.contains(next_pc) &&
+    if (!m_guarded_images && !m_module && next_pc > block_addr && m_inline_targets.contains(next_pc) &&
         m_inline_depth < kMaxInlineDepth)
     {
       auto size_it = m_block_sizes.find(next_pc);
@@ -1103,6 +1110,11 @@ void AOTCEmitter::EmitBranchTo(std::string& out, u32 target, u32 current_pc,
 
 void AOTCEmitter::EmitIndirectDispatch(std::string& out)
 {
+  if (m_guarded_images)
+  {
+    out += fmt::format("    [[clang::musttail]] return {}_dispatch(s);\n", m_prefix);
+    return;
+  }
   // Per-site inline table probe (production only): every blr/bctr previously
   // musttail'd into the ONE shared <prefix>_dispatch, so all indirect transfers
   // shared a single indirect-branch predictor site. Probing the table at the

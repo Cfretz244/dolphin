@@ -83,6 +83,10 @@ public:
   void SetInlineHints(std::unordered_map<u32, u32> block_sizes,
                       std::unordered_set<u32> inline_targets);
 
+  // Alternate fixed-address images: every entry is checked, including direct
+  // tail calls. No inlining or image-local indirect probe can bypass the guard.
+  void SetGuardedImages() { m_guarded_images = true; }
+
   // Get the set of unhandled opcodes encountered during translation.
   const std::map<std::string, u32>& GetUnhandledOpcodes() const { return m_unhandled_opcodes; }
 
@@ -216,6 +220,7 @@ private:
   // the function header and closing brace). Re-entered for chain inlining.
   void EmitBlockBody(std::string& out, u32 block_addr, u32 num_instructions);
 
+  bool m_guarded_images = false;
   const PPCMemoryImage& m_memory;
   std::set<u32> m_known_blocks;
   std::string m_prefix;

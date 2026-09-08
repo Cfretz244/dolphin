@@ -35,6 +35,7 @@
 #include "Core/PowerPC/PPCTables.h"
 
 #include "DolphinTool/AotCEmitter.h"
+#include "DolphinTool/DolImages.h"
 #include "DolphinTool/PPCMemoryImage.h"
 #include "DolphinTool/RelFile.h"
 #include "DolphinTool/RelModules.h"
@@ -205,6 +206,10 @@ int AotCommand(const std::vector<std::string>& args)
     if (!section.empty())
       memory.AddSection(dol.GetTextSectionAddress(i), section.data(), dol.GetTextSectionSize(i));
   }
+
+  if (IsDolImageCFG(cfg_path))
+    return TranslateDolImages(*volume, cfg_path, output_dir, prefix, dol_sha256_hex) ?
+               EXIT_SUCCESS : EXIT_FAILURE;
 
   // 2. Read CFG database
   std::vector<CFGBlockInfo> cfg_blocks;

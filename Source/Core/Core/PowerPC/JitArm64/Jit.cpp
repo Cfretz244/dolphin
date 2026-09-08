@@ -4,6 +4,7 @@
 #include "Core/PowerPC/JitArm64/Jit.h"
 
 #include <cstdio>
+#include <map>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -1063,13 +1064,29 @@ void JitArm64::Jit(u32 em_address, bool clear_cache_and_retry_on_failure)
 
       if (IsTraceCollectionEnabled())
       {
-        // Snapshot the block's instruction words as fetched from guest memory — for
-        // dynamically loaded code (overlays/RELs) these bytes exist nowhere on disc.
-        std::vector<u32> instruction_words(code_block.m_num_instructions);
-        for (u32 i = 0; i < code_block.m_num_instructions; i++)
-          instruction_words[i] = m_code_buffer[i].inst.hex;
-        m_trace_collector.RecordBlock(em_address, code_block.m_num_instructions,
-                                      instruction_words.data());
+        // The analyzer reorders instructions and follows branches. Serialize
+        // address-contiguous runs, not its optimized execution order, so v4
+        // snapshots continue to mean words at (record address + 4 * index).
+        std::map<u32, u32> fetched;
+        for (u32 i = 0; i < code_block.m_num_instructions; ++i)
+          fetched.emplace(m_code_buffer[i].address, m_code_buffer[i].inst.hex);
+        std::vector<u32> instruction_words;
+        u32 start = 0;
+        for (const auto& [address, word] : fetched)
+        {
+          if (!instruction_words.empty() && address != start + instruction_words.size() * 4)
+          {
+            m_trace_collector.RecordBlock(start, static_cast<u32>(instruction_words.size()),
+                                          instruction_words.data());
+            instruction_words.clear();
+          }
+          if (instruction_words.empty())
+            start = address;
+          instruction_words.push_back(word);
+        }
+        if (!instruction_words.empty())
+          m_trace_collector.RecordBlock(start, static_cast<u32>(instruction_words.size()),
+                                        instruction_words.data());
         for (const auto& link : b->linkData)
         {
           m_trace_collector.RecordStaticEdge(em_address, link.exitAddress, link.call);

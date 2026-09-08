@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
@@ -373,10 +374,10 @@ void aot_dump_fallback_stats()
     const u32 pc = sorted[i].first;
     const u64 count = sorted[i].second;
     std::string opname = "???";
-    if (s_ram_ptr && IsRAMAddress(pc))
+    if (const u8* code = FastMemHostPtr(pc))
     {
       u32 inst_word;
-      std::memcpy(&inst_word, &s_ram_ptr[pc & 0x3FFFFFFF], sizeof(u32));
+      std::memcpy(&inst_word, code, sizeof(u32));
       inst_word = Common::swap32(inst_word);
       UGeckoInstruction inst(inst_word);
       const GekkoOPInfo* info = PPCTables::GetOpInfo(inst, pc);
@@ -1329,3 +1330,69 @@ void aot_icbi(AOTState* s, uint32_t addr)
 #undef FP_CMP
 
 }  // extern "C"
+
+// Fast path for content guards: compare words already resident in the emulated
+// instruction cache, translating once per BAT range instead of once per word.
+// No validation result is cached: icbi, eviction, state loads and BAT changes
+// are observed immediately through the live cache and translation tables.
+static std::optional<bool> MatchResidentCode(uint32_t pc, const uint32_t* words, uint32_t count)
+{
+  auto& system = GetSystem();
+  auto& state = system.GetPPCState();
+  auto& cache = state.iCache;
+  if (!HID0(state).ICE || cache.m_disable_icache ||
+      (pc >> PowerPC::BAT_INDEX_SHIFT) != ((pc + (count - 1) * 4) >> PowerPC::BAT_INDEX_SHIFT))
+    return std::nullopt;
+
+  u32 physical = pc;
+  if (state.msr.IR)
+  {
+    const u32 bat = GetMMU().GetIBATTable()[pc >> PowerPC::BAT_INDEX_SHIFT];
+    if (!(bat & PowerPC::BAT_MAPPED_BIT))
+      return std::nullopt;
+    physical = (bat & PowerPC::BAT_RESULT_MASK) | (pc & (PowerPC::BAT_PAGE_SIZE - 1));
+  }
+  // Limit the fast path to real MEM1/MEM2. Page-table mappings, fake VMEM,
+  // uncached instruction fetches and other memory types use the MMU below.
+  const u32 bytes = count * 4;
+  const u32 mem2_offset = physical - 0x10000000u;
+  if (!((physical < s_ram_size && bytes <= s_ram_size - physical) ||
+        (mem2_offset < s_exram_size && bytes <= s_exram_size - mem2_offset)))
+    return std::nullopt;
+
+  u32 checked = 0;
+  while (checked < count)
+  {
+    const u32 address = physical + checked * 4;
+    // locked=true is a non-filling lookup, regardless of the guest's ILOCK.
+    // GetCache also preserves the normal replacement-policy update on hits.
+    const auto [set, way] = cache.GetCache(system.GetMemory(), address, true);
+    if (way == 0xff)
+      return std::nullopt;
+    const u32 offset = (address & 31) / 4;
+    const u32 length = std::min(count - checked, PowerPC::CACHE_BLOCK_SIZE - offset);
+    for (u32 n = 0; n < length; ++n)
+      if (Common::swap32(cache.data[set][way][offset + n]) != words[checked + n])
+        return false;
+    checked += length;
+  }
+  return true;
+}
+
+// Content-guarded alternate DOLs. Writes before icbi must continue to select
+// the cached instructions, not freshly modified RAM.
+extern "C" int aot_match_code(uint32_t pc, const uint32_t* words, uint32_t count)
+{
+  if (!words || !count || (pc & 3) || count > (UINT32_MAX - pc) / 4)
+    return 0;
+  if (const auto match = MatchResidentCode(pc, words, count))
+    return *match;
+  auto& mmu = GetMMU();
+  for (uint32_t i = 0; i < count; ++i)
+  {
+    const auto inst = mmu.TryReadInstruction(pc + i * 4);
+    if (!inst.valid || inst.hex != words[i])
+      return 0;
+  }
+  return 1;
+}

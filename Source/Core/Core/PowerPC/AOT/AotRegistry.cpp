@@ -121,3 +121,14 @@ extern "C" void aot_register_game_image(const char* game_id, const char* dol_sha
 {
   AotRegistry::Instance().RegisterImageHash(game_id, dol_sha256_hex);
 }
+
+void AotRegistry::RegisterImageBlockSizes(const std::string& game_id, uint32_t (*lookup)(uint32_t))
+{
+  if (!IsRejected(game_id))
+    m_games[game_id].image_block_size = lookup;
+}
+
+extern "C" void aot_register_image_block_sizes(const char* game_id, uint32_t (*lookup)(uint32_t))
+{
+  AotRegistry::Instance().RegisterImageBlockSizes(game_id, lookup);
+}

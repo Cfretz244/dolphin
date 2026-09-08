@@ -32,6 +32,7 @@
 #include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/PPCTables.h"
 
+#include "DolphinTool/DolImages.h"
 #include "DolphinTool/OverlayImages.h"
 #include "DolphinTool/PPCMemoryImage.h"
 #include "DolphinTool/RelModules.h"
@@ -607,6 +608,19 @@ static void RunDisassembly(const PPCMemoryImage& memory, const TraceData& trace,
     fmt::println(std::cerr, "Disassembly: {} initial seeds -> {} blocks, {} edges",
                  initial_seeds, blocks.size(), edges.size());
   }
+}
+
+std::map<u32, u32> DisassembleDolSeeds(const PPCMemoryImage& memory, const std::set<u32>& seeds)
+{
+  TraceData trace;
+  trace.seed_addresses.insert(seeds.begin(), seeds.end());
+  std::map<u32, CFGBlock> blocks;
+  std::vector<CFGEdge> edges;
+  RunDisassembly(memory, trace, blocks, edges, false);
+  std::map<u32, u32> counts;
+  for (const auto& [pc, block] : blocks)
+    counts.emplace(pc, block.num_instructions);
+  return counts;
 }
 
 // ============================================================================
@@ -1631,6 +1645,8 @@ int CfgCommand(const std::vector<std::string>& args)
       .help("Path to .dpht trace file (repeatable — multiple traces union into one CFG)");
   parser.add_option("-o", "--output").action("store").help("Path to output SQLite database");
   parser.add_option("-v", "--verbose").action("store_true").help("Print detailed progress");
+  parser.add_option("--dol-images").action("store_true")
+      .help("Experimental: content-guarded alternate DOLs from instruction snapshots");
   parser.add_option("--no-rels")
       .action("store_true")
       .help("Skip discovery and CFG extraction of .rel relocatable modules");
@@ -1731,7 +1747,7 @@ int CfgCommand(const std::vector<std::string>& args)
   // code requires a relocation, so module CFGs need no trace input — and the
   // DOL-code targets of module relocations seed the main pass below).
   std::vector<RelFile> modules;
-  if (!no_rels)
+  if (!no_rels && !options.is_set("dol_images"))
     modules = DiscoverRelModules(*volume, verbose);
   std::sort(modules.begin(), modules.end(),
             [](const RelFile& a, const RelFile& b) { return a.module_id < b.module_id; });
@@ -1780,6 +1796,16 @@ int CfgCommand(const std::vector<std::string>& args)
   }
   fmt::println(std::cerr, "Trace: {} seed blocks, {} edges ({} dynamic) from {} file(s)",
                trace.blocks.size(), trace.edges.size(), dynamic_count, trace_paths.size());
+
+  if (options.is_set("dol_images"))
+  {
+    if (options.is_set("overlays"))
+    {
+      fmt::println(std::cerr, "--dol-images and --overlays are mutually exclusive");
+      return EXIT_FAILURE;
+    }
+    return WriteDolImageCFG(*volume, trace.snapshot_blocks, output_path) ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
 
   // 4. Run recursive descent disassembly
   std::map<u32, CFGBlock> blocks;

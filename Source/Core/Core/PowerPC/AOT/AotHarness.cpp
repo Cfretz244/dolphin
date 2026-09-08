@@ -149,6 +149,7 @@ std::unique_ptr<AotHarness> AotHarness::MaybeCreate(Core::System& system,
   if (entry)
   {
     harness->m_lookup_block = entry->lookup_block;
+    harness->m_image_block_size = entry->image_block_size;
     for (u32 i = 0; i < entry->block_size_count; i++)
       harness->m_block_sizes[entry->block_sizes[i].addr] = entry->block_sizes[i].num_instructions;
     for (u32 i = 0; i < entry->module_block_size_count; i++)
@@ -163,7 +164,8 @@ std::unique_ptr<AotHarness> AotHarness::MaybeCreate(Core::System& system,
   }
 
   // Comparison modes silently compare nothing without block boundaries — fail loudly.
-  if ((diff_mode || std::getenv("AOT_COMPARE")) && harness->m_block_sizes.empty())
+  if ((diff_mode || std::getenv("AOT_COMPARE")) && harness->m_block_sizes.empty() &&
+      !harness->m_image_block_size)
   {
     ERROR_LOG_FMT(AOT, "AotHarness: comparison requested but the AOT library carries no block "
                        "boundary metadata — rebuild it with AOT_HARNESS=1 (stack.sh aot-macos). "
@@ -370,9 +372,19 @@ void AotHarness::Run()
         u64 compare_key = block_pc;
         if (aot_fn)
         {
-          auto it = m_block_sizes.find(block_pc);
-          if (it != m_block_sizes.end())
-            block_size = it->second;
+          if (m_image_block_size)
+          {
+            block_size = m_image_block_size(block_pc);
+            // The same PC can have multiple compiled image variants. Dedup by
+            // function identity so a launcher comparison never suppresses MP1.
+            compare_key = (u64(1) << 62) | reinterpret_cast<uintptr_t>(aot_fn);
+          }
+          else
+          {
+            auto it = m_block_sizes.find(block_pc);
+            if (it != m_block_sizes.end())
+              block_size = it->second;
+          }
         }
         else
         {
@@ -913,6 +925,8 @@ void AotHarness::RunDiff()
 
   fmt::print(log, "AOT Diff Harness — {} mode\n", self_diff ? "self-diff" : "AOT-vs-interpreter");
   fmt::print(log, "Block boundaries loaded: {}\n", m_block_sizes.size());
+  if (m_image_block_size)
+    fmt::print(log, "Dynamic DOL image boundaries: enabled\n");
   fmt::print(log, "RAM size: {} MB (MEM1 {} MB + MEM2 {} MB)\n\n", shadow_size / (1024 * 1024),
              guest_ram.mem1_size / (1024 * 1024), guest_ram.mem2_size / (1024 * 1024));
   std::fflush(log);
@@ -962,7 +976,9 @@ void AotHarness::RunDiff()
 
       // Look up block in CFG database
       auto it = m_block_sizes.find(block_pc);
-      if (it == m_block_sizes.end())
+      const u32 num_instr = m_image_block_size ? m_image_block_size(block_pc) :
+                            (it == m_block_sizes.end() ? 0 : it->second);
+      if (num_instr == 0)
       {
         // Unknown block — run interpreter single step (same as AOT fallback)
         m_ppc_state.npc = m_ppc_state.pc + 4;
@@ -978,7 +994,6 @@ void AotHarness::RunDiff()
         continue;
       }
 
-      const u32 num_instr = it->second;
 
       // Look up AOT block function early (needed by validation skip and filter paths)
       AOTBlockFunc aot_block_fn =

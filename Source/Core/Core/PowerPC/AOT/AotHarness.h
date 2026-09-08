@@ -106,6 +106,7 @@ private:
   DispatchFunc m_dispatch = nullptr;
   DispatchFunc m_interp_dispatch = nullptr;
   AOTLookupFunc m_lookup_block = nullptr;
+  uint32_t (*m_image_block_size)(uint32_t) = nullptr;
 
   // Block boundary maps, from the AOT library's aot_register_block_sizes
   // (present in AOT_HARNESS builds of the generated code only).

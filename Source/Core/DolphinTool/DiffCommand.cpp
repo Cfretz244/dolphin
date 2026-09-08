@@ -54,6 +54,8 @@ int DiffCommand(const std::vector<std::string>& args)
 
   parser.add_option("--iso").action("store").metavar("<path>").help("Path to game ISO (required)");
 
+  parser.add_option("--user").action("store").help("Use an isolated Dolphin user directory");
+
   parser.add_option("--max-blocks")
       .action("store")
       .type("int")
@@ -121,7 +123,7 @@ int DiffCommand(const std::vector<std::string>& args)
   const bool self_diff = static_cast<int>(options.get("self_diff")) != 0;
 
   // Initialize UICommon (config system, video backend)
-  UICommon::SetUserDirectory("");  // Use default user directory
+  UICommon::SetUserDirectory(options.is_set("user") ? std::string(options["user"]) : "");
   UICommon::Init();
 
   // Headless WSI — no window, null video backend

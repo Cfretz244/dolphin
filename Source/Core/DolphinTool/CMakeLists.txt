@@ -1,5 +1,7 @@
 add_executable(dolphin-tool
   ToolHeadlessPlatform.cpp
+  DolImages.cpp
+  DolImages.h
   AotCommand.cpp
   AotCommand.h
   AotCEmitter.cpp
@@ -78,3 +80,12 @@ endif()
 
 set(CPACK_PACKAGE_EXECUTABLES ${CPACK_PACKAGE_EXECUTABLES} dolphin-tool)
 install(TARGETS dolphin-tool RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# Offline image generation uses RAII to unwind database/file failures. All
+# exceptions are caught at its bool-returning entry points; core/runtime code
+# retains Dolphin's no-exceptions policy.
+if(MSVC)
+  set_source_files_properties(DolImages.cpp PROPERTIES COMPILE_OPTIONS "/EHsc")
+else()
+  set_source_files_properties(DolImages.cpp PROPERTIES COMPILE_OPTIONS "-fexceptions")
+endif()
