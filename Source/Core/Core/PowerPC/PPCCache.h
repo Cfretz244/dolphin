@@ -33,6 +33,10 @@ constexpr u32 CACHE_VMEM_BIT = 0x20000000;
 
 struct Cache
 {
+  // Host-only revision for consumers of resident cache contents. Never serialize
+  // or reset it: restoring a savestate must invalidate prior validation results.
+  u64 content_generation = 0;
+
   std::array<std::array<std::array<u32, CACHE_BLOCK_SIZE>, CACHE_WAYS>, CACHE_SETS> data{};
 
   // Stores the 32-byte aligned address of the start of each cache block. This consists of the cache
@@ -50,6 +54,14 @@ struct Cache
   std::vector<u8> lookup_table{};
   std::vector<u8> lookup_table_ex{};
   std::vector<u8> lookup_table_vmem{};
+
+  // Valid only for a resident location, e.g. one protected by content_generation.
+  void MarkUsed(u32 set, u32 way)
+  {
+    constexpr std::array<u8, 8> masks{11, 11, 19, 19, 37, 37, 69, 69};
+    constexpr std::array<u8, 8> values{11, 3, 17, 1, 36, 4, 64, 0};
+    plru[set] = (plru[set] & ~masks[way]) | values[way];
+  }
 
   void Store(Memory::MemoryManager& memory, u32 addr);
   void Invalidate(Memory::MemoryManager& memory, u32 addr);

@@ -5,6 +5,7 @@
 // These wrap Dolphin's existing subsystems (MMU, Interpreter, CoreTiming).
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -146,6 +147,26 @@ static u8* s_l1_ptr = nullptr;
 static u32 s_l1_size = 0;
 
 // Interpreter fallback tracking (enabled by AOT_TRACK_FALLBACKS=1)
+// Expected instruction arrays are immutable generated constants. Cache only
+// successful resident comparisons, bounded independently of game coverage.
+struct GuardMemo
+{
+  const u32* words = nullptr;
+  u64 generation = 0;
+  u32 physical = 0;
+  u32 count = 0;
+  u32 line_count = 0;
+  struct Location
+  {
+    u8 set;
+    u8 way;
+  };
+  std::array<Location, 4> lines{};
+};
+static std::array<GuardMemo, 16384> s_guard_memos{};
+static u64 s_guard_checks = 0;
+static u64 s_guard_reuses = 0;
+
 static bool s_track_fallbacks = false;
 static std::unordered_map<u32, u64> s_fallback_counts;
 
@@ -198,6 +219,8 @@ AotFastMem aot_fast_mem = {nullptr, 0, nullptr, 0};
 
 void aot_init_fast_mem()
 {
+  s_guard_memos.fill({});
+  s_guard_checks = s_guard_reuses = 0;
   s_system = &Core::System::GetInstance();
   s_interpreter = &s_system->GetInterpreter();
   s_mmu = &s_system->GetMMU();
@@ -220,6 +243,8 @@ void aot_init_fast_mem()
 // survive into a second game's session.
 void aot_shutdown()
 {
+  s_guard_memos.fill({});
+  s_guard_checks = s_guard_reuses = 0;
   s_system = nullptr;
   s_interpreter = nullptr;
   s_mmu = nullptr;
@@ -366,6 +391,7 @@ void aot_dump_fallback_stats()
 
   fmt::print(stderr, "\n=== AOT Interpreter Fallback Stats ===\n");
   fmt::print(stderr, "Total fallbacks: {}\n", total);
+  fmt::print(stderr, "Resident guard checks: {} | Reused: {}\n", s_guard_checks, s_guard_reuses);
   fmt::print(stderr, "Unique PCs: {}\n\n", sorted.size());
 
   const size_t limit = std::min<size_t>(sorted.size(), 50);
@@ -1333,8 +1359,8 @@ void aot_icbi(AOTState* s, uint32_t addr)
 
 // Fast path for content guards: compare words already resident in the emulated
 // instruction cache, translating once per BAT range instead of once per word.
-// No validation result is cached: icbi, eviction, state loads and BAT changes
-// are observed immediately through the live cache and translation tables.
+// Successful comparisons may be reused while cache contents and the physical
+// mapping stay unchanged. Cache hits still update the replacement policy.
 static std::optional<bool> MatchResidentCode(uint32_t pc, const uint32_t* words, uint32_t count)
 {
   auto& system = GetSystem();
@@ -1360,6 +1386,23 @@ static std::optional<bool> MatchResidentCode(uint32_t pc, const uint32_t* words,
         (mem2_offset < s_exram_size && bytes <= s_exram_size - mem2_offset)))
     return std::nullopt;
 
+  const uintptr_t key = reinterpret_cast<uintptr_t>(words);
+  const size_t slot = ((key >> 2) ^ (key >> 16)) & (s_guard_memos.size() - 1);
+  auto& memo = s_guard_memos[slot];
+  const bool validated = memo.words == words && memo.physical == physical &&
+                         memo.count == count && memo.generation == cache.content_generation;
+  if (s_track_fallbacks)
+  {
+    ++s_guard_checks;
+    s_guard_reuses += validated;
+  }
+  if (validated)
+  {
+    for (u32 n = 0; n < memo.line_count; ++n)
+      cache.MarkUsed(memo.lines[n].set, memo.lines[n].way);
+    return true;
+  }
+  GuardMemo pending{words, cache.content_generation, physical, count};
   u32 checked = 0;
   while (checked < count)
   {
@@ -1374,8 +1417,13 @@ static std::optional<bool> MatchResidentCode(uint32_t pc, const uint32_t* words,
     for (u32 n = 0; n < length; ++n)
       if (Common::swap32(cache.data[set][way][offset + n]) != words[checked + n])
         return false;
+    if (pending.line_count < pending.lines.size())
+      pending.lines[pending.line_count] = {static_cast<u8>(set), static_cast<u8>(way)};
+    ++pending.line_count;
     checked += length;
   }
+  if (pending.line_count <= pending.lines.size())
+    memo = pending;
   return true;
 }
 

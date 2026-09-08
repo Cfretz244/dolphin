@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include "Common/ChunkFile.h"
+#include "Common/Swap.h"
 #include "Core/Core.h"
 #include "Core/HW/Memmap.h"
 #include "Core/PowerPC/Gekko.h"
@@ -67,13 +68,19 @@ protected:
       system.GetMemory().Write_U32(words[i], physical + 4 * i);
   }
   int Match(u32 pc) { return aot_match_code(pc, words.data(), words.size()); }
+  void Warm(u32 pc)
+  {
+    ASSERT_EQ(Match(pc), 1);  // Fill cache.
+    ASSERT_EQ(Match(pc), 1);  // Validate resident words.
+    ASSERT_EQ(Match(pc), 1);  // Reuse validation.
+  }
 };
 
 TEST_F(AotCodeGuardTest, WritesRemainInvisibleUntilIcbi)
 {
   Write(0x101c);  // Three cache lines, including a partial first line.
-  ASSERT_EQ(Match(0x101c), 1);  // Fill via MMU.
-  ASSERT_EQ(Match(0x101c), 1);  // Resident fast path.
+  Warm(0x101c);  // Fill via MMU.
+  Warm(0x101c);  // Resident fast path.
   system.GetMemory().Write_U32(0x38600002, 0x101c);
   EXPECT_EQ(Match(0x101c), 1);
   system.GetPPCState().iCache.Invalidate(system.GetMemory(), system.GetJitInterface(), 0x101c);
@@ -91,7 +98,7 @@ TEST_F(AotCodeGuardTest, BatRemappingSelectsNewPhysicalCode)
   auto& bat = system.GetMMU().GetIBATTable()[0x80001000 >> PowerPC::BAT_INDEX_SHIFT];
   bat = PowerPC::BAT_MAPPED_BIT;
   system.GetPPCState().msr.IR = 1;
-  ASSERT_EQ(Match(0x80001000), 1);
+  Warm(0x80001000);
   bat = 0x20000 | PowerPC::BAT_MAPPED_BIT;
   EXPECT_EQ(Match(0x80001000), 0);
   words[0] = 0x38600002;
@@ -101,7 +108,7 @@ TEST_F(AotCodeGuardTest, BatRemappingSelectsNewPhysicalCode)
 TEST_F(AotCodeGuardTest, EvictionExposesModifiedRam)
 {
   Write(0x1000);
-  ASSERT_EQ(Match(0x1000), 1);
+  Warm(0x1000);
   system.GetMemory().Write_U32(0x38600002, 0x1000);
   for (u32 i = 1; i <= 16; ++i)
     system.GetPPCState().iCache.ReadInstruction(system.GetMemory(), system.GetPPCState(),
@@ -114,7 +121,7 @@ TEST_F(AotCodeGuardTest, EvictionExposesModifiedRam)
 TEST_F(AotCodeGuardTest, DisabledCacheReadsRam)
 {
   Write(0x1000);
-  ASSERT_EQ(Match(0x1000), 1);
+  Warm(0x1000);
   system.GetMemory().Write_U32(0x38600002, 0x1000);
   HID0(system.GetPPCState()).ICE = 0;
   EXPECT_EQ(Match(0x1000), 0);
@@ -138,7 +145,7 @@ TEST_F(AotCodeGuardTest, Mem2AndBatBoundary)
 TEST_F(AotCodeGuardTest, RestoredCacheSelectsRestoredInstructions)
 {
   Write(0x1000);
-  ASSERT_EQ(Match(0x1000), 1);
+  Warm(0x1000);
   std::array<u8, 65536> saved{};
   u8* cursor = saved.data();
   PointerWrap writer(&cursor, saved.size(), PointerWrap::Mode::Write);
@@ -147,7 +154,7 @@ TEST_F(AotCodeGuardTest, RestoredCacheSelectsRestoredInstructions)
   cache.Invalidate(system.GetMemory(), system.GetJitInterface(), 0x1000);
   words[0] = 0x38600002;
   Write(0x1000);
-  ASSERT_EQ(Match(0x1000), 1);
+  Warm(0x1000);
   cursor = saved.data();
   PointerWrap reader(&cursor, saved.size(), PointerWrap::Mode::Read);
   cache.DoState(system.GetMemory(), reader);
@@ -160,10 +167,72 @@ TEST_F(AotCodeGuardTest, LockedCacheMissDoesNotRememberRam)
 {
   Write(0x1000);
   HID0(system.GetPPCState()).ILOCK = 1;
-  ASSERT_EQ(Match(0x1000), 1);
+  Warm(0x1000);
   words[0] = 0x38600002;
   Write(0x1000);
   EXPECT_EQ(Match(0x1000), 1);
+}
+
+TEST_F(AotCodeGuardTest, ReusePreservesReplacementPolicy)
+{
+  auto& cache = system.GetPPCState().iCache;
+  for (u32 way = 0; way < PowerPC::CACHE_WAYS; ++way)
+  {
+    const u32 pc = 0x101c + way * 4096;
+    Write(pc);
+    Warm(pc);  // Three lines in successively populated ways.
+    for (u32 initial = 0; initial < 128; ++initial)
+    {
+      cache.plru.fill(initial);
+      for (u32 i = 0; i < words.size(); ++i)
+        cache.ReadInstruction(system.GetMemory(), system.GetPPCState(), pc + 4 * i);
+      const auto expected = cache.plru;
+      cache.plru.fill(initial);
+      EXPECT_EQ(Match(pc), 1);
+      EXPECT_EQ(cache.plru, expected);
+    }
+  }
+}
+
+TEST_F(AotCodeGuardTest, CacheWriteAndResetInvalidateReuse)
+{
+  Write(0x1000);
+  Warm(0x1000);
+  auto& cache = system.GetPPCState().iCache;
+  const u32 replacement = Common::swap32(0x38600002u);
+  cache.Write(system.GetMemory(), 0x1000, &replacement, sizeof(replacement), true);
+  EXPECT_EQ(Match(0x1000), 0);
+  static_cast<PowerPC::Cache&>(cache).Reset();
+  Warm(0x1000);  // Original RAM contents, independent of the modified cache line.
+  system.GetMemory().Write_U32(0x38600002, 0x1000);
+  static_cast<PowerPC::Cache&>(cache).Reset();
+  EXPECT_EQ(Match(0x1000), 0);
+}
+
+TEST_F(AotCodeGuardTest, ExpectedVariantsHaveIndependentResults)
+{
+  Write(0x1000);
+  Warm(0x1000);
+  auto other = words;
+  other.back() = 0x38600002;
+  EXPECT_EQ(aot_match_code(0x1000, other.data(), other.size()), 0);
+  EXPECT_EQ(Match(0x1000), 1);
+  EXPECT_EQ(aot_match_code(0x1000, other.data(), 1), 1);
+  EXPECT_EQ(aot_match_code(0x1000, other.data(), other.size()), 0);
+}
+
+TEST_F(AotCodeGuardTest, LargeBlocksRemainFullyChecked)
+{
+  std::array<u32, 64> large;
+  large.fill(0x60000000);
+  for (u32 i = 0; i < large.size(); ++i)
+    system.GetMemory().Write_U32(large[i], 0x101c + 4 * i);
+  for (int i = 0; i < 3; ++i)
+    EXPECT_EQ(aot_match_code(0x101c, large.data(), large.size()), 1);
+  const u32 last = 0x101c + 4 * (large.size() - 1);
+  system.GetMemory().Write_U32(0x38600002, last);
+  system.GetPPCState().iCache.Invalidate(system.GetMemory(), system.GetJitInterface(), last);
+  EXPECT_EQ(aot_match_code(0x101c, large.data(), large.size()), 0);
 }
 
 TEST_F(AotCodeGuardTest, RejectsInvalidBounds)

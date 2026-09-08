@@ -18,13 +18,6 @@ namespace PowerPC
 {
 namespace
 {
-constexpr std::array<u32, 8> s_plru_mask{
-    11, 11, 19, 19, 37, 37, 69, 69,
-};
-constexpr std::array<u32, 8> s_plru_value{
-    11, 3, 17, 1, 36, 4, 64, 0,
-};
-
 constexpr std::array<u32, 255> s_way_from_valid = [] {
   std::array<u32, 255> data{};
   for (size_t m = 0; m < data.size(); m++)
@@ -96,6 +89,7 @@ InstructionCache::~InstructionCache()
 
 void Cache::Reset()
 {
+  ++content_generation;
   valid.fill(0);
   plru.fill(0);
   modified.fill(0);
@@ -157,6 +151,7 @@ void Cache::FlushAll(Memory::MemoryManager& memory)
 
 void Cache::Invalidate(Memory::MemoryManager& memory, u32 addr)
 {
+  ++content_generation;
   auto [set, way] = GetCache(memory, addr, true);
 
   if (way == 0xff)
@@ -178,6 +173,7 @@ void Cache::Invalidate(Memory::MemoryManager& memory, u32 addr)
 
 void Cache::Flush(Memory::MemoryManager& memory, u32 addr)
 {
+  ++content_generation;
   auto [set, way] = GetCache(memory, addr, true);
 
   if (way == 0xff)
@@ -227,6 +223,7 @@ std::pair<u32, u32> Cache::GetCache(Memory::MemoryManager& memory, u32 addr, boo
   // load to the cache
   if (!locked && way == 0xff)
   {
+    ++content_generation;
     // select a way
     if (valid[set] != 0xff)
       way = s_way_from_valid[valid[set]];
@@ -264,7 +261,7 @@ std::pair<u32, u32> Cache::GetCache(Memory::MemoryManager& memory, u32 addr, boo
 
   // update plru
   if (way != 0xff)
-    plru[set] = (plru[set] & ~s_plru_mask[way]) | s_plru_value[way];
+    MarkUsed(set, way);
 
   return {set, way};
 }
@@ -298,6 +295,7 @@ void Cache::Read(Memory::MemoryManager& memory, u32 addr, void* buffer, u32 len,
 
 void Cache::Write(Memory::MemoryManager& memory, u32 addr, const void* buffer, u32 len, bool locked)
 {
+  ++content_generation;
   auto* value = static_cast<const u8*>(buffer);
 
   while (len > 0)
@@ -328,6 +326,7 @@ void Cache::DoState(Memory::MemoryManager& memory, PointerWrap& p)
 {
   if (p.IsReadMode())
   {
+    ++content_generation;
     // Clear valid parts of the lookup tables (this is done instead of using fill(0xff) to avoid
     // loading the entire 4MB of tables into cache)
     for (u32 set = 0; set < CACHE_SETS; set++)
@@ -388,6 +387,7 @@ u32 InstructionCache::ReadInstruction(Memory::MemoryManager& memory,
 void InstructionCache::Invalidate(Memory::MemoryManager& memory, JitInterface& jit_interface,
                                   u32 addr)
 {
+  ++content_generation;
   // Per the 750cl manual, section 3.4.1.5 Instruction Cache Enabling/Disabling (page 137)
   // and section 3.4.2.6 Instruction Cache Block Invalidate (icbi) (page 140), the icbi
   // instruction always invalidates, even if the instruction cache is disabled or locked,
