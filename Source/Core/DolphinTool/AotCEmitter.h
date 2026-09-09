@@ -69,7 +69,10 @@ public:
 
   // Translate a single block. Returns the C function body as a string.
   // If from_trace is true, the block was observed during trace collection (hot).
-  std::string TranslateBlock(u32 block_addr, u32 num_instructions, bool from_trace = true);
+  // A larger guard_instructions permits fallthrough fusion only after the caller
+  // proves a single cache line containing no cache/mapping mutators or calls.
+  std::string TranslateBlock(u32 block_addr, u32 num_instructions, bool from_trace = true,
+                             u32 guard_instructions = 0);
 
   // Chain inlining (DOL mode only): a block in inline_targets has exactly one
   // non-dynamic CFG in-edge — the fallthrough from its predecessor — so the
@@ -84,7 +87,7 @@ public:
                       std::unordered_set<u32> inline_targets);
 
   // Alternate fixed-address images: every entry is checked, including direct
-  // tail calls. No inlining or image-local indirect probe can bypass the guard.
+  // tail calls. Bounded resident-line chains may share their entry guard.
   void SetGuardedImages() { m_guarded_images = true; }
 
   // Get the set of unhandled opcodes encountered during translation.
@@ -221,6 +224,7 @@ private:
   void EmitBlockBody(std::string& out, u32 block_addr, u32 num_instructions);
 
   bool m_guarded_images = false;
+  u32 m_guarded_inline_end = 0;
   const PPCMemoryImage& m_memory;
   std::set<u32> m_known_blocks;
   std::string m_prefix;

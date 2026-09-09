@@ -108,24 +108,31 @@ void AOTCEmitter::SetInlineHints(std::unordered_map<u32, u32> block_sizes,
   m_inline_targets = std::move(inline_targets);
 }
 
-std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bool from_trace)
+std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bool from_trace,
+                                        u32 guard_instructions)
 {
   std::string out;
   // regular,pure_instructions marks these as code sections — without it the
   // linker won't synthesize branch islands, and once total __TEXT exceeds the
   // ±128MB B/BL range (5+ games linked together) direct branches from AOT
   // blocks back to <ID>_dispatch fail to fix up.
-  const char* section = from_trace ? "__TEXT,__aot_hot,regular,pure_instructions" :
-                                     "__TEXT,__aot_cold,regular,pure_instructions";
+  const char* section = from_trace ? "__TEXT,__aot_hot,regular,pure_instructions"
+                                   : "__TEXT,__aot_cold,regular,pure_instructions";
   out += fmt::format("__attribute__((noinline, section(\"{}\")))"
                      " void {}(AOTState* s) {{\n",
                      section, BlockFn(block_addr, false));
 
+  m_guarded_inline_end = 0;
   if (m_guarded_images)
   {
-    out += fmt::format("    if (!aot_match_code({:#x}u, {}_words, {}u)) {{ s->pc={:#x}u; "
+    const bool chain = guard_instructions > num_instructions;
+    const u32 checked = chain ? guard_instructions : num_instructions;
+    if (chain)
+      m_guarded_inline_end = block_addr + checked * 4;
+    out += fmt::format("    if (!{}({:#x}u, {}_words, {}u)) {{ s->pc={:#x}u; "
                        "[[clang::musttail]] return {}_dispatch(s); }}\n",
-                       block_addr, BlockFn(block_addr, false), num_instructions, block_addr, m_prefix);
+                       chain ? "aot_match_chain" : "aot_match_code", block_addr,
+                       BlockFn(block_addr, false), checked, block_addr, m_prefix);
   }
 
   m_inline_depth = 0;
@@ -230,22 +237,30 @@ void AOTCEmitter::EmitBlockBody(std::string& out, u32 block_addr, u32 num_instru
     // blocks; large ones amortize their musttail fine), bounded chain length,
     // forward edges only (strictly increasing PCs — cycles impossible, and
     // every CFG cycle still crosses a guarded backward edge or dispatch).
-    if (!m_guarded_images && !m_module && next_pc > block_addr && m_inline_targets.contains(next_pc) &&
-        m_inline_depth < kMaxInlineDepth)
+    if (!m_module && next_pc > block_addr && m_inline_depth < kMaxInlineDepth &&
+        (m_guarded_images ? next_pc < m_guarded_inline_end : m_inline_targets.contains(next_pc)))
     {
       auto size_it = m_block_sizes.find(next_pc);
       if (size_it != m_block_sizes.end() && size_it->second <= kMaxInlineBlockInsts &&
-          m_inline_insts + size_it->second <= kMaxInlineTotalInsts)
+          m_inline_insts + size_it->second <= kMaxInlineTotalInsts &&
+          (!m_guarded_images || size_it->second <= (m_guarded_inline_end - next_pc) / 4))
       {
         out += fmt::format("    /* chain-inlined fallthrough: {} */\n", PcStr(next_pc));
-        // Harness builds keep a per-block stop at the chain seam so the diff
-        // harness can compare block-by-block (chains otherwise run past the
-        // interpreter's comparison window and flag phantom divergences).
-        // Production compiles this out — that guard removal is the whole point.
-        out += "#if AOT_HARNESS\n";
-        out += fmt::format("    if(aot_single_block_mode){{ s->pc={}; return; }}\n",
-                           PcStr(next_pc));
-        out += "#endif\n";
+        if (m_guarded_images)
+        {
+          // The resident-line guard covers this body, but timing, exceptions
+          // and the diff harness still stop at every original block boundary.
+          out += fmt::format("    if(s->downcount<=0||s->exceptions AOT_EDGE_STOP)"
+                             "{{ s->pc={}; return; }}\n",
+                             PcStr(next_pc));
+        }
+        else
+        {
+          out += "#if AOT_HARNESS\n";
+          out +=
+              fmt::format("    if(aot_single_block_mode){{ s->pc={}; return; }}\n", PcStr(next_pc));
+          out += "#endif\n";
+        }
         m_inline_depth++;
         m_inline_insts += size_it->second;
         EmitBlockBody(out, next_pc, size_it->second);
@@ -260,8 +275,9 @@ void AOTCEmitter::EmitBlockBody(std::string& out, u32 block_addr, u32 num_instru
       // as EmitBranchTo). Un-chained fall-throughs were the dominant source of
       // dispatch-table bounces: every not-taken conditional and split-block
       // boundary unwound to the Run loop and re-entered <prefix>_dispatch.
-      out += fmt::format("    if(s->downcount<=0||s->exceptions AOT_EDGE_STOP){{ s->pc={}; return; }}\n",
-                         PcStr(next_pc));
+      out += fmt::format(
+          "    if(s->downcount<=0||s->exceptions AOT_EDGE_STOP){{ s->pc={}; return; }}\n",
+          PcStr(next_pc));
       out += fmt::format("    [[clang::musttail]] return {}(s);\n", BlockFn(next_pc, false));
     }
     else

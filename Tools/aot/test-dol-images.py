@@ -63,6 +63,8 @@ def main():
         harness = out / 'test.c'
         harness.write_text(r'''
 #include <assert.h>
+int aot_match_code(unsigned,const unsigned*,unsigned);
+int aot_match_chain(unsigned pc,const unsigned* words,unsigned count) { return aot_match_code(pc,words,count); }
 #include "TSTE01_images.h"
 extern AOTBlockFunc TSTE01_lookup_block(uint32_t);
 static uint32_t code[] = {0x38600001, 0x4e800020};

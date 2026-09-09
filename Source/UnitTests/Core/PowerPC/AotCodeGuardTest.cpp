@@ -21,6 +21,7 @@
 extern "C" void aot_init_fast_mem();
 extern "C" void aot_shutdown();
 extern "C" int aot_match_code(u32 pc, const u32* words, u32 count);
+extern "C" int aot_match_chain(u32 pc, const u32* words, u32 count);
 
 class AotCodeGuardTest : public testing::Test
 {
@@ -278,6 +279,38 @@ TEST_F(AotCodeGuardTest, DISABLED_CachedGuardThroughput)
       iterations;
   EXPECT_EQ(matches, iterations);
   std::printf("Cached three-line BAT guard: %.2f ns/check (%u checks)\n", ns, iterations);
+}
+
+TEST_F(AotCodeGuardTest, ChainRequiresResidentSingleLine)
+{
+  Write(0x1000);
+  EXPECT_EQ(aot_match_chain(0x1000, words.data(), 8), 1);  // Fill, then certify.
+  Warm(0x1000);
+  EXPECT_EQ(aot_match_chain(0x1000, words.data(), 8), 1);
+  EXPECT_EQ(aot_match_chain(0x1000, words.data(), 9), 0);
+  system.GetMemory().Write_U32(0x38600002, 0x101c);
+  EXPECT_EQ(aot_match_chain(0x1000, words.data(), 8), 1);
+  auto& cache = system.GetPPCState().iCache;
+  cache.Invalidate(system.GetMemory(), system.GetJitInterface(), 0x101c);
+  EXPECT_EQ(aot_match_chain(0x1000, words.data(), 8), 0);
+  EXPECT_EQ(aot_match_code(0x1000, words.data(), 8), 0);
+}
+
+TEST_F(AotCodeGuardTest, ChainRejectsUncachedAndLockedMissExecution)
+{
+  Write(0x1000);
+  auto& state = system.GetPPCState();
+  HID0(state).ILOCK = 1;
+  EXPECT_EQ(aot_match_code(0x1000, words.data(), 8), 1);
+  EXPECT_EQ(aot_match_chain(0x1000, words.data(), 8), 0);
+  HID0(state).ILOCK = 0;
+  Warm(0x1000);
+  EXPECT_EQ(aot_match_chain(0x1000, words.data(), 8), 1);
+  HID0(state).ICE = 0;
+  EXPECT_EQ(aot_match_chain(0x1000, words.data(), 8), 0);
+  HID0(state).ICE = 1;
+  state.iCache.m_disable_icache = true;
+  EXPECT_EQ(aot_match_chain(0x1000, words.data(), 8), 0);
 }
 
 TEST_F(AotCodeGuardTest, RejectsInvalidBounds)

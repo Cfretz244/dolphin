@@ -1424,7 +1424,8 @@ static std::optional<bool> MatchResidentCode(uint32_t pc, const uint32_t* words,
 // the cached instructions, not freshly modified RAM.
 // Keep cache fills, word comparisons and their stack temporaries out of the
 // per-block memo hit path, including when the runtime is linked with ThinLTO.
-[[gnu::noinline]] static int MatchCodeSlow(uint32_t pc, const uint32_t* words, uint32_t count)
+[[gnu::noinline]] static int MatchCodeSlow(uint32_t pc, const uint32_t* words, uint32_t count,
+                                           bool resident_only)
 {
   if (!words || !count || (pc & 3) || count > (UINT32_MAX - pc) / 4)
     return 0;
@@ -1437,14 +1438,17 @@ static std::optional<bool> MatchResidentCode(uint32_t pc, const uint32_t* words,
     if (!inst.valid || inst.hex != words[i])
       return 0;
   }
-  return 1;
+  // A normal fetch may have filled the line. Locked misses and uncached or
+  // page-table execution still cannot certify a fused chain.
+  return resident_only ? MatchResidentCode(pc, words, count).value_or(false) : 1;
 }
 
-extern "C" int aot_match_code(uint32_t pc, const uint32_t* words, uint32_t count)
+template <bool ResidentOnly>
+static int MatchCode(uint32_t pc, const uint32_t* words, uint32_t count)
 {
   // Pre-init calls use the slow path; normal hits need no lazy singleton setup.
   if (!s_system)
-    return MatchCodeSlow(pc, words, count);
+    return MatchCodeSlow(pc, words, count, ResidentOnly);
   auto& state = s_system->GetPPCState();
   auto& cache = state.iCache;
   const uintptr_t key = reinterpret_cast<uintptr_t>(words);
@@ -1456,18 +1460,33 @@ extern "C" int aot_match_code(uint32_t pc, const uint32_t* words, uint32_t count
   const bool reused =
       memo.line_count && memo.words == words && memo.pc == pc && memo.count == count &&
       memo.generation == cache.content_generation && HID0(state).ICE && !cache.m_disable_icache &&
-      (state.msr.IR
-           ? memo.translation != 0 && s_mmu &&
-                 memo.translation == s_mmu->GetIBATTable()[pc >> PowerPC::BAT_INDEX_SHIFT]
-           : memo.translation == 0);
+      (state.msr.IR ? memo.translation != 0 && s_mmu &&
+                          memo.translation == s_mmu->GetIBATTable()[pc >> PowerPC::BAT_INDEX_SHIFT]
+                    : memo.translation == 0);
   if (s_track_fallbacks)
   {
     ++s_guard_checks;
     s_guard_reuses += reused;
   }
   if (!reused)
-    return MatchCodeSlow(pc, words, count);
+    return MatchCodeSlow(pc, words, count, ResidentOnly);
   for (u32 n = 0; n < memo.line_count; ++n)
     cache.MarkUsed(memo.lines[n].set, memo.lines[n].way);
   return 1;
+}
+
+extern "C" int aot_match_code(uint32_t pc, const uint32_t* words, uint32_t count)
+{
+  return MatchCode<false>(pc, words, count);
+}
+
+// A fused chain may omit intermediate content checks only when all of its
+// instructions are already in one cache line, and its bodies cannot change
+// instruction translation or invalidate that line. The emitter proves the
+// latter; this entry point refuses uncached/locked-miss/page-table execution.
+extern "C" int aot_match_chain(uint32_t pc, const uint32_t* words, uint32_t count)
+{
+  if (!count || count > (32 - (pc & 31)) / 4)
+    return 0;
+  return MatchCode<true>(pc, words, count);
 }

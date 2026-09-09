@@ -14,6 +14,8 @@
 #include <set>
 #include <stdexcept>
 #include <utility>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
@@ -76,6 +78,44 @@ std::string Text(sqlite3_stmt* stmt, int col)
   if (!text)
     throw std::runtime_error("Missing image identity");
   return reinterpret_cast<const char*>(text);
+}
+
+// Fused bodies may write RAM, but must not change instruction-cache residency
+// or translation. They execute only behind a resident, single-cache-line guard.
+bool CanFuseFallthrough(const PPCMemoryImage& memory, u32 pc, u32 count)
+{
+  for (u32 n = 0; n < count; ++n)
+  {
+    const auto word = memory.ReadInstruction(pc + n * 4);
+    if (!word)
+      return false;
+    const UGeckoInstruction inst(*word);
+    const auto* info = PPCTables::GetOpInfo(inst, pc + n * 4);
+    if (!info)
+      return false;
+    if (inst.OPCD == 16 && !inst.LK)  // A taken edge still exits the native body.
+      continue;
+    if (info->flags & FL_ENDBLOCK)
+      return false;
+    switch (info->type)
+    {
+    case OpType::Integer:
+    case OpType::CR:
+    case OpType::Load:
+    case OpType::Store:
+    case OpType::LoadFP:
+    case OpType::StoreFP:
+    case OpType::LoadPS:
+    case OpType::StorePS:
+    case OpType::DoubleFP:
+    case OpType::SingleFP:
+    case OpType::PS:
+      break;
+    default:
+      return false;
+    }
+  }
+  return true;
 }
 
 void AddImage(std::vector<Image>& images, std::string name, std::vector<u8> bytes)
@@ -407,7 +447,7 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
       throw std::runtime_error("DOL image inventory mismatch");
     struct Block
     {
-      u32 pc, count;
+      u32 pc, count, guard_count;
       size_t image;
       std::string symbol;
     };
@@ -425,7 +465,8 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
       for (u32 n = 0; n < count; ++n)
         if (!images[id].memory.ReadInstruction(static_cast<u32>(pc) + n * 4))
           throw std::runtime_error("DOL block outside text");
-      blocks.push_back({static_cast<u32>(pc), static_cast<u32>(count), static_cast<size_t>(id),
+      blocks.push_back({static_cast<u32>(pc), static_cast<u32>(count), static_cast<u32>(count),
+                        static_cast<size_t>(id),
                         fmt::format("{}_d{}_block_{:08x}", prefix, id, pc)});
     }
     if (blocks.empty())
@@ -439,17 +480,48 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
           throw std::runtime_error("Use an empty output directory to avoid stale generated code");
       }
     }
+    std::vector<std::unordered_map<u32, u32>> sizes(images.size());
+    for (const auto& b : blocks)
+      sizes[b.image].emplace(b.pc, b.count);
+    size_t fused = 0;
+    for (auto& b : blocks)
+    {
+      // Sparse PrimeHack variants retain their original boundaries. Avoid
+      // extending base-image guards over a patch whose clone has another start.
+      const u32 line = b.pc & ~31u;
+      if (images[b.image].base_image ||
+          std::any_of(PrimeHack::MP1_PATCHES.begin(), PrimeHack::MP1_PATCHES.end(),
+                      [line](const auto& patch) { return (patch.address & ~31u) == line; }))
+        continue;
+      const u32 limit = (32 - (b.pc & 31)) / 4;
+      u32 current = b.pc, count = b.count;
+      while (b.guard_count <= limit && CanFuseFallthrough(images[b.image].memory, current, count))
+      {
+        const u32 next = b.pc + b.guard_count * 4;
+        const auto it = sizes[b.image].find(next);
+        if (it == sizes[b.image].end() || it->second > limit - b.guard_count)
+          break;
+        // The final body must also be safe: nested fallthroughs share the guard.
+        if (!CanFuseFallthrough(images[b.image].memory, next, it->second))
+          break;
+        b.guard_count += it->second;
+        current = next;
+        count = it->second;
+      }
+      fused += b.guard_count > b.count;
+    }
+    fmt::println(std::cerr, "Fused resident-line fallthrough chains at {} native entries", fused);
     std::filesystem::create_directories(output);
     Output(output + "/aot_runtime.h") << s_aot_runtime_header;
     auto header = Output(output + "/" + prefix + "_images.h");
-    header
-        << "#include \"aot_runtime.h\"\nint aot_match_code(uint32_t,const uint32_t*,uint32_t);\n";
+    header << "#include \"aot_runtime.h\"\nint aot_match_code(uint32_t,const uint32_t*,uint32_t);\n"
+           << "int aot_match_chain(uint32_t,const uint32_t*,uint32_t);\n";
     header << fmt::format("void {}_dispatch(AOTState*);\n", prefix);
     for (size_t id = 0; id < images.size(); ++id)
       header << fmt::format("#define {}_d{}_dispatch {}_dispatch\n", prefix, id, prefix);
     for (const auto& b : blocks)
       header << fmt::format("void {}(AOTState*);\nextern const uint32_t {}_words[{}];\n", b.symbol,
-                            b.symbol, b.count);
+                            b.symbol, b.guard_count);
     header.close();
     // Chunk files fit the existing stack's *_blocks_*.c compilation convention.
     std::vector<std::set<u32>> known(images.size());
@@ -461,6 +533,7 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
       auto emitter = std::make_unique<AOTCEmitter>(images[id].memory, known[id],
                                                    fmt::format("{}_d{}", prefix, id));
       emitter->SetGuardedImages();
+      emitter->SetInlineHints(sizes[id], {});
       emitters.push_back(std::move(emitter));
     }
     std::ofstream code;
@@ -475,18 +548,18 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
       }
       const auto& b = blocks[n];
       code << fmt::format("const uint32_t {}_words[] = {{", b.symbol);
-      for (u32 i = 0; i < b.count; ++i)
+      for (u32 i = 0; i < b.guard_count; ++i)
         code << fmt::format("{:#x}u,", *images[b.image].memory.ReadInstruction(b.pc + i * 4));
-      code << "};\n" << emitters[b.image]->TranslateBlock(b.pc, b.count);
+      code << "};\n" << emitters[b.image]->TranslateBlock(b.pc, b.count, true, b.guard_count);
     }
     code.close();
     auto dispatch = Output(output + "/" + prefix + "_dispatch.c");
     dispatch << fmt::format("#include \"{}_images.h\"\n", prefix);
-    dispatch << "typedef struct { uint32_t pc,count; const uint32_t* words; AOTBlockFunc fn; } "
+    dispatch << "typedef struct { uint32_t pc,count,guard_count; const uint32_t* words; AOTBlockFunc fn; } "
                 "Candidate;\n";
     dispatch << "static const Candidate candidates[] = {\n";
     for (const auto& b : blocks)
-      dispatch << fmt::format("{{{:#x}u,{}u,{}_words,{}}},\n", b.pc, b.count, b.symbol, b.symbol);
+      dispatch << fmt::format("{{{:#x}u,{}u,{}u,{}_words,{}}},\n", b.pc, b.count, b.guard_count, b.symbol, b.symbol);
     dispatch << "};\n";
     // Immutable address index: no cached image choice, so reloads, patches and
     // stale direct entries still go through the content guards. Avoid a binary
@@ -512,7 +585,8 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
     dispatch << "  if (pc&3) return 0; uint32_t page=page_ids[pc>>16]; if(!page) return 0;\n";
     dispatch << "  uint32_t lo=candidate_indices[page-1][(pc&65535)>>2]; if(!lo) return 0; --lo;\n";
     dispatch << fmt::format("  for(;lo<{}u && candidates[lo].pc==pc;++lo) {{\n", blocks.size());
-    dispatch << "    const Candidate* c=&candidates[lo]; if(aot_match_code(pc,c->words,c->count)) "
+    dispatch << "    const Candidate* c=&candidates[lo]; if(c->guard_count>c->count ? "
+                "aot_match_chain(pc,c->words,c->guard_count) : aot_match_code(pc,c->words,c->count)) "
                 "return c;\n  } return 0;\n}\n";
     dispatch << fmt::format("AOTBlockFunc {}_lookup_block(uint32_t pc) {{ const Candidate* "
                             "c=find_candidate(pc); return c?c->fn:0; }}\n",

@@ -77,6 +77,8 @@ def main():
         harness = out / 'test.c'
         harness.write_text(r'''
 #include <assert.h>
+int aot_match_code(unsigned,const unsigned*,unsigned);
+int aot_match_chain(unsigned pc,const unsigned* words,unsigned count) { return aot_match_code(pc,words,count); }
 #include <stdio.h>
 #include <stdlib.h>
 #include "R3ME01_images.h"
