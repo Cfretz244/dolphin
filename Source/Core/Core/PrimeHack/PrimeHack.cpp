@@ -23,6 +23,7 @@
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
+#include "InputCommon/ControllerInterface/ControllerInterface.h"
 #include "InputCommon/GCPadStatus.h"
 
 namespace PrimeHack
@@ -46,10 +47,13 @@ constexpr std::array<Patch, 8> PATCHES{{
 constexpr u32 STATE_MANAGER = 0x804bf420;
 std::atomic<bool> s_input_enabled{false};
 std::mutex s_input_mutex;
-GCPadStatus s_pad;
+std::atomic<bool> s_reports_active{false};
 PointerState s_pointer;
 std::atomic<PointerMode> s_pointer_mode{PointerMode::Menu};
 bool s_reported_active = false;
+// CPU-thread-owned target angles, retained while freelook owns the camera.
+u32 s_camera_player = 0;
+float s_yaw = 0, s_pitch = 0;
 
 bool Ram(u32 address, u32 size = 4)
 {
@@ -129,7 +133,7 @@ void PrepareInput(WiimoteEmu::DesiredWiimoteState* state, bool sensor_bar)
     return;
   const GCPadStatus pad = Pad::GetStatus(0);
   std::lock_guard lock(s_input_mutex);
-  s_pad = pad;
+  s_reports_active = true;
   auto mode = s_pointer_mode.load();
   // A wheel request must stop freelook immediately, before the game opens it.
   if (mode != PointerMode::Menu && WheelButton(pad))
@@ -147,7 +151,7 @@ u16 GetCurrentlyPressedButtons()
   // prevent reconnecting, and could keep moving the camera with stale stick input.
   const GCPadStatus pad = Pad::GetStatus(0);
   std::lock_guard lock(s_input_mutex);
-  s_pad = {};
+  s_reports_active = false;
   s_pointer = {};
   WiimoteEmu::DesiredWiimoteState state;
   MapPad(pad, &state, 0, 0, false);
@@ -158,10 +162,11 @@ void Reset()
 {
   s_input_enabled = false;
   std::lock_guard lock(s_input_mutex);
-  s_pad = {};
+  s_reports_active = false;
   s_pointer = {};
   s_pointer_mode = PointerMode::Menu;
   s_reported_active = false;
+  s_camera_player = 0;
 }
 
 void Update(const Core::CPUThreadGuard& guard)
@@ -174,14 +179,23 @@ void Update(const Core::CPUThreadGuard& guard)
   s_input_enabled = enabled;
   if (!supported)
   {
+    s_camera_player = 0;
     s_pointer_mode = PointerMode::Menu;
     return;
   }
 
   GCPadStatus pad;
+  pad.isConnected = false;
+  if (enabled && s_reports_active.load() && Pad::IsInitialized())
   {
-    std::lock_guard lock(s_input_mutex);
-    pad = s_pad;
+    // Sample at the camera update, rather than reusing the previous Bluetooth
+    // report. Delta's external provider is read here through the same Pad API.
+    const auto previous_channel = g_controller_interface.GetCurrentInputChannel();
+    g_controller_interface.SetCurrentInputChannel(ciface::InputChannel::Bluetooth);
+    if (g_controller_interface.IsInit())
+      g_controller_interface.UpdateInput();
+    pad = Pad::GetStatus(0);
+    g_controller_interface.SetCurrentInputChannel(previous_channel);
   }
   UpdatePrime1(guard, pad, enabled);
 }
@@ -192,6 +206,7 @@ void UpdatePrime1(const Core::CPUThreadGuard& guard, const GCPadStatus& pad, boo
   // loads, another executable at the same addresses, and conflicting mods.
   if (Read(guard, 0x8046d340) != 0x4e800020)
   {
+    s_camera_player = 0;
     s_reported_active = false;
     s_pointer_mode = PointerMode::Menu;
     return;
@@ -201,6 +216,7 @@ void UpdatePrime1(const Core::CPUThreadGuard& guard, const GCPadStatus& pad, boo
     const u32 word = Read(guard, patch.address);
     if (word != patch.original && word != patch.replacement)
     {
+      s_camera_player = 0;
       s_pointer_mode = PointerMode::Menu;
       return;
     }
@@ -229,7 +245,10 @@ void UpdatePrime1(const Core::CPUThreadGuard& guard, const GCPadStatus& pad, boo
     WriteCode(guard, PATCHES[i], enabled && centered_reticle && gun_move);
   }
   if (!enabled || !has_player)
+  {
+    s_camera_player = 0;
     return;
+  }
   if (!s_reported_active)
   {
     NOTICE_LOG_FMT(CORE,
@@ -238,11 +257,15 @@ void UpdatePrime1(const Core::CPUThreadGuard& guard, const GCPadStatus& pad, boo
   }
 
   if (wheel_input)
+  {
+    s_camera_player = 0;
     return; // Right stick belongs exclusively to selection, not camera rotation.
+  }
 
   // Keep pitch aligned with the actual first-person camera during lock-on.
   if (locked)
   {
+    s_camera_player = 0;
     const u32 manager = Read(guard, STATE_MANAGER + 0x868);
     const u32 objects = Read(guard, STATE_MANAGER + 0x810);
     if (!Ram(manager) || !Ram(objects, 0x2004))
@@ -261,26 +284,42 @@ void UpdatePrime1(const Core::CPUThreadGuard& guard, const GCPadStatus& pad, boo
     return;
   }
   if (Read(guard, player + 0x2f0) != 0 || Read(guard, STATE_MANAGER + 0x117c) != 0)
+  {
+    s_camera_player = 0;
     return; // Morph ball/cutscene or pause menu owns the camera.
+  }
 
   if (!pad.isConnected)
+  {
+    s_camera_player = 0;
     return;
+  }
   const float fx = Read<float>(guard, player + 0x30);
   const float fy = Read<float>(guard, player + 0x40);
   const float old_pitch = Read<float>(guard, player + 0x3dc);
   if (!std::isfinite(fx) || !std::isfinite(fy) || !std::isfinite(old_pitch) ||
       fx * fx + fy * fy < 0.0001f)
+  {
+    s_camera_player = 0;
     return;
+  }
+  if (s_camera_player != player)
+  {
+    s_camera_player = player;
+    s_yaw = std::atan2(fy, fx);
+    s_pitch = old_pitch;
+  }
+  const auto stick = ReadLookStick(pad);
   constexpr float step = 2.5f / 60.f; // Radians per emulated NTSC frame.
-  const float yaw = std::atan2(fy, fx) - StickAxis(pad.substickX) * step;
-  const float pitch = std::clamp(old_pitch + StickAxis(pad.substickY) * step, -1.52f, 1.52f);
-  const float rotation = yaw - 1.570796327f;
+  s_yaw = std::remainder(s_yaw - stick.x * step, 6.283185307f);
+  s_pitch = std::clamp(s_pitch + stick.y * step, -1.52f, 1.52f);
+  const float rotation = s_yaw - 1.570796327f;
   const float sy = std::sin(rotation), cy = std::cos(rotation);
   const std::array<float, 9> basis{cy, -sy, 0, sy, cy, 0, 0, 0, 1};
   for (u32 row = 0; row < 3; ++row)
     for (u32 col = 0; col < 3; ++col)
       Write(guard, player + 0x2c + row * 16 + col * 4, basis[row * 3 + col]);
-  Write(guard, player + 0x3dc, pitch);
+  Write(guard, player + 0x3dc, s_pitch);
   Write(guard, 0x804ddff8 + 0x134, 1.52f);
   const u32 cursor_root = Read(guard, 0x805c28a8);
   if (Ram(cursor_root, 0xc58))

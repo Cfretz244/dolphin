@@ -56,7 +56,18 @@ During gameplay the emulated IR pointer stays centered, so it cannot compete
 with host camera rotation. Reticle-forcing patches are restored to original
 instructions while a selection wheel or pause menu owns the pointer.
 Direct weapon/visor shortcuts, springball, MP2/MP3 support, custom guest opcodes,
-and PrimeHack's desktop UI are not ported. Pitch/yaw derive from guest state each
-frame rather than a host angle accumulator. Host-side pointer position is reset
-between sessions. Save-state transitions and full gameplay still need interactive
-validation; RAM patch unit tests alone do not establish playability.
+and PrimeHack's desktop UI are not ported.
+
+Freelook uses an 8% circular deadzone followed by a linear turn-rate response,
+with no time-based acceleration or smoothing. Combined diagonal turn rate is
+bounded to the same maximum as axial movement. Nunchuk and wheel input retain
+their existing mappings. At each camera update, input is freshly sampled through
+the pad provider rather than reusing the preceding Wii report.
+
+Pitch/yaw targets accumulate while freelook owns the camera, as in upstream
+PrimeHack; they are not reconstructed from a potentially game-modified transform
+each frame. Ownership is relinquished for lock-on, wheels, pause, morph/cutscenes,
+disconnect, invalid player/code, or disabled controls. Resuming freelook initializes
+the target from guest state. Loading a savestate resets host control state without
+changing the savestate format. Save-state transitions and full gameplay still
+need interactive validation; RAM patch tests do not establish end-to-end latency.

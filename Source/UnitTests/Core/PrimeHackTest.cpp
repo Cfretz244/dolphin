@@ -185,10 +185,22 @@ TEST_F(PrimeHackRuntime, ReconnectPollReadsFreshPadWithoutReports)
   pad.button = 0;
   EXPECT_EQ(remote.GetCurrentlyPressedButtons().hex, 0);
   EXPECT_EQ(polls, 3);
+  // Once reports resume, the frame callback must sample a newer stick position
+  // even if no further Bluetooth report has been prepared.
+  Player();
+  WiimoteEmu::DesiredWiimoteState report;
+  PrimeHack::PrepareInput(&report, true);
+  pad.substickY = 228;
+  PrimeHack::Update(guard);
+  EXPECT_GT(std::bit_cast<float>(Get(player + 0x3dc)), 0);
+  pad.substickY = 28;
+  PrimeHack::Update(guard);
+  EXPECT_NEAR(std::bit_cast<float>(Get(player + 0x3dc)), 0, 1e-6);
+  EXPECT_EQ(polls, 6);
   PrimeHack::Reset();
   pad.button = PAD_BUTTON_A;
   EXPECT_EQ(remote.GetCurrentlyPressedButtons().hex, 0);
-  EXPECT_EQ(polls, 3);
+  EXPECT_EQ(polls, 6);
 }
 
 TEST_F(PrimeHackRuntime, PatchesInvalidateInstructionCacheAndRestore)
@@ -254,6 +266,81 @@ TEST_F(PrimeHackRuntime, PauseAndMorphKeepCamera)
   Put(0x804bf420 + 0x117c, 1);
   Update(true, pad);
   EXPECT_EQ(Get(player + 0x3dc), 0u);
+}
+
+TEST(PrimeHackInput, LookDeadzonePreservesDirectionAndBoundsSpeed)
+{
+  GCPadStatus pad;
+  pad.substickX = 135;
+  auto stick = PrimeHack::ReadLookStick(pad);
+  EXPECT_EQ(stick.x, 0);
+  pad.substickY = 135;
+  stick = PrimeHack::ReadLookStick(pad);
+  EXPECT_GT(stick.x, 0);
+  EXPECT_FLOAT_EQ(stick.x, stick.y);
+  pad.substickX = 228;
+  pad.substickY = 178;
+  stick = PrimeHack::ReadLookStick(pad);
+  EXPECT_NEAR(stick.x / stick.y, 2, 1e-6);
+  EXPECT_NEAR(std::hypot(stick.x, stick.y), 1, 1e-6);
+  pad.substickX = 28;
+  pad.substickY = 78;
+  const auto reverse = PrimeHack::ReadLookStick(pad);
+  EXPECT_FLOAT_EQ(reverse.x, -stick.x);
+  EXPECT_FLOAT_EQ(reverse.y, -stick.y);
+  pad.isConnected = false;
+  EXPECT_EQ(PrimeHack::ReadLookStick(pad).x, 0);
+}
+
+TEST_F(PrimeHackRuntime, LookStartsStopsAndReversesOnNextFrame)
+{
+  Player();
+  GCPadStatus pad;
+  pad.substickY = 228;
+  Update(true, pad);
+  const float first = std::bit_cast<float>(Get(player + 0x3dc));
+  EXPECT_NEAR(first, 2.5f / 60, 1e-6);
+  pad.substickY = 128;
+  Update(true, pad);
+  EXPECT_FLOAT_EQ(std::bit_cast<float>(Get(player + 0x3dc)), first);
+  pad.substickY = 28;
+  Update(true, pad);
+  EXPECT_NEAR(std::bit_cast<float>(Get(player + 0x3dc)), 0, 1e-6);
+}
+
+TEST_F(PrimeHackRuntime, ContinuousTargetDoesNotFeedBackGuestAngleChanges)
+{
+  Player();
+  GCPadStatus pad;
+  pad.substickX = 228;
+  for (int frame = 0; frame < 30; ++frame)
+  {
+    // Emulate the game overwriting the transform between host updates.
+    Float(player + 0x30, 0);
+    Float(player + 0x40, 1);
+    Update(true, pad);
+  }
+  const float yaw = std::atan2(std::bit_cast<float>(Get(player + 0x40)),
+                               std::bit_cast<float>(Get(player + 0x30)));
+  EXPECT_NEAR(yaw, 1.570796327f - 30 * 2.5f / 60, 1e-5);
+}
+
+TEST_F(PrimeHackRuntime, CameraReacquiresAfterGameOwnershipAndReset)
+{
+  Player();
+  GCPadStatus pad;
+  pad.substickY = 228;
+  Update(true, pad);
+  Put(player + 0x2f0, 1);
+  Update(true, pad);
+  Float(player + 0x3dc, -0.5f);
+  Put(player + 0x2f0, 0);
+  Update(true, pad);
+  EXPECT_NEAR(std::bit_cast<float>(Get(player + 0x3dc)), -0.5f + 2.5f / 60, 1e-6);
+  PrimeHack::Reset();
+  Float(player + 0x3dc, 0.75f);
+  Update(true, pad);
+  EXPECT_NEAR(std::bit_cast<float>(Get(player + 0x3dc)), 0.75f + 2.5f / 60, 1e-6);
 }
 
 TEST_F(PrimeHackRuntime, LockOnRestoresGunMovement)

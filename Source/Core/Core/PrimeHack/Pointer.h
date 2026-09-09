@@ -30,6 +30,28 @@ inline bool WheelButton(const GCPadStatus& pad)
          ((pad.button & PAD_TRIGGER_Z) || ((pad.button & PAD_BUTTON_START) && !lock));
 }
 
+// A circular deadzone preserves small diagonal corrections instead of separately
+// suppressing each axis. This is a position-to-turn-rate mapping, with no temporal
+// smoothing or acceleration ramp to delay starts, stops, or reversals.
+struct LookStick
+{
+  float x, y;
+};
+
+inline LookStick ReadLookStick(const GCPadStatus& pad)
+{
+  if (!pad.isConnected)
+    return {};
+  const float x = (int(pad.substickX) - 128) / 100.f;
+  const float y = (int(pad.substickY) - 128) / 100.f;
+  const float radius = std::hypot(x, y);
+  constexpr float deadzone = 0.08f;
+  if (radius <= deadzone)
+    return {};
+  const float scale = (std::min(radius, 1.f) - deadzone) / ((1.f - deadzone) * radius);
+  return {x * scale, y * scale};
+}
+
 struct PointerState
 {
   float x = 0, y = 0;
