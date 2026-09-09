@@ -2027,6 +2027,7 @@ void MMU::DBATUpdated()
 
 void MMU::IBATUpdated()
 {
+  ++m_ppc_state.iCache.invalidation_generation;
   m_ibat_table = {};
   UpdateBATs(m_ibat_table, SPR_IBAT0U);
   bool extended_bats = m_system.IsWii() && HID4(m_ppc_state).SBE;

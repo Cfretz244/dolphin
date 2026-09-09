@@ -9,6 +9,8 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -165,6 +167,19 @@ struct GuardMemo
   std::array<Location, 4> lines{};
 };
 static std::array<GuardMemo, 16384> s_guard_memos{};
+// Trust mode intentionally omits per-fetch cache residency and PLRU emulation.
+// It assumes executable modifications are published with explicit invalidation.
+// Never cache failures: unknown or newly loaded code still needs identification.
+struct TrustedCodeMemo
+{
+  const u32* words = nullptr;
+  u64 generation = 0;
+  u32 pc = 0;
+  u32 translation = 0;
+  u32 count = 0;
+};
+static std::array<TrustedCodeMemo, 131072> s_trusted_code_memos{};
+static bool s_trust_code = false;
 static u64 s_guard_checks = 0;
 static u64 s_guard_reuses = 0;
 
@@ -221,7 +236,13 @@ AotFastMem aot_fast_mem = {nullptr, 0, nullptr, 0};
 void aot_init_fast_mem()
 {
   s_guard_memos.fill({});
+  s_trusted_code_memos.fill({});
   s_guard_checks = s_guard_reuses = 0;
+  const char* trust = std::getenv("AOT_TRUST_CODE");
+  s_trust_code = trust && std::strcmp(trust, "1") == 0;
+  if (s_trust_code)
+    std::fprintf(stderr, "AOT: experimental trust-code mode ON; validated code is reused until "
+                         "explicit invalidation (cache fill/eviction and PLRU checks omitted).\n");
   s_system = &Core::System::GetInstance();
   s_interpreter = &s_system->GetInterpreter();
   s_mmu = &s_system->GetMMU();
@@ -245,7 +266,9 @@ void aot_init_fast_mem()
 void aot_shutdown()
 {
   s_guard_memos.fill({});
+  s_trusted_code_memos.fill({});
   s_guard_checks = s_guard_reuses = 0;
+  s_trust_code = false;
   s_system = nullptr;
   s_interpreter = nullptr;
   s_mmu = nullptr;
@@ -565,6 +588,7 @@ void aot_mtspr_special(AOTState* s, uint32_t spr_index, uint32_t val)
 
   case SPR_HID0:
   {
+    ++ppc_state.iCache.invalidation_generation;
     UReg_HID0 old_hid0;
     old_hid0.Hex = old_value;
     if (HID0(ppc_state).ICFI)
@@ -1475,9 +1499,52 @@ static int MatchCode(uint32_t pc, const uint32_t* words, uint32_t count)
   return 1;
 }
 
+template <bool ResidentOnly>
+[[gnu::noinline]] static int RememberTrustedCode(uint32_t pc, const uint32_t* words, uint32_t count)
+{
+  const int matches = MatchCode<ResidentOnly>(pc, words, count);
+  // Only certify actual resident MEM1/MEM2 instructions, including for normal
+  // entries. This prevents a locked miss or uncached fetch seeding a chain memo.
+  if (matches && MatchResidentCode(pc, words, count).value_or(false))
+  {
+    auto& state = s_system->GetPPCState();
+    const u32 translation =
+        state.msr.IR ? s_mmu->GetIBATTable()[pc >> PowerPC::BAT_INDEX_SHIFT] : 0;
+    const uintptr_t key = reinterpret_cast<uintptr_t>(words);
+    auto& memo =
+        s_trusted_code_memos[((key >> 2) ^ (key >> 16)) & (s_trusted_code_memos.size() - 1)];
+    memo = {words, state.iCache.invalidation_generation, pc, translation, count};
+  }
+  return matches;
+}
+
+// Experimental fast mode: a successful resident comparison establishes the
+// instruction identity until an explicit invalidation event. Ordinary fills do
+// not expire it, and hits neither fetch instructions nor touch replacement state.
+// Translation and cache-enable checks keep unsupported execution on strict paths.
+template <bool ResidentOnly>
+static int MatchTrustedCode(uint32_t pc, const uint32_t* words, uint32_t count)
+{
+  if (!s_system)
+    return MatchCode<ResidentOnly>(pc, words, count);
+  auto& state = s_system->GetPPCState();
+  auto& cache = state.iCache;
+  const u32 translation = state.msr.IR ? s_mmu->GetIBATTable()[pc >> PowerPC::BAT_INDEX_SHIFT] : 0;
+  if (!HID0(state).ICE || cache.m_disable_icache ||
+      (state.msr.IR && !(translation & PowerPC::BAT_MAPPED_BIT)))
+    return MatchCode<ResidentOnly>(pc, words, count);
+  const uintptr_t key = reinterpret_cast<uintptr_t>(words);
+  auto& memo = s_trusted_code_memos[((key >> 2) ^ (key >> 16)) & (s_trusted_code_memos.size() - 1)];
+  if (memo.words == words && words && memo.pc == pc && memo.count == count &&
+      memo.generation == cache.invalidation_generation && memo.translation == translation)
+    return 1;
+  return RememberTrustedCode<ResidentOnly>(pc, words, count);
+}
+
 extern "C" int aot_match_code(uint32_t pc, const uint32_t* words, uint32_t count)
 {
-  return MatchCode<false>(pc, words, count);
+  return s_trust_code ? MatchTrustedCode<false>(pc, words, count)
+                      : MatchCode<false>(pc, words, count);
 }
 
 // A fused chain may omit intermediate content checks only when all of its
@@ -1488,5 +1555,6 @@ extern "C" int aot_match_chain(uint32_t pc, const uint32_t* words, uint32_t coun
 {
   if (!count || count > (32 - (pc & 31)) / 4)
     return 0;
-  return MatchCode<true>(pc, words, count);
+  return s_trust_code ? MatchTrustedCode<true>(pc, words, count)
+                      : MatchCode<true>(pc, words, count);
 }

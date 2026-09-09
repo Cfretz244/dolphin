@@ -36,6 +36,10 @@ struct Cache
   // Host-only revision for consumers of resident cache contents. Never serialize
   // or reset it: restoring a savestate must invalidate prior validation results.
   u64 content_generation = 0;
+  // Experimental AOT trust mode ignores ordinary fills/evictions, but must
+  // discard selections after explicit invalidation, writes, resets and restores.
+  // Host-only, monotonic, and deliberately not serialized.
+  u64 invalidation_generation = 0;
 
   std::array<std::array<std::array<u32, CACHE_BLOCK_SIZE>, CACHE_WAYS>, CACHE_SETS> data{};
 

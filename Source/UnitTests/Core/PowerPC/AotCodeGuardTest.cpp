@@ -5,6 +5,9 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <optional>
+#include <string>
 
 #include <gtest/gtest.h>
 
@@ -50,7 +53,26 @@ protected:
     static_cast<PowerPC::Cache&>(state.iCache).Init(system.GetMemory());
     saved_disable_icache = state.iCache.m_disable_icache;
     state.iCache.m_disable_icache = false;
+    ReinitWithTrust("0");
+  }
+  void ReinitWithTrust(const char* value)
+  {
+    const char* old = std::getenv("AOT_TRUST_CODE");
+    const std::optional<std::string> saved = old ? std::optional<std::string>(old) : std::nullopt;
+#ifdef _WIN32
+    _putenv_s("AOT_TRUST_CODE", value);
+#else
+    setenv("AOT_TRUST_CODE", value, 1);
+#endif
     aot_init_fast_mem();
+#ifdef _WIN32
+    _putenv_s("AOT_TRUST_CODE", saved ? saved->c_str() : "");
+#else
+    if (saved)
+      setenv("AOT_TRUST_CODE", saved->c_str(), 1);
+    else
+      unsetenv("AOT_TRUST_CODE");
+#endif
   }
   void TearDown() override
   {
@@ -320,4 +342,119 @@ TEST_F(AotCodeGuardTest, RejectsInvalidBounds)
   EXPECT_EQ(aot_match_code(0x1001, words.data(), 1), 0);
   EXPECT_EQ(aot_match_code(0xfffffffc, words.data(), 2), 0);
 }
+TEST_F(AotCodeGuardTest, TrustSkipsFetchAndPlruUntilExplicitInvalidation)
+{
+  ReinitWithTrust("1");
+  Write(0x1000);
+  Warm(0x1000);
+  auto& state = system.GetPPCState();
+  auto& cache = state.iCache;
+  const u64 epoch = cache.invalidation_generation;
+  system.GetMemory().Write_U32(0x38600002, 0x1000);
+  for (u32 i = 1; i <= 16; ++i)
+    cache.ReadInstruction(system.GetMemory(), state, 0x1000 + i * 4096);
+  EXPECT_EQ(cache.invalidation_generation, epoch);
+  const auto plru = cache.plru;
+  const u64 generation = cache.content_generation;
+  // Deliberate experimental difference from EvictionExposesModifiedRam:
+  // code is trusted until icbi, even after an eviction exposes changed RAM.
+  EXPECT_EQ(Match(0x1000), 1);
+  EXPECT_EQ(cache.content_generation, generation);
+  EXPECT_EQ(cache.plru, plru);
+  cache.Invalidate(system.GetMemory(), system.GetJitInterface(), 0x1000);
+  EXPECT_EQ(Match(0x1000), 0);
+  auto patched = words;
+  patched[0] = 0x38600002;
+  EXPECT_EQ(aot_match_code(0x1000, patched.data(), patched.size()), 1);
+}
+
+TEST_F(AotCodeGuardTest, TrustPatchAndSavestateChangesExpireSelections)
+{
+  ReinitWithTrust("1");
+  Write(0x1000);
+  Warm(0x1000);
+  std::array<u8, 65536> saved{};
+  u8* cursor = saved.data();
+  PointerWrap writer(&cursor, saved.size(), PointerWrap::Mode::Write);
+  auto& cache = system.GetPPCState().iCache;
+  cache.DoState(system.GetMemory(), writer);
+  system.GetMemory().Write_U32(0x38600002, 0x1000);
+  cache.Invalidate(system.GetMemory(), system.GetJitInterface(), 0x1000);
+  EXPECT_EQ(Match(0x1000), 0);
+  auto patched = words;
+  patched[0] = 0x38600002;
+  EXPECT_EQ(aot_match_code(0x1000, patched.data(), patched.size()), 1);
+  EXPECT_EQ(aot_match_code(0x1000, patched.data(), patched.size()), 1);
+  cursor = saved.data();
+  PointerWrap reader(&cursor, saved.size(), PointerWrap::Mode::Read);
+  cache.DoState(system.GetMemory(), reader);
+  EXPECT_EQ(aot_match_code(0x1000, patched.data(), patched.size()), 0);
+  EXPECT_EQ(Match(0x1000), 1);
+}
+
+TEST_F(AotCodeGuardTest, TrustChecksMappingAndCacheWrites)
+{
+  ReinitWithTrust("1");
+  Write(0x1000);
+  Warm(0x1000);
+  EXPECT_EQ(Match(0x21000), 0);
+  auto& state = system.GetPPCState();
+  auto& bat = system.GetMMU().GetIBATTable()[0];
+  bat = 0x20000 | PowerPC::BAT_MAPPED_BIT;
+  state.msr.IR = 1;
+  EXPECT_EQ(Match(0x1000), 0);
+  state.msr.IR = 0;
+  const u32 replacement = Common::swap32(0x38600002u);
+  state.iCache.Write(system.GetMemory(), 0x1000, &replacement, sizeof(replacement), true);
+  EXPECT_EQ(Match(0x1000), 0);
+  static_cast<PowerPC::Cache&>(state.iCache).Reset();
+  EXPECT_EQ(Match(0x1000), 1);
+  const u64 epoch = state.iCache.invalidation_generation;
+  system.GetMMU().IBATUpdated();
+  EXPECT_GT(state.iCache.invalidation_generation, epoch);
+}
+
+TEST_F(AotCodeGuardTest, TrustDoesNotCertifyUncachedOrLockedMisses)
+{
+  ReinitWithTrust("1");
+  Write(0x1000);
+  auto& state = system.GetPPCState();
+  HID0(state).ILOCK = 1;
+  EXPECT_EQ(Match(0x1000), 1);
+  EXPECT_EQ(aot_match_chain(0x1000, words.data(), 8), 0);
+  system.GetMemory().Write_U32(0x38600002, 0x1000);
+  EXPECT_EQ(Match(0x1000), 0);
+  HID0(state).ILOCK = 0;
+  Write(0x1000);
+  Warm(0x1000);
+  HID0(state).ICE = 0;
+  system.GetMemory().Write_U32(0x38600002, 0x1000);
+  EXPECT_EQ(Match(0x1000), 0);
+  EXPECT_EQ(aot_match_chain(0x1000, words.data(), 8), 0);
+  EXPECT_EQ(aot_match_code(0x1000, words.data(), 0), 0);
+  EXPECT_EQ(aot_match_code(0x1001, words.data(), 1), 0);
+}
+
+TEST_F(AotCodeGuardTest, DISABLED_TrustCodeThroughput)
+{
+  Write(0x101c);
+  system.GetPPCState().msr.IR = 1;
+  system.GetMMU().GetIBATTable()[0x8000101c >> PowerPC::BAT_INDEX_SHIFT] = PowerPC::BAT_MAPPED_BIT;
+  for (const char* mode : {"0", "1"})
+  {
+    ReinitWithTrust(mode);
+    Warm(0x8000101c);
+    constexpr u32 iterations = 20000000;
+    u32 matches = 0;
+    const auto start = std::chrono::steady_clock::now();
+    for (u32 i = 0; i < iterations; ++i)
+      matches += Match(0x8000101c);
+    const double ns =
+        std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() /
+        iterations;
+    EXPECT_EQ(matches, iterations);
+    std::printf("AOT_TRUST_CODE=%s: %.2f ns/check (%u checks)\n", mode, ns, iterations);
+  }
+}
+
 #endif

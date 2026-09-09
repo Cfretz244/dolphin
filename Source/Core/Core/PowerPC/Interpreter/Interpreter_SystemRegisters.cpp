@@ -344,6 +344,7 @@ void Interpreter::mtspr(Interpreter& interpreter, UGeckoInstruction inst)
 
   case SPR_HID0:  // HID0
   {
+    ++ppc_state.iCache.invalidation_generation;
     UReg_HID0 old_hid0;
     old_hid0.Hex = old_value;
     if (HID0(ppc_state).ICE != old_hid0.ICE)
