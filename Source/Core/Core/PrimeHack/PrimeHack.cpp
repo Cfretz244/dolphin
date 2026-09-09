@@ -4,6 +4,7 @@
 // 53f53e0f5bad27ad62a807cb93b136d84f68777f. See README.md for scope/provenance.
 
 #include "Core/PrimeHack/PrimeHack.h"
+#include "Core/PrimeHack/Pointer.h"
 
 #include <algorithm>
 #include <array>
@@ -46,16 +47,9 @@ constexpr u32 STATE_MANAGER = 0x804bf420;
 std::atomic<bool> s_input_enabled{false};
 std::mutex s_input_mutex;
 GCPadStatus s_pad;
-float s_pointer_x = 0, s_pointer_y = 0;
+PointerState s_pointer;
+std::atomic<PointerMode> s_pointer_mode{PointerMode::Menu};
 bool s_reported_active = false;
-
-float Axis(u8 value)
-{
-  const float v = std::clamp((int(value) - 128) / 100.f, -1.f, 1.f);
-  constexpr float deadzone = 0.15f;
-  return std::abs(v) <= deadzone ? 0.f
-                                 : std::copysign((std::abs(v) - deadzone) / (1 - deadzone), v);
-}
 
 bool Ram(u32 address, u32 size = 4)
 {
@@ -121,8 +115,8 @@ void MapPad(const GCPadStatus& input, WiimoteEmu::DesiredWiimoteState* state, fl
     state->camera_points[1] = {{static_cast<u16>(x + 50), y}, 8};
   }
   N::DataFormat nc{};
-  nc.jx = static_cast<u8>(128 + Axis(pad.stickX) * 100);
-  nc.jy = static_cast<u8>(128 + Axis(pad.stickY) * 100);
+  nc.jx = static_cast<u8>(128 + StickAxis(pad.stickX) * 100);
+  nc.jy = static_cast<u8>(128 + StickAxis(pad.stickY) * 100);
   nc.SetButtons((pad.button & PAD_BUTTON_X ? N::BUTTON_C : 0) |
                 (pad.button & PAD_TRIGGER_L || pad.triggerLeft > 127 ? N::BUTTON_Z : 0));
   nc.SetAccel({N::ACCEL_ZERO_G << 2, N::ACCEL_ZERO_G << 2, N::ACCEL_ONE_G << 2});
@@ -136,14 +130,12 @@ void PrepareInput(WiimoteEmu::DesiredWiimoteState* state, bool sensor_bar)
   const GCPadStatus pad = Pad::GetStatus(0);
   std::lock_guard lock(s_input_mutex);
   s_pad = pad;
-  // Fixed emulated 200 Hz, independent of host FPS. The right stick moves the IR
-  // pointer in menus and also feeds the CPU-thread camera update in gameplay.
-  if (pad.isConnected)
-  {
-    s_pointer_x = std::clamp(s_pointer_x + Axis(pad.substickX) * 1.5f / 200, -1.f, 1.f);
-    s_pointer_y = std::clamp(s_pointer_y + Axis(pad.substickY) * 1.5f / 200, -1.f, 1.f);
-  }
-  MapPad(pad, state, s_pointer_x, s_pointer_y, sensor_bar);
+  auto mode = s_pointer_mode.load();
+  // A wheel request must stop freelook immediately, before the game opens it.
+  if (mode != PointerMode::Menu && WheelButton(pad))
+    mode = PointerMode::Wheel;
+  s_pointer.Update(pad, mode);
+  MapPad(pad, state, s_pointer.x, s_pointer.y, sensor_bar);
 }
 
 void Reset()
@@ -151,7 +143,8 @@ void Reset()
   s_input_enabled = false;
   std::lock_guard lock(s_input_mutex);
   s_pad = {};
-  s_pointer_x = s_pointer_y = 0;
+  s_pointer = {};
+  s_pointer_mode = PointerMode::Menu;
   s_reported_active = false;
 }
 
@@ -164,7 +157,10 @@ void Update(const Core::CPUThreadGuard& guard)
                        !NetPlay::IsNetPlayRunning() && !system.GetMovie().IsMovieActive();
   s_input_enabled = enabled;
   if (!supported)
+  {
+    s_pointer_mode = PointerMode::Menu;
     return;
+  }
 
   GCPadStatus pad;
   {
@@ -181,23 +177,41 @@ void UpdatePrime1(const Core::CPUThreadGuard& guard, const GCPadStatus& pad, boo
   if (Read(guard, 0x8046d340) != 0x4e800020)
   {
     s_reported_active = false;
+    s_pointer_mode = PointerMode::Menu;
     return;
   }
   for (const auto& patch : PATCHES)
   {
     const u32 word = Read(guard, patch.address);
     if (word != patch.original && word != patch.replacement)
+    {
+      s_pointer_mode = PointerMode::Menu;
       return;
+    }
   }
   const u32 player = Read(guard, STATE_MANAGER + 0x84c);
   const bool has_player = Ram(player, 0x500);
   const u32 menu_base = Read(guard, 0x805c28b0);
   const bool wheel = Ram(menu_base, 0x338) && Read(guard, menu_base + 0x32c) == 1;
+  const bool wheel_input = wheel || WheelButton(pad);
+  const bool paused = Read(guard, STATE_MANAGER + 0x117c) != 0;
+  if (!enabled || !has_player)
+    s_pointer_mode = PointerMode::Menu;
+  else
+    s_pointer_mode = wheel_input ? PointerMode::Wheel
+                     : paused    ? PointerMode::Menu
+                                 : PointerMode::FreeLook;
   const bool locked =
       has_player &&
       ((Read(guard, player + 0x300) != 5 && Read<u8>(guard, STATE_MANAGER + 0xc93)) || wheel);
   for (size_t i = 0; i < PATCHES.size(); ++i)
-    WriteCode(guard, PATCHES[i], enabled && (i != PATCHES.size() - 1 || !locked));
+  {
+    // Let the game's IR path place the reticle in both wheel axes. The initial
+    // port incorrectly forced the horizontal store to zero during selection.
+    const bool centered_reticle = (i != 5 && i != 6) || (!wheel_input && !paused);
+    const bool gun_move = i != PATCHES.size() - 1 || !locked;
+    WriteCode(guard, PATCHES[i], enabled && centered_reticle && gun_move);
+  }
   if (!enabled || !has_player)
     return;
   if (!s_reported_active)
@@ -206,6 +220,9 @@ void UpdatePrime1(const Core::CPUThreadGuard& guard, const GCPadStatus& pad, boo
                    "PrimeHack: NTSC-U Trilogy Prime 1 FPS controls active (8 guarded patches)");
     s_reported_active = true;
   }
+
+  if (wheel_input)
+    return; // Right stick belongs exclusively to selection, not camera rotation.
 
   // Keep pitch aligned with the actual first-person camera during lock-on.
   if (locked)
@@ -239,8 +256,8 @@ void UpdatePrime1(const Core::CPUThreadGuard& guard, const GCPadStatus& pad, boo
       fx * fx + fy * fy < 0.0001f)
     return;
   constexpr float step = 2.5f / 60.f; // Radians per emulated NTSC frame.
-  const float yaw = std::atan2(fy, fx) - Axis(pad.substickX) * step;
-  const float pitch = std::clamp(old_pitch + Axis(pad.substickY) * step, -1.52f, 1.52f);
+  const float yaw = std::atan2(fy, fx) - StickAxis(pad.substickX) * step;
+  const float pitch = std::clamp(old_pitch + StickAxis(pad.substickY) * step, -1.52f, 1.52f);
   const float rotation = yaw - 1.570796327f;
   const float sy = std::sin(rotation), cy = std::cos(rotation);
   const std::array<float, 9> basis{cy, -sy, 0, sy, cy, 0, 0, 0, 1};

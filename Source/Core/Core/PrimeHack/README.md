@@ -42,7 +42,14 @@ must use the emulated source. No physical Wii Remote is required.
 | L + Start | Wii 1: map |
 | Remaining D-pad directions | Wii D-pad |
 
-The original beam/visor wheels remain enabled and use the right-stick pointer.
+The original beam/visor wheels remain enabled. Hold minus/plus and push the
+right stick toward the desired screen quadrant, then release minus/plus. Wheel
+input selects a direction directly rather than integrating pointer velocity;
+it retains the last selection through stick release. A deliberate deflection is
+required to change direction, preventing weak center noise from changing it.
+During gameplay the emulated IR pointer stays centered, so it cannot compete
+with host camera rotation. Reticle-forcing patches are restored to original
+instructions while a selection wheel or pause menu owns the pointer.
 Direct weapon/visor shortcuts, springball, MP2/MP3 support, custom guest opcodes,
 and PrimeHack's desktop UI are not ported. Pitch/yaw derive from guest state each
 frame rather than a host angle accumulator. Host-side pointer position is reset

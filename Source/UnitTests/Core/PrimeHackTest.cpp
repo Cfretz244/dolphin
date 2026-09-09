@@ -11,6 +11,7 @@
 #include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
+#include "Core/PrimeHack/Pointer.h"
 #include "Core/PrimeHack/PrimeHack.h"
 #include "Core/System.h"
 #include "InputCommon/GCPadStatus.h"
@@ -205,5 +206,71 @@ TEST_F(PrimeHackRuntime, LockOnRestoresGunMovement)
   system.GetMemory().Write_U8(1, (0x804bf420 + 0xc93) & 0x1fffffff);
   Update();
   EXPECT_EQ(Get(0x8018b8d4), 0x41820014);
+}
+
+TEST(PrimeHackInput, CameraNeverAccumulatesIRDrift)
+{
+  PrimeHack::PointerState pointer;
+  GCPadStatus pad;
+  pad.substickX = 228;
+  for (int i = 0; i < 1000; ++i)
+    pointer.Update(pad, PrimeHack::PointerMode::FreeLook);
+  EXPECT_EQ(pointer.x, 0);
+  EXPECT_EQ(pointer.y, 0);
+  pad.substickX = 128;
+  pointer.Update(pad, PrimeHack::PointerMode::Wheel);
+  EXPECT_EQ(pointer.x, 0);
+}
+
+TEST(PrimeHackInput, WheelDirectionIsImmediateAndHeldUntilClose)
+{
+  PrimeHack::PointerState pointer;
+  GCPadStatus pad;
+  for (auto [x, y] :
+       std::array<std::pair<int, int>, 4>{{{228, 228}, {28, 228}, {28, 28}, {228, 28}}})
+  {
+    pad.substickX = x;
+    pad.substickY = y;
+    pointer.Update(pad, PrimeHack::PointerMode::Wheel);
+    EXPECT_NEAR(pointer.x, x > 128 ? 0.85f : -0.85f, 0.001f);
+    EXPECT_NEAR(pointer.y, y > 128 ? 0.85f : -0.85f, 0.001f);
+  }
+  const float last_x = pointer.x, last_y = pointer.y;
+  pad.substickX = pad.substickY = 100; // Weak opposite input during release.
+  pointer.Update(pad, PrimeHack::PointerMode::Wheel);
+  EXPECT_EQ(pointer.x, last_x);
+  EXPECT_EQ(pointer.y, last_y);
+  pad.substickX = pad.substickY = 128;
+  pointer.Update(pad, PrimeHack::PointerMode::Wheel);
+  EXPECT_EQ(pointer.x, last_x);
+  EXPECT_EQ(pointer.y, last_y);
+  pointer.Update(pad, PrimeHack::PointerMode::FreeLook);
+  EXPECT_EQ(pointer.x, 0);
+  EXPECT_EQ(pointer.y, 0);
+}
+
+TEST_F(PrimeHackRuntime, WheelReleasesHorizontalReticleAndOwnsStick)
+{
+  Player();
+  GCPadStatus pad;
+  pad.substickX = pad.substickY = 228;
+  pad.button = PAD_TRIGGER_Z; // Minus, even before the game's wheel flag updates.
+  Update(true, pad);
+  EXPECT_EQ(Get(0x802fb5b4), 0xd03f009c);
+  EXPECT_EQ(Get(0x8019fbcc), 0x4bea3ca9);
+  EXPECT_EQ(Get(player + 0x3dc), 0u);
+  EXPECT_EQ(Get(player + 0x30), 0u);
+  // The game can keep the wheel open after the physical button is released.
+  Put(0x805c28b0, 0x80200000);
+  Put(0x8020032c, 1);
+  pad.button = 0;
+  Update(true, pad);
+  EXPECT_EQ(Get(0x802fb5b4), 0xd03f009c);
+  EXPECT_EQ(Get(0x8019fbcc), 0x4bea3ca9);
+  EXPECT_EQ(Get(player + 0x3dc), 0u);
+  Put(0x8020032c, 0);
+  Update(true, pad);
+  EXPECT_EQ(Get(0x802fb5b4), 0xd23f009c);
+  EXPECT_GT(std::bit_cast<float>(Get(player + 0x3dc)), 0);
 }
 #endif
