@@ -925,6 +925,6 @@ if(ALL_AOT_LIBS)
 endif()
 
 if(ENABLE_PRIMEHACK)
-  target_sources(core PRIVATE PrimeHack/PrimeHack.cpp PrimeHack/PrimeHack.h)
+  target_sources(core PRIVATE PrimeHack/PrimeHack.cpp PrimeHack/PrimeHack.h PrimeHack/Patches.h)
   target_compile_definitions(core PUBLIC ENABLE_PRIMEHACK)
 endif()

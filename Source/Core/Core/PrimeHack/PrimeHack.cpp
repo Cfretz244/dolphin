@@ -4,6 +4,7 @@
 // 53f53e0f5bad27ad62a807cb93b136d84f68777f. See README.md for scope/provenance.
 
 #include "Core/PrimeHack/PrimeHack.h"
+#include "Core/PrimeHack/Patches.h"
 #include "Core/PrimeHack/Pointer.h"
 
 #include <algorithm>
@@ -30,20 +31,7 @@ namespace PrimeHack
 {
 namespace
 {
-struct Patch
-{
-  u32 address, original, replacement;
-};
-constexpr std::array<Patch, 8> PATCHES{{
-    {0x80098ee4, 0xec000072, 0xec010072}, // Pitch interpolation.
-    {0x80099138, 0x4bffe6dd, 0x60000000}, // Floor-driven pitch.
-    {0x80183a8c, 0xd03f03dc, 0x60000000},
-    {0x80183a64, 0xd03f03dc, 0x60000000},
-    {0x8017661c, 0x901f0118, 0x60000000},
-    {0x802fb5b4, 0xd03f009c, 0xd23f009c}, // Reticle horizontal store.
-    {0x8019fbcc, 0x4bea3ca9, 0x60000000},
-    {0x8018b8d4, 0x41820014, 0x48000354}, // Arm-cannon movement (off during lock-on).
-}};
+constexpr auto& PATCHES = MP1_PATCHES;
 constexpr u32 STATE_MANAGER = 0x804bf420;
 std::atomic<bool> s_input_enabled{false};
 std::mutex s_input_mutex;
@@ -236,13 +224,12 @@ void UpdatePrime1(const Core::CPUThreadGuard& guard, const GCPadStatus& pad, boo
   const bool locked =
       has_player &&
       ((Read(guard, player + 0x300) != 5 && Read<u8>(guard, STATE_MANAGER + 0xc93)) || wheel);
+  const u32 patch_mask = MP1PatchMask(enabled, wheel_input, paused, locked);
   for (size_t i = 0; i < PATCHES.size(); ++i)
   {
     // Let the game's IR path place the reticle in both wheel axes. The initial
     // port incorrectly forced the horizontal store to zero during selection.
-    const bool centered_reticle = (i != 5 && i != 6) || (!wheel_input && !paused);
-    const bool gun_move = i != PATCHES.size() - 1 || !locked;
-    WriteCode(guard, PATCHES[i], enabled && centered_reticle && gun_move);
+    WriteCode(guard, PATCHES[i], (patch_mask & (1u << i)) != 0);
   }
   if (!enabled || !has_player)
   {

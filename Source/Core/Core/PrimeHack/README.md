@@ -20,7 +20,18 @@ partially loaded code is left alone. Changed instructions go through Dolphin's
 instruction-cache invalidation, including AOT guard generation invalidation.
 Turning the option off restores the known originals when the same image is
 present. Reloaded original code is patched again; no persistent image activation
-is trusted. AOT interprets modified blocks until patched native variants exist.
+is trusted.
+
+For native patched blocks, build the CFG with `--dol-images --primehack`.
+`Patches.h` is shared by the runtime and offline image builder. The builder
+requires R3ME01 revision 0, the MP1 discriminator, and all eight original words;
+it derives four patch-mode images from those verified disc bytes. Their identities
+include the complete original DOL hash and exact patch recipe. Translation checks
+those identities again. Only changed blocks get extra native candidates; common
+code remains shared with the original DOL. Existing instruction-content guards
+select the matching candidate on mode changes, including stale direct entries.
+Unknown modifications still fall back to the interpreter. No trace snapshot is
+accepted as executable code, and no instruction-validation checks are removed.
 
 Wiimote 1 input is adapted from `Pad::GetStatus(0)` before normal Wiimote reports
 are built. The desired-state variant attaches a Nunchuk automatically. On desktop,

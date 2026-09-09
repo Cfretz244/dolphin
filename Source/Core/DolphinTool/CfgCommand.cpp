@@ -368,7 +368,8 @@ using RelocBranchTargets = std::unordered_map<u32, u32>;  // site addr -> local 
 
 static void RunDisassembly(const PPCMemoryImage& memory, const TraceData& trace,
                            std::map<u32, CFGBlock>& blocks, std::vector<CFGEdge>& edges,
-                           bool verbose, const RelocBranchTargets* reloc_branches = nullptr)
+                           bool verbose, const RelocBranchTargets* reloc_branches = nullptr,
+                           bool indexed_dol_blocks = false)
 {
   std::set<u32> worklist;
   std::set<u32> visited;
@@ -405,7 +406,12 @@ static void RunDisassembly(const PPCMemoryImage& memory, const TraceData& trace,
 
     // Check if this address is already inside an existing block (not at start)
     // If so, we need to split that block
-    for (auto it = blocks.begin(); it != blocks.end(); ++it)
+    // Fixed DOL text blocks are non-overlapping. Looking up their predecessor
+    // avoids scanning every previously discovered block for every new seed.
+    // Keep the existing traversal for the separate REL/overlay pipeline.
+    auto predecessor = blocks.upper_bound(addr);
+    predecessor = predecessor == blocks.begin() ? blocks.end() : std::prev(predecessor);
+    for (auto it = indexed_dol_blocks ? predecessor : blocks.begin(); it != blocks.end(); ++it)
     {
       auto& existing = it->second;
       if (addr > existing.start_addr && addr <= existing.end_addr)
@@ -440,6 +446,8 @@ static void RunDisassembly(const PPCMemoryImage& memory, const TraceData& trace,
         edges.push_back({existing.start_addr, addr, CFGEdge::FallThrough, false});
         break;
       }
+      if (indexed_dol_blocks)
+        break;
     }
 
     if (blocks.contains(addr))
@@ -616,7 +624,7 @@ std::map<u32, u32> DisassembleDolSeeds(const PPCMemoryImage& memory, const std::
   trace.seed_addresses.insert(seeds.begin(), seeds.end());
   std::map<u32, CFGBlock> blocks;
   std::vector<CFGEdge> edges;
-  RunDisassembly(memory, trace, blocks, edges, false);
+  RunDisassembly(memory, trace, blocks, edges, false, nullptr, true);
   std::map<u32, u32> counts;
   for (const auto& [pc, block] : blocks)
     counts.emplace(pc, block.num_instructions);
@@ -1647,6 +1655,8 @@ int CfgCommand(const std::vector<std::string>& args)
   parser.add_option("-v", "--verbose").action("store_true").help("Print detailed progress");
   parser.add_option("--dol-images").action("store_true")
       .help("Experimental: content-guarded alternate DOLs from instruction snapshots");
+  parser.add_option("--primehack").action("store_true")
+      .help("With --dol-images, include verified NTSC-U Trilogy MP1 patched code variants");
   parser.add_option("--no-rels")
       .action("store_true")
       .help("Skip discovery and CFG extraction of .rel relocatable modules");
@@ -1797,6 +1807,11 @@ int CfgCommand(const std::vector<std::string>& args)
   fmt::println(std::cerr, "Trace: {} seed blocks, {} edges ({} dynamic) from {} file(s)",
                trace.blocks.size(), trace.edges.size(), dynamic_count, trace_paths.size());
 
+  if (options.is_set("primehack") && !options.is_set("dol_images"))
+  {
+    fmt::println(std::cerr, "--primehack requires --dol-images");
+    return EXIT_FAILURE;
+  }
   if (options.is_set("dol_images"))
   {
     if (options.is_set("overlays"))
@@ -1804,7 +1819,8 @@ int CfgCommand(const std::vector<std::string>& args)
       fmt::println(std::cerr, "--dol-images and --overlays are mutually exclusive");
       return EXIT_FAILURE;
     }
-    return WriteDolImageCFG(*volume, trace.snapshot_blocks, output_path) ? EXIT_SUCCESS : EXIT_FAILURE;
+    return WriteDolImageCFG(*volume, trace.snapshot_blocks, output_path,
+                            options.is_set("primehack")) ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
   // 4. Run recursive descent disassembly

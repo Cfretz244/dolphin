@@ -4,11 +4,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <utility>
@@ -18,8 +20,10 @@
 #include <mbedtls/sha256.h>
 #include <sqlite3.h>
 
+#include "Common/Swap.h"
 #include "Core/Boot/DolReader.h"
 #include "Core/PowerPC/PPCTables.h"
+#include "Core/PrimeHack/Patches.h"
 #include "DiscIO/DiscExtractor.h"
 #include "DiscIO/DiscUtils.h"
 #include "DiscIO/Filesystem.h"
@@ -39,6 +43,8 @@ struct Image
   std::string hash;
   std::unique_ptr<DolReader> dol;
   PPCMemoryImage memory;
+  std::vector<std::vector<u8>> patched_sections;
+  std::optional<size_t> base_image;
 };
 using DB = std::unique_ptr<sqlite3, decltype(&sqlite3_close)>;
 using Statement = std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)>;
@@ -82,7 +88,8 @@ void AddImage(std::vector<Image>& images, std::string name, std::vector<u8> byte
     hash += fmt::format("{:02x}", b);
   if (std::any_of(images.begin(), images.end(), [&](const Image& i) { return i.hash == hash; }))
     return;
-  Image image{std::move(name), hash, std::make_unique<DolReader>(std::move(bytes)), {}};
+  Image image{std::move(name), hash, std::make_unique<DolReader>(std::move(bytes)), {}, {},
+              std::nullopt};
   if (!image.dol->IsValid())
     throw std::runtime_error("Invalid DOL: " + image.name);
   for (int i = 0; i < image.dol->GetNumTextSections(); ++i)
@@ -95,8 +102,8 @@ void AddImage(std::vector<Image>& images, std::string name, std::vector<u8> byte
   }
   images.push_back(std::move(image));
 }
-void Scan(const DiscIO::Volume& volume, const DiscIO::FileInfo& dir,
-          const std::string& parent, std::vector<Image>& images)
+void Scan(const DiscIO::Volume& volume, const DiscIO::FileInfo& dir, const std::string& parent,
+          std::vector<Image>& images)
 {
   for (const auto& entry : dir)
   {
@@ -138,16 +145,93 @@ std::vector<Image> Discover(const DiscIO::Volume& volume)
   Scan(volume, fs->GetRoot(), "", images);
   return images;
 }
+
+size_t AddPrimeHackImages(const DiscIO::Volume& volume, std::vector<Image>& images)
+{
+  if (volume.GetGameID() != "R3ME01" || volume.GetRevision() != 0)
+    throw std::runtime_error("PrimeHack AOT variants require Trilogy R3ME01 revision 0");
+  std::optional<size_t> source;
+  for (size_t id = 0; id < images.size(); ++id)
+  {
+    const auto& memory = images[id].memory;
+    if (memory.ReadInstruction(0x8046d340) != 0x4e800020 ||
+        !std::all_of(PrimeHack::MP1_PATCHES.begin(), PrimeHack::MP1_PATCHES.end(),
+                     [&](const auto& patch)
+                     { return memory.ReadInstruction(patch.address) == patch.original; }))
+      continue;
+    if (source)
+      throw std::runtime_error("Ambiguous PrimeHack MP1 source image");
+    source = id;
+  }
+  if (!source)
+    throw std::runtime_error("PrimeHack MP1 discriminator/original patch words do not match disc");
+  images.reserve(images.size() + PrimeHack::MP1_PATCH_MASKS.size());
+  for (u32 mask : PrimeHack::MP1_PATCH_MASKS)
+  {
+    const auto& base = images[*source];
+    Image patched;
+    patched.name = fmt::format("{}#primehack-{:02x}", base.name, mask);
+    patched.base_image = *source;
+    std::string identity = base.hash + patched.name;
+    for (size_t i = 0; i < PrimeHack::MP1_PATCHES.size(); ++i)
+    {
+      const auto& patch = PrimeHack::MP1_PATCHES[i];
+      identity += fmt::format(":{:08x}:{:08x}:{:08x}", patch.address, patch.original,
+                              (mask & (1u << i)) ? patch.replacement : patch.original);
+    }
+    u8 digest[32];
+    if (mbedtls_sha256_ret(reinterpret_cast<const u8*>(identity.data()), identity.size(), digest,
+                           0))
+      throw std::runtime_error("Cannot hash PrimeHack image identity");
+    for (u8 byte : digest)
+      patched.hash += fmt::format("{:02x}", byte);
+    for (int section = 0; section < base.dol->GetNumTextSections(); ++section)
+    {
+      auto bytes = base.dol->GetTextSection(section);
+      const u32 address = base.dol->GetTextSectionAddress(section);
+      for (size_t i = 0; i < PrimeHack::MP1_PATCHES.size(); ++i)
+      {
+        const auto& patch = PrimeHack::MP1_PATCHES[i];
+        if ((mask & (1u << i)) && patch.address >= address &&
+            u64(patch.address) + 4 <= u64(address) + bytes.size())
+        {
+          const u32 word = Common::swap32(patch.replacement);
+          std::memcpy(bytes.data() + patch.address - address, &word, sizeof(word));
+        }
+      }
+      patched.patched_sections.push_back(std::move(bytes));
+      const auto& stored = patched.patched_sections.back();
+      patched.memory.AddSection(address, stored.data(), static_cast<u32>(stored.size()));
+    }
+    images.push_back(std::move(patched));
+  }
+  return *source;
+}
+
+bool MatchesSnapshotWord(const Image& image, u32 pc, u32 word, bool primehack)
+{
+  if (image.memory.ReadInstruction(pc) == word)
+    return true;
+  // A trace is only a discovery hint. Recognize the known patch words in either
+  // state, then disassemble the verified disc/patch image, never arbitrary traces.
+  return primehack && std::any_of(PrimeHack::MP1_PATCHES.begin(), PrimeHack::MP1_PATCHES.end(),
+                                  [&](const auto& patch)
+                                  {
+                                    return patch.address == pc &&
+                                           (word == patch.original || word == patch.replacement);
+                                  });
+}
 std::ofstream Output(const std::string& path)
 {
   std::ofstream out(path);
   out.exceptions(std::ios::badbit | std::ios::failbit);
   return out;
 }
-}  // namespace
+} // namespace
 
 bool WriteDolImageCFG(const DiscIO::Volume& volume,
-                      const std::vector<TraceSnapshotBlock>& snapshots, const std::string& path)
+                      const std::vector<TraceSnapshotBlock>& snapshots, const std::string& path,
+                      bool primehack)
 {
   try
   {
@@ -156,15 +240,21 @@ bool WriteDolImageCFG(const DiscIO::Volume& volume,
     if (std::filesystem::exists(path))
       throw std::runtime_error("Output exists; use a fresh database: " + path);
     auto images = Discover(volume);
+    std::optional<size_t> primehack_source;
+    if (primehack)
+      primehack_source = AddPrimeHackImages(volume, images);
     auto db = Open(path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
     Exec(db.get(), "BEGIN; CREATE TABLE dol_images(id INTEGER PRIMARY KEY, name TEXT NOT NULL, "
-                  "sha256 TEXT NOT NULL); CREATE TABLE dol_image_blocks(image_id INTEGER, "
-                  "pc INTEGER, count INTEGER, PRIMARY KEY(image_id,pc)); "
-                  "CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT); "
-                  "INSERT INTO metadata VALUES('dol_images_version','1');");
+                   "sha256 TEXT NOT NULL); CREATE TABLE dol_image_blocks(image_id INTEGER, "
+                   "pc INTEGER, count INTEGER, PRIMARY KEY(image_id,pc)); "
+                   "CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT); "
+                   "INSERT INTO metadata VALUES('dol_images_version','1');");
+    if (primehack)
+      Exec(db.get(), "INSERT INTO metadata VALUES('primehack_patch_set','mp1-r3me01-v1');");
     auto image_stmt = Prepare(db.get(), "INSERT INTO dol_images VALUES(?,?,?)");
     auto block_stmt = Prepare(db.get(), "INSERT INTO dol_image_blocks VALUES(?,?,?)");
     size_t total = 0;
+    std::vector<std::map<u32, u32>> discovered(images.size());
     for (size_t id = 0; id < images.size(); ++id)
     {
       const auto& image = images[id];
@@ -175,12 +265,21 @@ bool WriteDolImageCFG(const DiscIO::Volume& volume,
         throw std::runtime_error(sqlite3_errmsg(db.get()));
       sqlite3_reset(image_stmt.get());
       std::set<u32> seeds;
+      if (primehack_source && (id == *primehack_source || image.base_image))
+      {
+        for (const auto& patch : PrimeHack::MP1_PATCHES)
+          seeds.insert(patch.address);
+      }
+      if (image.base_image)
+      {
+        for (const auto& [pc, count] : discovered[*image.base_image])
+          seeds.insert(pc);
+      }
       for (const auto& sb : snapshots)
       {
         for (const auto& snap : sb.snapshots)
         {
-          if ((sb.addr & 3) || snap.words.empty() ||
-              snap.words.size() > (UINT32_MAX - sb.addr) / 4)
+          if ((sb.addr & 3) || snap.words.empty() || snap.words.size() > (UINT32_MAX - sb.addr) / 4)
             continue;
           // Older v4 traces serialized the optimized JIT stream: instructions
           // may be reordered or follow a branch to a noncontiguous address.
@@ -192,7 +291,9 @@ bool WriteDolImageCFG(const DiscIO::Volume& volume,
           for (u32 word : snap.words)
           {
             const u32 pc = sb.addr + static_cast<u32>(matched * 4);
-            if (image.memory.ReadInstruction(pc) != word ||
+            if (!MatchesSnapshotWord(image, pc, word,
+                                     primehack_source &&
+                                         (id == *primehack_source || image.base_image)) ||
                 !PPCTables::IsValidInstruction(UGeckoInstruction(word), pc))
               break;
             ++matched;
@@ -207,17 +308,37 @@ bool WriteDolImageCFG(const DiscIO::Volume& volume,
         }
       }
       const auto blocks = DisassembleDolSeeds(image.memory, seeds);
+      discovered[id] = blocks;
+      size_t written = 0;
       for (const auto& [pc, count] : blocks)
       {
+        if (image.base_image)
+        {
+          // Share unchanged native blocks with the original DOL. A NOP/branch
+          // patch can change block boundaries, so compare length as well as words.
+          const auto& originals = discovered[*image.base_image];
+          const auto original = originals.find(pc);
+          if (original != originals.end() && original->second == count)
+          {
+            bool equal = true;
+            for (u32 n = 0; n < count && equal; ++n)
+              equal = image.memory.ReadInstruction(pc + n * 4) ==
+                      images[*image.base_image].memory.ReadInstruction(pc + n * 4);
+            if (equal)
+              continue;
+          }
+        }
         sqlite3_bind_int(block_stmt.get(), 1, static_cast<int>(id));
         sqlite3_bind_int64(block_stmt.get(), 2, pc);
         sqlite3_bind_int64(block_stmt.get(), 3, count);
         if (sqlite3_step(block_stmt.get()) != SQLITE_DONE)
           throw std::runtime_error(sqlite3_errmsg(db.get()));
         sqlite3_reset(block_stmt.get());
+        ++written;
       }
-      total += blocks.size();
-      fmt::println(std::cerr, "DOL image {}: {} — {} reachable blocks", id, image.name, blocks.size());
+      total += written;
+      fmt::println(std::cerr, "DOL image {}: {} — {} native block candidates", id, image.name,
+                   written);
     }
     if (!total)
       throw std::runtime_error("No snapshots match any DOL");
@@ -237,12 +358,13 @@ bool IsDolImageCFG(const std::string& path)
   try
   {
     auto db = Open(path, SQLITE_OPEN_READONLY);
-    auto stmt = Prepare(db.get(), "SELECT 1 FROM sqlite_master WHERE name='dol_images' AND type='table'");
+    auto stmt =
+        Prepare(db.get(), "SELECT 1 FROM sqlite_master WHERE name='dol_images' AND type='table'");
     return sqlite3_step(stmt.get()) == SQLITE_ROW;
   }
   catch (const std::exception&)
   {
-    return false;  // The ordinary CFG reader reports the missing/unreadable database.
+    return false; // The ordinary CFG reader reports the missing/unreadable database.
   }
 }
 
@@ -253,10 +375,19 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
   try
   {
     if (prefix.empty() || std::isdigit(static_cast<unsigned char>(prefix[0])) ||
-        !std::all_of(prefix.begin(), prefix.end(), [](unsigned char c) { return std::isalnum(c) || c == '_'; }))
+        !std::all_of(prefix.begin(), prefix.end(),
+                     [](unsigned char c) { return std::isalnum(c) || c == '_'; }))
       throw std::runtime_error("Invalid C symbol prefix");
     auto images = Discover(volume);
     auto db = Open(cfg, SQLITE_OPEN_READONLY);
+    auto patch_set =
+        Prepare(db.get(), "SELECT value FROM metadata WHERE key='primehack_patch_set'");
+    if (sqlite3_step(patch_set.get()) == SQLITE_ROW)
+    {
+      if (Text(patch_set.get(), 0) != "mp1-r3me01-v1")
+        throw std::runtime_error("Unsupported PrimeHack patch set; regenerate CFG");
+      AddPrimeHackImages(volume, images);
+    }
     auto version = Prepare(db.get(), "SELECT value FROM metadata WHERE key='dol_images_version'");
     if (sqlite3_step(version.get()) != SQLITE_ROW || Text(version.get(), 0) != "1")
       throw std::runtime_error("Unsupported DOL image CFG version");
@@ -265,29 +396,37 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
     size_t seen = 0;
     while (sqlite3_step(identities.get()) == SQLITE_ROW)
     {
-      if (seen >= images.size() || sqlite3_column_int64(identities.get(), 0) != static_cast<sqlite3_int64>(seen) ||
-          Text(identities.get(), 1) != images[seen].name || Text(identities.get(), 2) != images[seen].hash)
+      if (seen >= images.size() ||
+          sqlite3_column_int64(identities.get(), 0) != static_cast<sqlite3_int64>(seen) ||
+          Text(identities.get(), 1) != images[seen].name ||
+          Text(identities.get(), 2) != images[seen].hash)
         throw std::runtime_error("DOL image identity mismatch; regenerate CFG from this disc");
       ++seen;
     }
     if (seen != images.size())
       throw std::runtime_error("DOL image inventory mismatch");
-    struct Block { u32 pc, count; size_t image; std::string symbol; };
+    struct Block
+    {
+      u32 pc, count;
+      size_t image;
+      std::string symbol;
+    };
     std::vector<Block> blocks;
-    auto query = Prepare(db.get(), "SELECT image_id,pc,count FROM dol_image_blocks ORDER BY pc,image_id");
+    auto query =
+        Prepare(db.get(), "SELECT image_id,pc,count FROM dol_image_blocks ORDER BY pc,image_id");
     while (sqlite3_step(query.get()) == SQLITE_ROW)
     {
       const auto id = sqlite3_column_int64(query.get(), 0);
       const auto pc = sqlite3_column_int64(query.get(), 1);
       const auto count = sqlite3_column_int64(query.get(), 2);
-      if (id < 0 || id >= static_cast<sqlite3_int64>(images.size()) || pc < 0 || pc > UINT32_MAX || (pc & 3) ||
-          count <= 0 || count > (UINT32_MAX - pc) / 4)
+      if (id < 0 || id >= static_cast<sqlite3_int64>(images.size()) || pc < 0 || pc > UINT32_MAX ||
+          (pc & 3) || count <= 0 || count > (UINT32_MAX - pc) / 4)
         throw std::runtime_error("Invalid DOL block bounds");
       for (u32 n = 0; n < count; ++n)
         if (!images[id].memory.ReadInstruction(static_cast<u32>(pc) + n * 4))
           throw std::runtime_error("DOL block outside text");
       blocks.push_back({static_cast<u32>(pc), static_cast<u32>(count), static_cast<size_t>(id),
-                       fmt::format("{}_d{}_block_{:08x}", prefix, id, pc)});
+                        fmt::format("{}_d{}_block_{:08x}", prefix, id, pc)});
     }
     if (blocks.empty())
       throw std::runtime_error("Empty DOL image CFG");
@@ -303,12 +442,14 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
     std::filesystem::create_directories(output);
     Output(output + "/aot_runtime.h") << s_aot_runtime_header;
     auto header = Output(output + "/" + prefix + "_images.h");
-    header << "#include \"aot_runtime.h\"\nint aot_match_code(uint32_t,const uint32_t*,uint32_t);\n";
+    header
+        << "#include \"aot_runtime.h\"\nint aot_match_code(uint32_t,const uint32_t*,uint32_t);\n";
     header << fmt::format("void {}_dispatch(AOTState*);\n", prefix);
     for (size_t id = 0; id < images.size(); ++id)
       header << fmt::format("#define {}_d{}_dispatch {}_dispatch\n", prefix, id, prefix);
     for (const auto& b : blocks)
-      header << fmt::format("void {}(AOTState*);\nextern const uint32_t {}_words[{}];\n", b.symbol, b.symbol, b.count);
+      header << fmt::format("void {}(AOTState*);\nextern const uint32_t {}_words[{}];\n", b.symbol,
+                            b.symbol, b.count);
     header.close();
     // Chunk files fit the existing stack's *_blocks_*.c compilation convention.
     std::vector<std::set<u32>> known(images.size());
@@ -317,7 +458,8 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
     std::vector<std::unique_ptr<AOTCEmitter>> emitters;
     for (size_t id = 0; id < images.size(); ++id)
     {
-      auto emitter = std::make_unique<AOTCEmitter>(images[id].memory, known[id], fmt::format("{}_d{}", prefix, id));
+      auto emitter = std::make_unique<AOTCEmitter>(images[id].memory, known[id],
+                                                   fmt::format("{}_d{}", prefix, id));
       emitter->SetGuardedImages();
       emitters.push_back(std::move(emitter));
     }
@@ -326,7 +468,8 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
     {
       if (n % 512 == 0)
       {
-        if (code.is_open()) code.close();
+        if (code.is_open())
+          code.close();
         code = Output(fmt::format("{}/{}_blocks_{:04d}.c", output, prefix, n / 512));
         code << fmt::format("#include \"{}_images.h\"\n", prefix);
       }
@@ -339,7 +482,8 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
     code.close();
     auto dispatch = Output(output + "/" + prefix + "_dispatch.c");
     dispatch << fmt::format("#include \"{}_images.h\"\n", prefix);
-    dispatch << "typedef struct { uint32_t pc,count; const uint32_t* words; AOTBlockFunc fn; } Candidate;\n";
+    dispatch << "typedef struct { uint32_t pc,count; const uint32_t* words; AOTBlockFunc fn; } "
+                "Candidate;\n";
     dispatch << "static const Candidate candidates[] = {\n";
     for (const auto& b : blocks)
       dispatch << fmt::format("{{{:#x}u,{}u,{}_words,{}}},\n", b.pc, b.count, b.symbol, b.symbol);
@@ -368,30 +512,44 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
     dispatch << "  if (pc&3) return 0; uint32_t page=page_ids[pc>>16]; if(!page) return 0;\n";
     dispatch << "  uint32_t lo=candidate_indices[page-1][(pc&65535)>>2]; if(!lo) return 0; --lo;\n";
     dispatch << fmt::format("  for(;lo<{}u && candidates[lo].pc==pc;++lo) {{\n", blocks.size());
-    dispatch << "    const Candidate* c=&candidates[lo]; if(aot_match_code(pc,c->words,c->count)) return c;\n  } return 0;\n}\n";
-    dispatch << fmt::format("AOTBlockFunc {}_lookup_block(uint32_t pc) {{ const Candidate* c=find_candidate(pc); return c?c->fn:0; }}\n", prefix);
-    dispatch << "static uint32_t image_block_size(uint32_t pc) { const Candidate* c=find_candidate(pc); return c?c->count:0; }\n";
+    dispatch << "    const Candidate* c=&candidates[lo]; if(aot_match_code(pc,c->words,c->count)) "
+                "return c;\n  } return 0;\n}\n";
+    dispatch << fmt::format("AOTBlockFunc {}_lookup_block(uint32_t pc) {{ const Candidate* "
+                            "c=find_candidate(pc); return c?c->fn:0; }}\n",
+                            prefix);
+    dispatch << "static uint32_t image_block_size(uint32_t pc) { const Candidate* "
+                "c=find_candidate(pc); return c?c->count:0; }\n";
     dispatch << "void aot_register_image_block_sizes(const char*,uint32_t (*)(uint32_t));\n";
     dispatch << fmt::format("void {}_dispatch(AOTState* s) {{\n", prefix);
-    dispatch << "#if AOT_HARNESS\n  if(aot_single_block_mode) return;\n#endif\n  if(s->downcount<=0) return;\n";
+    dispatch << "#if AOT_HARNESS\n  if(aot_single_block_mode) return;\n#endif\n  "
+                "if(s->downcount<=0) return;\n";
     dispatch << fmt::format("  AOTBlockFunc fn={}_lookup_block(s->pc);\n", prefix);
-    dispatch << "  if(fn){[[clang::musttail]] return fn(s);}\n  [[clang::musttail]] return aot_interpreter_single_step(s);\n}\n";
-    dispatch << fmt::format("__attribute__((constructor)) static void register_images(void) {{\n"
-                           "  aot_register_game(\"{}\",{}_dispatch,{}_lookup_block,AOT_ABI_VERSION);\n"
-                           "  aot_register_game_image(\"{}\",\"{}\");\n"
-                           "  aot_register_image_block_sizes(\"{}\",image_block_size);\n}}\n", prefix,prefix,prefix,prefix,boot_hash,prefix);
+    dispatch << "  if(fn){[[clang::musttail]] return fn(s);}\n  [[clang::musttail]] return "
+                "aot_interpreter_single_step(s);\n}\n";
+    dispatch << fmt::format(
+        "__attribute__((constructor)) static void register_images(void) {{\n"
+        "  aot_register_game(\"{}\",{}_dispatch,{}_lookup_block,AOT_ABI_VERSION);\n"
+        "  aot_register_game_image(\"{}\",\"{}\");\n"
+        "  aot_register_image_block_sizes(\"{}\",image_block_size);\n}}\n",
+        prefix, prefix, prefix, prefix, boot_hash, prefix);
     dispatch.close();
     auto script = Output(output + "/build.sh");
     script << "#!/bin/bash\nset -euo pipefail\ncd \"$(dirname \"$0\")\"\n";
-    script << "export IMAGE_CFLAGS='-Os -flto=thin -arch arm64 -mcpu=apple-a14 -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1'\n";
-    script << fmt::format("printf '%s\\0' {}_blocks_*.c | xargs -0 -n1 -P \"${{AOT_JOBS:-4}}\" sh -c 'exec clang -c $IMAGE_CFLAGS -I. \"$1\" -o \"${{1%.c}}.o\"' sh\n",prefix);
+    script << "export IMAGE_CFLAGS='-Os -flto=thin -arch arm64 -mcpu=apple-a14 -fwrapv "
+              "-fno-strict-aliasing -DAOT_HARNESS=1'\n";
+    script << fmt::format("printf '%s\\0' {}_blocks_*.c | xargs -0 -n1 -P \"${{AOT_JOBS:-4}}\" sh "
+                          "-c 'exec clang -c $IMAGE_CFLAGS -I. \"$1\" -o \"${{1%.c}}.o\"' sh\n",
+                          prefix);
     // Importing the dispatch table into every ThinLTO block module makes the
     // optimizer repeatedly process references to every candidate function.
     // Keep that immutable index native; block-to-block optimization stays on.
-    script << fmt::format("clang -c $IMAGE_CFLAGS -fno-lto -I. {}_dispatch.c -o {}_dispatch.o\n", prefix, prefix);
-    script << fmt::format("ar rcs lib{}_aot.a {}_*.o\n", prefix,prefix);
+    script << fmt::format("clang -c $IMAGE_CFLAGS -fno-lto -I. {}_dispatch.c -o {}_dispatch.o\n",
+                          prefix, prefix);
+    script << fmt::format("ar rcs lib{}_aot.a {}_*.o\n", prefix, prefix);
     script.close();
-    fmt::println(std::cerr, "Translated {} content-guarded DOL blocks (experimental; measure guard cost)", blocks.size());
+    fmt::println(std::cerr,
+                 "Translated {} content-guarded DOL blocks (experimental; measure guard cost)",
+                 blocks.size());
     return true;
   }
   catch (const std::exception& e)
@@ -400,4 +558,4 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
     return false;
   }
 }
-}  // namespace DolphinTool
+} // namespace DolphinTool

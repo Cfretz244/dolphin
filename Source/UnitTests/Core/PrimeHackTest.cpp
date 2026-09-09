@@ -18,6 +18,7 @@
 #include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
+#include "Core/PrimeHack/Patches.h"
 #include "Core/PrimeHack/Pointer.h"
 #include "Core/PrimeHack/PrimeHack.h"
 #include "Core/System.h"
@@ -30,6 +31,20 @@ extern "C" void aot_init_fast_mem();
 extern "C" void aot_shutdown();
 extern "C" int aot_match_code(u32, const u32*, u32);
 #endif
+
+TEST(PrimeHackInput, OfflineVariantsCoverEveryRuntimePatchMode)
+{
+  for (bool wheel : {false, true})
+    for (bool paused : {false, true})
+      for (bool locked : {false, true})
+      {
+        const u32 mask = PrimeHack::MP1PatchMask(true, wheel, paused, locked);
+        EXPECT_NE(
+            std::find(PrimeHack::MP1_PATCH_MASKS.begin(), PrimeHack::MP1_PATCH_MASKS.end(), mask),
+            PrimeHack::MP1_PATCH_MASKS.end());
+        EXPECT_EQ(PrimeHack::MP1PatchMask(false, wheel, paused, locked), 0u);
+      }
+}
 
 TEST(PrimeHackInput, ButtonsStickAndExtension)
 {
