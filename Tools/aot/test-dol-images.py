@@ -69,9 +69,11 @@ int aot_match_chain(unsigned pc,const unsigned* words,unsigned count) { return a
 extern AOTBlockFunc TSTE01_lookup_block(uint32_t);
 static uint32_t code[] = {0x38600001, 0x4e800020};
 static int fallbacks;
+static int guard_checks;
 static uint32_t (*block_size)(uint32_t);
 int aot_single_block_mode;
 int aot_match_code(uint32_t pc, const uint32_t* words, uint32_t count) {
+  ++guard_checks;
   if (pc != 0x80004000 || count != 2) return 0;
   return words[0] == code[0] && words[1] == code[1];
 }
@@ -91,6 +93,11 @@ int main(void) {
   AOTBlockFunc stale = TSTE01_lookup_block(0x80004000);
   code[0]=0x38600002;
   execute(TSTE01_dispatch,2);
+  guard_checks=0;
+  assert(TSTE01_lookup_block(0x80004000));
+  assert(guard_checks==1); // warm alternate image skips the rejected boot candidate
+  assert(!TSTE01_lookup_block(0x80014004)); // same cache slot, different unmapped PC
+  assert(block_size(0x80004000)==2);
   execute(stale,2); // direct entry into old image must redirect before executing it
   code[0]=0x38600003;
   assert(!TSTE01_lookup_block(0x80004000));

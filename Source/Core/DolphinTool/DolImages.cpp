@@ -561,9 +561,9 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
     for (const auto& b : blocks)
       dispatch << fmt::format("{{{:#x}u,{}u,{}u,{}_words,{}}},\n", b.pc, b.count, b.guard_count, b.symbol, b.symbol);
     dispatch << "};\n";
-    // Immutable address index: no cached image choice, so reloads, patches and
-    // stale direct entries still go through the content guards. Avoid a binary
-    // search through every image's blocks for each interpreted instruction.
+    // The index locates all versions of an address. Remember the last successful
+    // version separately, but validate it on every use: DOL reloads, patches,
+    // instruction-cache replacement and translation changes can change the winner.
     std::map<u32, std::vector<std::pair<u32, size_t>>> pages;
     for (size_t n = 0; n < blocks.size(); ++n)
       if (n == 0 || blocks[n - 1].pc != blocks[n].pc)
@@ -581,13 +581,19 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
       dispatch << "},\n";
     }
     dispatch << "};\n";
+    dispatch << "static const Candidate* selected[16384];\n";
+    dispatch << "static int matches(const Candidate* c,uint32_t pc) { return "
+                "c->guard_count>c->count ? aot_match_chain(pc,c->words,c->guard_count) : "
+                "aot_match_code(pc,c->words,c->count); }\n";
     dispatch << "static const Candidate* find_candidate(uint32_t pc) {\n";
+    dispatch << "  uint32_t slot=((pc>>2)^(pc>>16))&16383;\n"
+                "  const Candidate* cached=selected[slot];\n"
+                "  if(cached && cached->pc==pc && matches(cached,pc)) return cached;\n";
     dispatch << "  if (pc&3) return 0; uint32_t page=page_ids[pc>>16]; if(!page) return 0;\n";
     dispatch << "  uint32_t lo=candidate_indices[page-1][(pc&65535)>>2]; if(!lo) return 0; --lo;\n";
     dispatch << fmt::format("  for(;lo<{}u && candidates[lo].pc==pc;++lo) {{\n", blocks.size());
-    dispatch << "    const Candidate* c=&candidates[lo]; if(c->guard_count>c->count ? "
-                "aot_match_chain(pc,c->words,c->guard_count) : aot_match_code(pc,c->words,c->count)) "
-                "return c;\n  } return 0;\n}\n";
+    dispatch << "    const Candidate* c=&candidates[lo]; if(c!=cached && matches(c,pc)) { "
+                "selected[slot]=c; return c; }\n  } return 0;\n}\n";
     dispatch << fmt::format("AOTBlockFunc {}_lookup_block(uint32_t pc) {{ const Candidate* "
                             "c=find_candidate(pc); return c?c->fn:0; }}\n",
                             prefix);
