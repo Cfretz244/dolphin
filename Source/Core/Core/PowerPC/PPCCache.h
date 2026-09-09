@@ -58,8 +58,8 @@ struct Cache
   // Valid only for a resident location, e.g. one protected by content_generation.
   void MarkUsed(u32 set, u32 way)
   {
-    constexpr std::array<u8, 8> masks{11, 11, 19, 19, 37, 37, 69, 69};
-    constexpr std::array<u8, 8> values{11, 3, 17, 1, 36, 4, 64, 0};
+    static constexpr std::array<u8, 8> masks{11, 11, 19, 19, 37, 37, 69, 69};
+    static constexpr std::array<u8, 8> values{11, 3, 17, 1, 36, 4, 64, 0};
     plru[set] = (plru[set] & ~masks[way]) | values[way];
   }
 

@@ -3,6 +3,8 @@
 
 #ifdef DOLPHIN_HAS_AOT
 #include <array>
+#include <chrono>
+#include <cstdio>
 
 #include <gtest/gtest.h>
 
@@ -103,6 +105,29 @@ TEST_F(AotCodeGuardTest, BatRemappingSelectsNewPhysicalCode)
   EXPECT_EQ(Match(0x80001000), 0);
   words[0] = 0x38600002;
   EXPECT_EQ(Match(0x80001000), 1);
+}
+
+TEST_F(AotCodeGuardTest, TranslationModeAndVirtualAddressArePartOfReuse)
+{
+  Write(0x1000);
+  words[0] = 0x38600002;
+  Write(0x21000);
+  words[0] = 0x38600001;
+  Warm(0x1000);
+  // The same immutable expected array does not certify a different address.
+  EXPECT_EQ(Match(0x21000), 0);
+  auto& state = system.GetPPCState();
+  auto& bat = system.GetMMU().GetIBATTable()[0];
+  bat = 0x20000 | PowerPC::BAT_MAPPED_BIT;
+  state.msr.IR = 1;
+  EXPECT_EQ(Match(0x1000), 0);
+  bat = 0;  // An unmapped BAT cannot reuse a translation-disabled memo.
+  EXPECT_EQ(Match(0x1000), 0);
+  state.msr.IR = 0;
+  EXPECT_EQ(Match(0x1000), 1);
+  // Bounds must still be rejected even with a populated memo for this array.
+  EXPECT_EQ(aot_match_code(0x1001, words.data(), words.size()), 0);
+  EXPECT_EQ(aot_match_code(0x1000, words.data(), 0), 0);
 }
 
 TEST_F(AotCodeGuardTest, EvictionExposesModifiedRam)
@@ -233,6 +258,26 @@ TEST_F(AotCodeGuardTest, LargeBlocksRemainFullyChecked)
   system.GetMemory().Write_U32(0x38600002, last);
   system.GetPPCState().iCache.Invalidate(system.GetMemory(), system.GetJitInterface(), last);
   EXPECT_EQ(aot_match_code(0x101c, large.data(), large.size()), 0);
+}
+
+// Opt-in microbenchmark: no timing threshold on heterogeneous CI machines.
+// Run with --gtest_also_run_disabled_tests --gtest_filter=*CachedGuardThroughput.
+TEST_F(AotCodeGuardTest, DISABLED_CachedGuardThroughput)
+{
+  Write(0x101c);
+  system.GetPPCState().msr.IR = 1;
+  system.GetMMU().GetIBATTable()[0x8000101c >> PowerPC::BAT_INDEX_SHIFT] = PowerPC::BAT_MAPPED_BIT;
+  Warm(0x8000101c);
+  constexpr u32 iterations = 20000000;
+  u32 matches = 0;
+  const auto start = std::chrono::steady_clock::now();
+  for (u32 i = 0; i < iterations; ++i)
+    matches += Match(0x8000101c);
+  const double ns =
+      std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() /
+      iterations;
+  EXPECT_EQ(matches, iterations);
+  std::printf("Cached three-line BAT guard: %.2f ns/check (%u checks)\n", ns, iterations);
 }
 
 TEST_F(AotCodeGuardTest, RejectsInvalidBounds)

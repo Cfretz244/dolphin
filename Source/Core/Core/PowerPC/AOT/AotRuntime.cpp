@@ -153,7 +153,8 @@ struct GuardMemo
 {
   const u32* words = nullptr;
   u64 generation = 0;
-  u32 physical = 0;
+  u32 pc = 0;
+  u32 translation = 0;
   u32 count = 0;
   u32 line_count = 0;
   struct Location
@@ -391,7 +392,7 @@ void aot_dump_fallback_stats()
 
   fmt::print(stderr, "\n=== AOT Interpreter Fallback Stats ===\n");
   fmt::print(stderr, "Total fallbacks: {}\n", total);
-  fmt::print(stderr, "Resident guard checks: {} | Reused: {}\n", s_guard_checks, s_guard_reuses);
+  fmt::print(stderr, "Guard checks: {} | Reused: {}\n", s_guard_checks, s_guard_reuses);
   fmt::print(stderr, "Unique PCs: {}\n\n", sorted.size());
 
   const size_t limit = std::min<size_t>(sorted.size(), 50);
@@ -1389,20 +1390,12 @@ static std::optional<bool> MatchResidentCode(uint32_t pc, const uint32_t* words,
   const uintptr_t key = reinterpret_cast<uintptr_t>(words);
   const size_t slot = ((key >> 2) ^ (key >> 16)) & (s_guard_memos.size() - 1);
   auto& memo = s_guard_memos[slot];
-  const bool validated = memo.words == words && memo.physical == physical &&
-                         memo.count == count && memo.generation == cache.content_generation;
-  if (s_track_fallbacks)
-  {
-    ++s_guard_checks;
-    s_guard_reuses += validated;
-  }
-  if (validated)
-  {
-    for (u32 n = 0; n < memo.line_count; ++n)
-      cache.MarkUsed(memo.lines[n].set, memo.lines[n].way);
-    return true;
-  }
-  GuardMemo pending{words, cache.content_generation, physical, count};
+  GuardMemo pending;
+  pending.words = words;
+  pending.generation = cache.content_generation;
+  pending.pc = pc;
+  pending.translation = state.msr.IR ? GetMMU().GetIBATTable()[pc >> PowerPC::BAT_INDEX_SHIFT] : 0;
+  pending.count = count;
   u32 checked = 0;
   while (checked < count)
   {
@@ -1429,7 +1422,9 @@ static std::optional<bool> MatchResidentCode(uint32_t pc, const uint32_t* words,
 
 // Content-guarded alternate DOLs. Writes before icbi must continue to select
 // the cached instructions, not freshly modified RAM.
-extern "C" int aot_match_code(uint32_t pc, const uint32_t* words, uint32_t count)
+// Keep cache fills, word comparisons and their stack temporaries out of the
+// per-block memo hit path, including when the runtime is linked with ThinLTO.
+[[gnu::noinline]] static int MatchCodeSlow(uint32_t pc, const uint32_t* words, uint32_t count)
 {
   if (!words || !count || (pc & 3) || count > (UINT32_MAX - pc) / 4)
     return 0;
@@ -1442,5 +1437,37 @@ extern "C" int aot_match_code(uint32_t pc, const uint32_t* words, uint32_t count
     if (!inst.valid || inst.hex != words[i])
       return 0;
   }
+  return 1;
+}
+
+extern "C" int aot_match_code(uint32_t pc, const uint32_t* words, uint32_t count)
+{
+  // Pre-init calls use the slow path; normal hits need no lazy singleton setup.
+  if (!s_system)
+    return MatchCodeSlow(pc, words, count);
+  auto& state = s_system->GetPPCState();
+  auto& cache = state.iCache;
+  const uintptr_t key = reinterpret_cast<uintptr_t>(words);
+  const size_t slot = ((key >> 2) ^ (key >> 16)) & (s_guard_memos.size() - 1);
+  const auto& memo = s_guard_memos[slot];
+  // A populated memo also certifies alignment, bounds and real MEM1/MEM2.
+  // Recheck the effective address and BAT descriptor before reusing it: the
+  // same instruction array can be queried at different virtual addresses.
+  const bool reused =
+      memo.line_count && memo.words == words && memo.pc == pc && memo.count == count &&
+      memo.generation == cache.content_generation && HID0(state).ICE && !cache.m_disable_icache &&
+      (state.msr.IR
+           ? memo.translation != 0 && s_mmu &&
+                 memo.translation == s_mmu->GetIBATTable()[pc >> PowerPC::BAT_INDEX_SHIFT]
+           : memo.translation == 0);
+  if (s_track_fallbacks)
+  {
+    ++s_guard_checks;
+    s_guard_reuses += reused;
+  }
+  if (!reused)
+    return MatchCodeSlow(pc, words, count);
+  for (u32 n = 0; n < memo.line_count; ++n)
+    cache.MarkUsed(memo.lines[n].set, memo.lines[n].way);
   return 1;
 }
