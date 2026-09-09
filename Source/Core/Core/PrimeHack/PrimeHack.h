@@ -24,6 +24,8 @@ void Reset();
 void UpdatePrime1(const Core::CPUThreadGuard& guard, const GCPadStatus& pad, bool enabled);
 // Called by Wiimote 1 before its input is recorded/serialized.
 void PrepareInput(WiimoteEmu::DesiredWiimoteState* state, bool sensor_bar);
+// Poll fresh pad input while Bluetooth is disconnected (PrepareInput is not called then).
+u16 GetCurrentlyPressedButtons();
 // Pure mapping shared by the frontend path and tests. Pointer axes are [-1, 1].
 void MapPad(const GCPadStatus& pad, WiimoteEmu::DesiredWiimoteState* state, float pointer_x,
             float pointer_y, bool sensor_bar);
@@ -31,5 +33,6 @@ void MapPad(const GCPadStatus& pad, WiimoteEmu::DesiredWiimoteState* state, floa
 inline void Update(const Core::CPUThreadGuard&) {}
 inline void Reset() {}
 inline void PrepareInput(WiimoteEmu::DesiredWiimoteState*, bool) {}
+inline u16 GetCurrentlyPressedButtons() { return 0; }
 #endif
 } // namespace PrimeHack

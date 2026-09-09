@@ -5,7 +5,14 @@
 #include <bit>
 #include <gtest/gtest.h>
 
+#include "Common/Config/Config.h"
+#include "Common/FileUtil.h"
+#include "Common/ScopeGuard.h"
+#include "Core/Config/MainSettings.h"
+#include "Core/ConfigManager.h"
 #include "Core/Core.h"
+#include "Core/HW/GCPad.h"
+#include "Core/HW/GCPadEmu.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/WiimoteEmu/DesiredWiimoteState.h"
 #include "Core/PowerPC/Gekko.h"
@@ -15,6 +22,8 @@
 #include "Core/PrimeHack/PrimeHack.h"
 #include "Core/System.h"
 #include "InputCommon/GCPadStatus.h"
+#include "InputCommon/InputConfig.h"
+#include "UICommon/UICommon.h"
 
 #ifdef DOLPHIN_HAS_AOT
 extern "C" void aot_init_fast_mem();
@@ -132,6 +141,55 @@ protected:
     Float(player + 0x38, 123);
   }
 };
+
+TEST_F(PrimeHackRuntime, ReconnectPollReadsFreshPadWithoutReports)
+{
+  const auto profile = File::CreateTempDir();
+  ASSERT_FALSE(profile.empty());
+  UICommon::SetUserDirectory(profile);
+  Config::Init();
+  SConfig::Init();
+  system.SetIsWii(true);
+  Pad::GetConfig()->CreateController<GCPad>(0);
+  const Common::ScopeGuard cleanup(
+      [&]
+      {
+        PrimeHack::Reset();
+        Pad::ClearExternalProvider();
+        Pad::GetConfig()->ClearControllers();
+        SConfig::Shutdown();
+        Config::Shutdown();
+        File::DeleteDirRecursively(profile);
+      });
+  GCPadStatus pad;
+  int polls = 0;
+  Pad::SetExternalProvider(
+      [&](int index)
+      {
+        EXPECT_EQ(index, 0);
+        ++polls;
+        return pad;
+      });
+  SConfig::GetInstance().SetRunningGameMetadata("R3ME01");
+  Config::SetCurrent(Config::MAIN_PRIMEHACK_ENABLED, true);
+  Core::CPUThreadGuard guard(system);
+  PrimeHack::Update(guard);
+  WiimoteEmu::Wiimote remote(0);
+  WiimoteEmu::Wiimote other_remote(1);
+  pad.button = PAD_BUTTON_A;
+  pad.isConnected = false;
+  EXPECT_EQ(remote.GetCurrentlyPressedButtons().hex, 0);
+  pad.isConnected = true;
+  EXPECT_EQ(remote.GetCurrentlyPressedButtons().hex, WiimoteEmu::Wiimote::BUTTON_A);
+  EXPECT_EQ(other_remote.GetCurrentlyPressedButtons().hex, 0);
+  pad.button = 0;
+  EXPECT_EQ(remote.GetCurrentlyPressedButtons().hex, 0);
+  EXPECT_EQ(polls, 3);
+  PrimeHack::Reset();
+  pad.button = PAD_BUTTON_A;
+  EXPECT_EQ(remote.GetCurrentlyPressedButtons().hex, 0);
+  EXPECT_EQ(polls, 3);
+}
 
 TEST_F(PrimeHackRuntime, PatchesInvalidateInstructionCacheAndRestore)
 {

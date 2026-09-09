@@ -28,6 +28,11 @@ configure GameCube controller 1 using Dolphin's normal controller settings; on
 Delta, the existing external pad provider supplies the same layout. Wiimote 1
 must use the emulated source. No physical Wii Remote is required.
 
+If the emulated Wii Remote disconnects after inactivity, reconnect the physical
+controller and press A. The Bluetooth activation poll reads GameCube pad 1 even
+while normal Wii input reports are stopped. Dolphin's Connect Wii Remote 1
+shortcut (Alt/Option + F5 by default) can also request reconnection.
+
 | Pad input | Wii input / action |
 | --- | --- |
 | Left stick | Nunchuk movement |

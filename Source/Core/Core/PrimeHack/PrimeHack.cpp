@@ -138,6 +138,22 @@ void PrepareInput(WiimoteEmu::DesiredWiimoteState* state, bool sensor_bar)
   MapPad(pad, state, s_pointer.x, s_pointer.y, sensor_bar);
 }
 
+u16 GetCurrentlyPressedButtons()
+{
+  if (!s_input_enabled.load() || !Pad::IsInitialized())
+    return 0;
+
+  // Bluetooth activation bypasses PrepareInput. Sampling its cached pad here would
+  // prevent reconnecting, and could keep moving the camera with stale stick input.
+  const GCPadStatus pad = Pad::GetStatus(0);
+  std::lock_guard lock(s_input_mutex);
+  s_pad = {};
+  s_pointer = {};
+  WiimoteEmu::DesiredWiimoteState state;
+  MapPad(pad, &state, 0, 0, false);
+  return state.buttons.hex;
+}
+
 void Reset()
 {
   s_input_enabled = false;

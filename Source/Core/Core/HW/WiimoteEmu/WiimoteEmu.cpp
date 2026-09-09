@@ -684,6 +684,8 @@ ButtonData Wiimote::GetCurrentlyPressedButtons()
   m_dpad->GetState(&buttons.hex, IsSideways() ? dpad_sideways_bitmasks : dpad_bitmasks,
                    m_input_override_function);
 
+  if (m_index == 0)
+    buttons.hex |= PrimeHack::GetCurrentlyPressedButtons();
   return buttons;
 }
 
