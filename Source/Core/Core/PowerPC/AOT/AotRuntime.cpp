@@ -601,6 +601,27 @@ void aot_rfi(AOTState* s)
   ppc_state.pc = SRR0(ppc_state);
   ppc_state.npc = ppc_state.pc;
   aot_msr_updated(s);
+  // Generated code dispatches straight to pc (no Run-loop bounce), so deliver
+  // anything the restored MSR.EE now permits here, as the Run loop would.
+  if (ppc_state.Exceptions != 0)
+    GetSystem().GetPowerPC().CheckExceptions();
+}
+
+// mtmsr without ending the block: returns 1 when CheckExceptions delivered an
+// exception (pc moved to a vector), 0 when the block may continue with the
+// next instruction. The caller sets pc/npc to the fallthrough first.
+int aot_mtmsr_check(AOTState* s, uint32_t val)
+{
+  if (aot_stats_enabled)
+    ++s_stat_mtmsr;
+  auto& ppc_state = GetPPCState(s);
+  ppc_state.msr.Hex = val;
+  aot_msr_updated(s);  // Lightweight -- no BAT remapping
+  if (ppc_state.Exceptions == 0)
+    return 0;
+  const u32 pc = ppc_state.pc;
+  GetSystem().GetPowerPC().CheckExceptions();
+  return ppc_state.pc != pc;
 }
 
 void aot_mtmsr(AOTState* s, uint32_t val)

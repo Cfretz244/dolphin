@@ -811,7 +811,11 @@ bool AOTCEmitter::EmitTable19(std::string& out, UGeckoInstruction inst, u32 pc)
   case 417: EmitCrLogical(out, inst, "AOT_CR_ORC"); return true;   // crorc
   case 449: EmitCrLogical(out, inst, "AOT_CR_OR"); return true;    // cror
   case 150: return true; // isync (no-op)
-  case 50:  out += "    aot_rfi(s); return;\n"; return true; // rfi
+  case 50:  // rfi: restore MSR/pc, then dispatch to the target directly. aot_rfi
+            // delivers any exception the restored MSR.EE permits.
+    out += fmt::format("    s->downcount-={}; aot_rfi(s);\n", m_block_cycle_count);
+    EmitIndirectDispatch(out);
+    return true;
   default:  return false;
   }
 }
@@ -1534,11 +1538,20 @@ void AOTCEmitter::EmitMfmsr(std::string& out, UGeckoInstruction inst)
 
 void AOTCEmitter::EmitMtmsr(std::string& out, UGeckoInstruction inst, u32 pc)
 {
-  // mtmsr ends the block (may enable exceptions). Set PC to fallthrough
-  // before calling aot_mtmsr which may change PC via CheckExceptions.
+  // mtmsr may enable a pending exception. Set PC to the fallthrough first;
+  // aot_mtmsr_check reports whether CheckExceptions redirected pc, in which
+  // case the block ends. Otherwise execution continues in place -- Wii OS
+  // code toggles MSR.EE millions of times a second (OSDisable/RestoreInterrupts
+  // around every mutex), and returning to the Run loop for each one cost more
+  // than the instruction. Cycles so far are charged here; the remainder of the
+  // block accounts from zero. MSR.FP may have changed, so re-check before the
+  // next FP instruction.
   out += fmt::format("    s->downcount-={}; s->pc={}; s->npc=s->pc; "
-                     "aot_mtmsr(s,s->gpr[{}]); return;\n",
+                     "{{ extern int aot_mtmsr_check(AOTState*,uint32_t); "
+                     "if(aot_mtmsr_check(s,s->gpr[{}])) return; }}\n",
                      m_block_cycle_count, PcStr(pc + 4), I(inst.RS));
+  m_block_cycle_count = 0;
+  m_fpu_checked = false;
 }
 
 void AOTCEmitter::EmitMfsr(std::string& out, UGeckoInstruction inst)
