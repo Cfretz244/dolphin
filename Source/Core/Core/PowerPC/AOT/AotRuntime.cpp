@@ -188,6 +188,13 @@ static u64 s_guard_reuses = 0;
 
 static bool s_track_fallbacks = false;
 static std::unordered_map<u32, u64> s_fallback_counts;
+// Event counters printed with the fallback report (AOT_TRACK_FALLBACKS=1).
+extern "C" int aot_stats_enabled = 0;
+extern "C" uint64_t aot_stat_exception_checks = 0;   // Run-loop CheckExceptions calls
+extern "C" uint64_t aot_stat_exception_bits[16] = {};  // pending bit histogram at those calls
+extern "C" uint64_t aot_stat_exception_masked = 0;   // ... with MSR.EE clear
+static u64 s_stat_rfi = 0, s_stat_idle = 0, s_stat_mtmsr = 0, s_stat_gp_store = 0,
+           s_stat_gp_psq = 0;
 
 // Check if address is in guest RAM: MEM1 (cached or uncached mirror), or on
 // Wii, MEM2 at 0x90000000/0xD0000000. Low-memory (0x0xxxxxxx) and 0x4xxxxxxx
@@ -286,6 +293,7 @@ void aot_shutdown()
   aot_fast_mem.exram = nullptr;
   aot_fast_mem.exram_size = 0;
   s_track_fallbacks = false;
+  aot_stats_enabled = s_track_fallbacks ? 1 : 0;
   s_fallback_counts.clear();
 }
 
@@ -346,26 +354,36 @@ uint64_t aot_read_u64_slow(AOTState* s, uint32_t addr)
 // translation when MSR.DR is set (anything not BAT-mapped, and page-crossing
 // stores, stay on the MMU path), then the same 0xFFFFF000 physical-address
 // mask. Returns false when the store is not a gather-pipe write.
-static inline bool TryGatherPipeWrite(AOTState* s, uint32_t addr, uint32_t val, uint32_t size)
+// Physical gather-pipe address for a `size`-byte store at effective `addr`, or
+// 0 when the store is anything else (not BAT-mapped, not the pipe page, or
+// page-crossing -- all left to the MMU path).
+static inline u32 GatherPipePhysical(const PowerPC::PowerPCState& ppc_state, uint32_t addr,
+                                     uint32_t size)
 {
-  auto& ppc_state = GetPPCState(s);
   u32 physical = addr;
   if (ppc_state.msr.DR)
   {
     const u32 bat = GetMMU().GetDBATTable()[addr >> PowerPC::BAT_INDEX_SHIFT];
     if (!(bat & PowerPC::BAT_MAPPED_BIT))
-      return false;
+      return 0;
     physical = (bat & PowerPC::BAT_RESULT_MASK) | (addr & (PowerPC::BAT_PAGE_SIZE - 1));
   }
   if ((physical & 0xFFFFF000) != GPFifo::GATHER_PIPE_PHYSICAL_ADDRESS)
-    return false;
+    return 0;
   if ((addr & 0xFFF) + size > 0x1000)
-    return false;
+    return 0;
+  return physical;
+}
+
+// One element into the pipe, exactly as MMU::WriteToHardware's gather-pipe
+// branch would do it (including its double harness capture record).
+static inline void GatherPipeElement(u32 physical, u32 val, u32 size)
+{
 #ifdef DOLPHIN_AOT_HARNESS
-  // WriteToHardware records gather-pipe stores twice (generic MMIO capture,
-  // then again in its gather-pipe branch); keep the capture stream identical.
   MMIOCaptureRecord(physical, val, size);
   MMIOCaptureRecord(physical, val, size);
+#else
+  (void)physical;
 #endif
   auto& gpfifo = GetSystem().GetGPFifo();
   switch (size)
@@ -380,6 +398,16 @@ static inline bool TryGatherPipeWrite(AOTState* s, uint32_t addr, uint32_t val, 
     gpfifo.Write32(val);
     break;
   }
+}
+
+static inline bool TryGatherPipeWrite(AOTState* s, uint32_t addr, uint32_t val, uint32_t size)
+{
+  const u32 physical = GatherPipePhysical(GetPPCState(s), addr, size);
+  if (!physical)
+    return false;
+  if (aot_stats_enabled)
+    ++s_stat_gp_store;
+  GatherPipeElement(physical, val, size);
   return true;
 }
 
@@ -448,6 +476,7 @@ void aot_write_u64_slow(AOTState* s, uint64_t val, uint32_t addr)
 void aot_enable_fallback_tracking()
 {
   s_track_fallbacks = true;
+  aot_stats_enabled = 1;
   s_fallback_counts.clear();
 }
 
@@ -467,6 +496,19 @@ void aot_dump_fallback_stats()
   fmt::print(stderr, "\n=== AOT Interpreter Fallback Stats ===\n");
   fmt::print(stderr, "Total fallbacks: {}\n", total);
   fmt::print(stderr, "Guard checks: {} | Reused: {}\n", s_guard_checks, s_guard_reuses);
+  fmt::print(stderr,
+             "Events: run-loop exception checks {} (EE clear {}), rfi {}, mtmsr {}, idle exits "
+             "{}, gather-pipe stores {} (+{} psq)\n",
+             aot_stat_exception_checks, aot_stat_exception_masked, s_stat_rfi, s_stat_mtmsr,
+             s_stat_idle, s_stat_gp_store, s_stat_gp_psq);
+  static const char* const kBitNames[16] = {"DEC", "SYSCALL", "EXTINT", "DSI", "ISI", "ALIGN",
+                                            "FPU", "PROGRAM", "PMC", "bit9", "bit10", "bit11",
+                                            "bit12", "bit13", "bit14", "bit15"};
+  fmt::print(stderr, "Pending exception bits at those checks:");
+  for (int b = 0; b < 16; b++)
+    if (aot_stat_exception_bits[b])
+      fmt::print(stderr, " {}={}", kBitNames[b], aot_stat_exception_bits[b]);
+  fmt::print(stderr, "\n");
   fmt::print(stderr, "Unique PCs: {}\n\n", sorted.size());
 
   const size_t limit = std::min<size_t>(sorted.size(), 50);
@@ -550,6 +592,8 @@ void aot_msr_updated(AOTState* s)
 
 void aot_rfi(AOTState* s)
 {
+  if (aot_stats_enabled)
+    ++s_stat_rfi;
   auto& ppc_state = GetPPCState(s);
   const u32 mask = 0x87C0FFFF;
   const u32 clearMSR13 = 0xFFFBFFFF;
@@ -561,6 +605,8 @@ void aot_rfi(AOTState* s)
 
 void aot_mtmsr(AOTState* s, uint32_t val)
 {
+  if (aot_stats_enabled)
+    ++s_stat_mtmsr;
   auto& ppc_state = GetPPCState(s);
   ppc_state.msr.Hex = val;
   aot_msr_updated(s);  // Lightweight — no BAT remapping
@@ -1202,11 +1248,82 @@ bool FastDequantize(PowerPC::PowerPCState& ppcs, u32 addr, u32 instI, u32 instRD
   return true;
 }
 
+// psq_st into the write-gather pipe (GX packed vertex attributes). Quantizes
+// into a scratch buffer with the RAM fast path's routines, then pushes each
+// element in the interpreter's order (ps0 then ps1) as separate pipe writes.
+static bool GatherPipeQuantize(PowerPC::PowerPCState& ppcs, u32 addr, u32 instI, u32 instRS,
+                               u32 instW)
+{
+  const UGQR gqr(ppcs.spr[SPR_GQR0 + instI]);
+  u32 elem = 0;
+  switch (gqr.st_type)
+  {
+  case QUANTIZE_FLOAT:
+    elem = 4;
+    break;
+  case QUANTIZE_U16:
+  case QUANTIZE_S16:
+    elem = 2;
+    break;
+  case QUANTIZE_U8:
+  case QUANTIZE_S8:
+    elem = 1;
+    break;
+  default:
+    return false;
+  }
+  const u32 count = instW != 0 ? 1 : 2;
+  const u32 physical = GatherPipePhysical(ppcs, addr, elem * count);
+  if (!physical)
+    return false;
+  alignas(8) u8 buf[8] = {};
+  const double ps0 = ppcs.ps[instRS].PS0AsDouble();
+  const double ps1 = ppcs.ps[instRS].PS1AsDouble();
+  switch (gqr.st_type)
+  {
+  case QUANTIZE_FLOAT:
+  {
+    const u32 conv_ps0 = ConvertToSingleFTZ(std::bit_cast<u64>(ps0));
+    if (instW != 0)
+      FastWrite<u32>(conv_ps0, buf);
+    else
+      FastWritePair<u32>(conv_ps0, ConvertToSingleFTZ(std::bit_cast<u64>(ps1)), buf);
+    break;
+  }
+  case QUANTIZE_U8:
+    FastQuantizeAndStore<u8>(ps0, ps1, buf, instW, gqr.st_scale);
+    break;
+  case QUANTIZE_U16:
+    FastQuantizeAndStore<u16>(ps0, ps1, buf, instW, gqr.st_scale);
+    break;
+  case QUANTIZE_S8:
+    FastQuantizeAndStore<s8>(ps0, ps1, buf, instW, gqr.st_scale);
+    break;
+  default:
+    FastQuantizeAndStore<s16>(ps0, ps1, buf, instW, gqr.st_scale);
+    break;
+  }
+  if (aot_stats_enabled)
+    ++s_stat_gp_psq;
+  for (u32 i = 0; i < count; i++)
+  {
+    u32 val = 0;
+    if (elem == 4)
+      val = FastRead<u32>(buf + 4 * i);
+    else if (elem == 2)
+      val = FastRead<u16>(buf + 2 * i);
+    else
+      val = buf[i];
+    GatherPipeElement(physical + elem * i, val, elem);
+  }
+  return true;
+}
+
 bool FastQuantize(PowerPC::PowerPCState& ppcs, u32 addr, u32 instI, u32 instRS, u32 instW)
 {
   u8* p = FastMemHostPtr(addr);
   if (p == nullptr)
-    return false;
+    return GatherPipeQuantize(ppcs, addr, instI, instRS, instW);
 
   const UGQR gqr(ppcs.spr[SPR_GQR0 + instI]);
   const u32 st_scale = gqr.st_scale;
@@ -1417,6 +1534,8 @@ void aot_dcbt(AOTState* s, uint32_t addr)
 void aot_idle(AOTState* s)
 {
   (void)s;
+  if (aot_stats_enabled)
+    ++s_stat_idle;
   GetSystem().GetCoreTiming().Idle();
 }
 

@@ -40,6 +40,10 @@ extern "C" const int kDolphinCPUCoreAOT = static_cast<int>(PowerPC::CPUCore::AOT
 extern "C" void aot_init_fast_mem();
 extern "C" void aot_shutdown();
 extern "C" void aot_dump_fallback_stats();
+extern "C" int aot_stats_enabled;
+extern "C" uint64_t aot_stat_exception_checks;
+extern "C" uint64_t aot_stat_exception_bits[16];
+extern "C" uint64_t aot_stat_exception_masked;
 
 static void interp_only_dispatch(AOTState* s)
 {
@@ -220,6 +224,14 @@ void AOTCore::Run()
       m_dispatch(aot_state);
       if (m_ppc_state.Exceptions != 0)
       {
+        if (aot_stats_enabled)
+        {
+          ++aot_stat_exception_checks;
+          aot_stat_exception_masked += m_ppc_state.msr.EE ? 0 : 1;
+          for (int b = 0; b < 16; b++)
+            if (m_ppc_state.Exceptions & (1u << b))
+              ++aot_stat_exception_bits[b];
+        }
         m_ppc_state.npc = m_ppc_state.pc;
         power_pc.CheckExceptions();
       }
