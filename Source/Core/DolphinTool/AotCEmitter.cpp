@@ -325,7 +325,7 @@ void AOTCEmitter::EmitBlockBody(std::string& out, u32 block_addr, u32 num_instru
         {
           // The resident-line guard covers this body, but timing, exceptions
           // and the diff harness still stop at every original block boundary.
-          out += fmt::format("    if(s->downcount<=0||s->exceptions AOT_EDGE_STOP)"
+          out += fmt::format("    if(s->downcount<=0||(s->exceptions&0xFFFFFEFAu) AOT_EDGE_STOP)"
                              "{{ s->pc={}; return; }}\n",
                              PcStr(next_pc));
         }
@@ -357,7 +357,7 @@ void AOTCEmitter::EmitBlockBody(std::string& out, u32 block_addr, u32 num_instru
       // dispatch-table bounces: every not-taken conditional and split-block
       // boundary unwound to the Run loop and re-entered <prefix>_dispatch.
       out += fmt::format(
-          "    if(s->downcount<=0||s->exceptions AOT_EDGE_STOP){{ s->pc={}; return; }}\n",
+          "    if(s->downcount<=0||(s->exceptions&0xFFFFFEFAu) AOT_EDGE_STOP){{ s->pc={}; return; }}\n",
           PcStr(next_pc));
       out += fmt::format("    [[clang::musttail]] return {}(s);\n", BlockFn(next_pc, false));
     }
@@ -1208,7 +1208,7 @@ void AOTCEmitter::EmitBranchTo(std::string& out, u32 target, u32 current_pc,
     // per-edge latency now that chains span fall-throughs too; the JIT omits it
     // on linked edges, so it is a removal candidate once chaining soaks clean.
     out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
-    out += fmt::format("    if(s->downcount<=0||s->exceptions AOT_EDGE_STOP){{ s->pc={}; return; }}\n",
+    out += fmt::format("    if(s->downcount<=0||(s->exceptions&0xFFFFFEFAu) AOT_EDGE_STOP){{ s->pc={}; return; }}\n",
                        pc_expr);
     out += fmt::format("    [[clang::musttail]] return {}(s);\n", BlockFn(target, dol_target));
   }

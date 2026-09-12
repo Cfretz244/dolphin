@@ -30,6 +30,9 @@
 #include "Core/PowerPC/Interpreter/ExceptionUtils.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
 #include "Core/PowerPC/AOT/AotModuleTracker.h"
+#ifdef DOLPHIN_AOT_HARNESS
+#include "Core/PowerPC/AOT/AotMmioCapture.h"
+#endif
 #include "Core/PowerPC/Interpreter/Interpreter_FPUtils.h"
 #include "Core/PowerPC/Interpreter/Interpreter_PairedTables.h"
 #include "Core/PowerPC/Interpreter/Interpreter_PairedUtils.h"
@@ -336,8 +339,54 @@ uint64_t aot_read_u64_slow(AOTState* s, uint32_t addr)
   return PowerPC::ReadFromJit<u64>(GetMMU(), addr);
 }
 
+// Write-gather pipe fast path. MMU::WriteToHardware reaches the same
+// GPFifo::Write* calls only after its generic translation preamble; GX command
+// submission (GXPosition/GXColor/...) is a store per vertex attribute, so that
+// preamble dominated large scenes. Mirrors WriteToHardware exactly: BAT
+// translation when MSR.DR is set (anything not BAT-mapped, and page-crossing
+// stores, stay on the MMU path), then the same 0xFFFFF000 physical-address
+// mask. Returns false when the store is not a gather-pipe write.
+static inline bool TryGatherPipeWrite(AOTState* s, uint32_t addr, uint32_t val, uint32_t size)
+{
+  auto& ppc_state = GetPPCState(s);
+  u32 physical = addr;
+  if (ppc_state.msr.DR)
+  {
+    const u32 bat = GetMMU().GetDBATTable()[addr >> PowerPC::BAT_INDEX_SHIFT];
+    if (!(bat & PowerPC::BAT_MAPPED_BIT))
+      return false;
+    physical = (bat & PowerPC::BAT_RESULT_MASK) | (addr & (PowerPC::BAT_PAGE_SIZE - 1));
+  }
+  if ((physical & 0xFFFFF000) != GPFifo::GATHER_PIPE_PHYSICAL_ADDRESS)
+    return false;
+  if ((addr & 0xFFF) + size > 0x1000)
+    return false;
+#ifdef DOLPHIN_AOT_HARNESS
+  // WriteToHardware records gather-pipe stores twice (generic MMIO capture,
+  // then again in its gather-pipe branch); keep the capture stream identical.
+  MMIOCaptureRecord(physical, val, size);
+  MMIOCaptureRecord(physical, val, size);
+#endif
+  auto& gpfifo = GetSystem().GetGPFifo();
+  switch (size)
+  {
+  case 1:
+    gpfifo.Write8(static_cast<u8>(val));
+    break;
+  case 2:
+    gpfifo.Write16(static_cast<u16>(val));
+    break;
+  default:
+    gpfifo.Write32(val);
+    break;
+  }
+  return true;
+}
+
 void aot_write_u8_slow(AOTState* s, uint32_t val, uint32_t addr)
 {
+  if (TryGatherPipeWrite(s, addr, val, 1))
+    return;
   if (u8* p = FastMemHostPtr(addr))
   {
     *p = static_cast<u8>(val);
@@ -347,7 +396,8 @@ void aot_write_u8_slow(AOTState* s, uint32_t val, uint32_t addr)
 }
 
 void aot_write_u16_slow(AOTState* s, uint32_t val, uint32_t addr)
-{
+{  if (TryGatherPipeWrite(s, addr, val, 2))
+    return;
   if (u8* p = FastMemHostPtr(addr))
   {
     const u16 v = Common::swap16(static_cast<u16>(val));
@@ -369,7 +419,8 @@ void aot_write_u16_br_slow(AOTState* s, uint32_t val, uint32_t addr)
 }
 
 void aot_write_u32_slow(AOTState* s, uint32_t val, uint32_t addr)
-{
+{  if (TryGatherPipeWrite(s, addr, val, 4))
+    return;
   if (u8* p = FastMemHostPtr(addr))
   {
     const u32 v = Common::swap32(val);
