@@ -1360,6 +1360,15 @@ void aot_dcbt(AOTState* s, uint32_t addr)
   // Prefetch hint — no-op
 }
 
+// Busy-wait loop back-edge (emitter IsBusyWaitLoop): same as the JIT's idle
+// exit — advance to the next scheduled event instead of spinning. Zeroes the
+// downcount; the generated code returns to the Run loop right after.
+void aot_idle(AOTState* s)
+{
+  (void)s;
+  GetSystem().GetCoreTiming().Idle();
+}
+
 void aot_icbi(AOTState* s, uint32_t addr)
 {
   // Must invalidate the emulated icache exactly like Interpreter::icbi: the interpreter

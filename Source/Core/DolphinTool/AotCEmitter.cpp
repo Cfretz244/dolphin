@@ -3,6 +3,8 @@
 
 #include "DolphinTool/AotCEmitter.h"
 
+#include <bitset>
+
 #include <fmt/format.h>
 
 #include "Common/CommonTypes.h"
@@ -137,10 +139,83 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
 
   m_inline_depth = 0;
   m_inline_insts = num_instructions;
+  m_idle_loop_start =
+      (!m_module && !m_guarded_images && IsBusyWaitLoop(block_addr, num_instructions)) ?
+          block_addr : 0;
   EmitBlockBody(out, block_addr, num_instructions);
 
   out += "}\n";
   return out;
+}
+
+// Mirrors PPCAnalyzer::IsBusyWaitLoop: loops to itself with no other branch,
+// no CTR use, no stores, and only reads registers it wrote earlier in the loop
+// (or never writes registers it read). Register in/out sets follow
+// PPCAnalyzer::SetInstructionStats' GekkoOPInfo flag mapping.
+bool AOTCEmitter::IsBusyWaitLoop(u32 block_addr, u32 num_instructions) const
+{
+  if (num_instructions < 2)
+    return false;
+  std::bitset<32> write_disallowed, written;
+  for (u32 i = 0; i < num_instructions; i++)
+  {
+    const u32 pc = block_addr + i * 4;
+    const auto word = m_memory.ReadInstruction(pc);
+    if (!word)
+      return false;
+    const UGeckoInstruction inst(*word);
+    const GekkoOPInfo* info = PPCTables::GetOpInfo(inst, pc);
+    if (!info)
+      return false;
+    if (info->type == OpType::Branch)
+    {
+      if (i != num_instructions - 1)
+        return false;
+      u32 target;
+      if (inst.OPCD == 18)
+        target = inst.AA ? u32(SignExt26(inst.LI << 2)) : pc + u32(SignExt26(inst.LI << 2));
+      else if (inst.OPCD == 16)
+      {
+        if (!(inst.BO & BO_DONT_DECREMENT_FLAG))
+          return false;  // uses CTR
+        target = inst.AA ? u32(SignExt16(s16(inst.BD << 2))) :
+                           pc + u32(SignExt16(s16(inst.BD << 2)));
+      }
+      else
+        return false;
+      return target == block_addr && !inst.LK;
+    }
+    if (info->type != OpType::Integer && info->type != OpType::Load)
+      return false;
+    std::bitset<32> in, outr;
+    if ((info->flags & FL_IN_A) || ((info->flags & FL_IN_A0) && inst.RA != 0))
+      in[inst.RA] = true;
+    if (info->flags & FL_IN_B)
+      in[inst.RB] = true;
+    if (info->flags & FL_IN_C)
+      in[inst.RC] = true;
+    if (info->flags & FL_IN_S)
+      in[inst.RS] = true;
+    if (info->flags & FL_OUT_A)
+      outr[inst.RA] = true;
+    if (info->flags & FL_OUT_D)
+      outr[inst.RD] = true;
+    if (inst.OPCD == 46)  // lmw
+      for (u32 r = inst.RD; r < 32; r++)
+        outr[r] = true;
+    for (u32 r = 0; r < 32; r++)
+      if (in[r] && !written[r])
+        write_disallowed[r] = true;
+    for (u32 r = 0; r < 32; r++)
+    {
+      if (!outr[r])
+        continue;
+      if (write_disallowed[r])
+        return false;
+      written[r] = true;
+    }
+  }
+  return false;
 }
 
 void AOTCEmitter::EmitBlockBody(std::string& out, u32 block_addr, u32 num_instructions)
@@ -1108,7 +1183,16 @@ void AOTCEmitter::EmitBranchTo(std::string& out, u32 target, u32 current_pc,
   const bool known = dol_target ? m_module->dol_blocks->contains(target) :
                                   m_known_blocks.contains(target);
   const std::string pc_expr = dol_target ? fmt::format("{:#010x}u", target) : PcStr(target);
-  if (known && !m_module && m_volatile_targets.contains(target))
+  if (!m_module && m_inline_depth == 0 && m_idle_loop_start != 0 && target == m_idle_loop_start)
+  {
+    // Busy-wait back-edge: skip ahead to the next scheduled event (JIT idle
+    // exit). aot_idle zeroes the downcount, so returning re-enters the Run
+    // loop, which advances CoreTiming before dispatching the loop head again.
+    out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
+    out += "    { extern void aot_idle(AOTState*); aot_idle(s); }\n";
+    out += fmt::format("    s->pc={}; return;\n", pc_expr);
+  }
+  else if (known && !m_module && m_volatile_targets.contains(target))
   {
     // Runtime-swapped target (image variant): never bind the symbol statically.
     out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
@@ -1237,7 +1321,18 @@ void AOTCEmitter::EmitLmw(std::string& out, UGeckoInstruction inst)
     out += fmt::format("        uint32_t ea=s->gpr[{}]+{};\n", ra, DispExpr(offset));
   else
     out += fmt::format("        uint32_t ea=(uint32_t){};\n", DispExpr(offset));
-  out += fmt::format("        for(int r={};r<32;r++,ea+=4) s->gpr[r]=aot_read_u32(s,ea);\n", rd);
+  // Bulk fast path: one host-pointer check for the whole contiguous span
+  // (both ends must resolve into the same RAM region), then plain byte-swapped
+  // loads. Falls back to the per-word helper for anything else.
+  const u32 count = 32 - rd;
+  out += fmt::format("        uint8_t* p=aot_host_ptr(ea); uint8_t* q=aot_host_ptr(ea+{}u);\n",
+                     (count - 1) * 4);
+  out += fmt::format("        if(__builtin_expect(p!=0&&q==p+{}u,1)) {{\n", (count - 1) * 4);
+  out += fmt::format("            for(int r={};r<32;r++,p+=4) {{ uint32_t v; __builtin_memcpy(&v,p,4); "
+                     "s->gpr[r]=__builtin_bswap32(v); }}\n", rd);
+  out += "        } else {\n";
+  out += fmt::format("            for(int r={};r<32;r++,ea+=4) s->gpr[r]=aot_read_u32(s,ea);\n", rd);
+  out += "        }\n";
   out += "    }\n";
 }
 
@@ -1250,7 +1345,15 @@ void AOTCEmitter::EmitStmw(std::string& out, UGeckoInstruction inst)
     out += fmt::format("        uint32_t ea=s->gpr[{}]+{};\n", ra, DispExpr(offset));
   else
     out += fmt::format("        uint32_t ea=(uint32_t){};\n", DispExpr(offset));
-  out += fmt::format("        for(int r={};r<32;r++,ea+=4) aot_write_u32(s,s->gpr[r],ea);\n", rs);
+  const u32 count = 32 - rs;
+  out += fmt::format("        uint8_t* p=aot_host_ptr(ea); uint8_t* q=aot_host_ptr(ea+{}u);\n",
+                     (count - 1) * 4);
+  out += fmt::format("        if(__builtin_expect(p!=0&&q==p+{}u,1)) {{\n", (count - 1) * 4);
+  out += fmt::format("            for(int r={};r<32;r++,p+=4) {{ uint32_t v=__builtin_bswap32(s->gpr[r]); "
+                     "__builtin_memcpy(p,&v,4); }}\n", rs);
+  out += "        } else {\n";
+  out += fmt::format("            for(int r={};r<32;r++,ea+=4) aot_write_u32(s,s->gpr[r],ea);\n", rs);
+  out += "        }\n";
   out += "    }\n";
 }
 
@@ -1368,6 +1471,11 @@ void AOTCEmitter::EmitMfspr(std::string& out, UGeckoInstruction inst)
                        "((uint32_t)(s->xer_so_ov&1)<<30)|((uint32_t)s->xer_ca<<29)|"
                        "((uint32_t)s->xer_stringctrl);\n", rd);
     break;
+  case 912: case 913: case 914: case 915: case 916: case 917: case 918: case 919:  // GQR0-7
+    // Plain register reads (the interpreter's mfspr has no side effect for GQRs).
+    // OSSaveContext reads all seven upper GQRs on every thread switch.
+    out += fmt::format("    s->gpr[{}]=s->spr[{}];\n", rd, spr);
+    break;
   default:
     out += fmt::format("    s->gpr[{}]=aot_mfspr_special(s,{});\n", rd, spr);
     break;
@@ -1387,6 +1495,12 @@ void AOTCEmitter::EmitMtspr(std::string& out, UGeckoInstruction inst)
   case 1:   // XER
     out += fmt::format("    {{ uint32_t v=s->gpr[{}]; s->xer_so_ov=((v>>31)<<1)|((v>>30)&1); "
                        "s->xer_ca=(v>>29)&1; s->xer_stringctrl=v&0xFFFF; }}\n", rs);
+    break;
+  case 912: case 913: case 914: case 915: case 916: case 917: case 918: case 919:  // GQR0-7
+    // Interpreter::mtspr stores the value and does nothing else for GQRs; the
+    // psq helpers read the register at runtime, so no AOT-side state depends
+    // on it. OSLoadContext writes all seven upper GQRs on every thread switch.
+    out += fmt::format("    s->spr[{}]=s->gpr[{}];\n", spr, rs);
     break;
   default:
     out += fmt::format("    aot_mtspr_special(s,{},s->gpr[{}]);\n", spr, rs);

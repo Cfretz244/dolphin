@@ -245,6 +245,12 @@ private:
   std::unordered_set<u32> m_inline_targets;
   std::unordered_set<u32> m_volatile_targets;
   int m_inline_depth = 0;   // nested EmitBlockBody calls in the current function
+  // Busy-wait loop detection (PPCAnalyzer::IsBusyWaitLoop): the block being
+  // translated loops to itself with only integer/load work, so its taken
+  // back-edge calls aot_idle() and returns to the Run loop like the JIT's
+  // idle exit. Zero when the current block is not such a loop.
+  u32 m_idle_loop_start = 0;
+  bool IsBusyWaitLoop(u32 block_addr, u32 num_instructions) const;
   u32 m_inline_insts = 0;   // total instructions emitted into the current function
 
   const ModuleMode* m_module = nullptr;
