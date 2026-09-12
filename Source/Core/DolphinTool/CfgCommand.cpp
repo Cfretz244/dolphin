@@ -25,6 +25,7 @@
 #include <sqlite3.h>
 
 #include "Common/CommonTypes.h"
+#include "Common/StringUtil.h"
 #include "Common/IOFile.h"
 #include "Common/Swap.h"
 
@@ -1657,6 +1658,14 @@ int CfgCommand(const std::vector<std::string>& args)
       .help("Experimental: content-guarded alternate DOLs from instruction snapshots");
   parser.add_option("--primehack").action("store_true")
       .help("With --dol-images, include verified NTSC-U Trilogy MP1 patched code variants");
+  parser.add_option("--trace-image")
+      .action("append")
+      .help("With --dol-images: compile snapshot-captured code in LO-HI (hex, e.g. "
+            "0x81200000-0x81360000) as an additional fixed-address image (repeatable)");
+  parser.add_option("--trace-image-from")
+      .action("append")
+      .help("Trace file(s) whose snapshots supply --trace-image bytes (default: all --trace "
+            "files; use it to exclude captures from the pre-fix JIT trace writer)");
   parser.add_option("--no-rels")
       .action("store_true")
       .help("Skip discovery and CFG extraction of .rel relocatable modules");
@@ -1819,8 +1828,46 @@ int CfgCommand(const std::vector<std::string>& args)
       fmt::println(std::cerr, "--dol-images and --overlays are mutually exclusive");
       return EXIT_FAILURE;
     }
+    std::vector<std::pair<u32, u32>> trace_ranges;
+    if (options.is_set("trace_image"))
+    {
+      for (const auto& spec : options.all("trace_image"))
+      {
+        const std::string text = spec;
+        const size_t dash = text.find('-');
+        u32 lo = 0, hi = 0;
+        if (dash == std::string::npos ||
+            !TryParse(text.substr(0, dash), &lo) || !TryParse(text.substr(dash + 1), &hi) ||
+            lo >= hi || (lo & 3))
+        {
+          fmt::println(std::cerr, "--trace-image expects LO-HI hex addresses, got '{}'", text);
+          return EXIT_FAILURE;
+        }
+        trace_ranges.emplace_back(lo, hi);
+      }
+    }
+    const std::vector<TraceSnapshotBlock>* image_snapshots = &trace.snapshot_blocks;
+    TraceData image_sources;
+    if (options.is_set("trace_image_from"))
+    {
+      bool first = true;
+      for (const auto& path : options.all("trace_image_from"))
+      {
+        TraceData extra;
+        if (!ReadTraceFile(path, extra))
+          return EXIT_FAILURE;
+        if (first)
+          image_sources = std::move(extra);
+        else
+          MergeTraceData(image_sources, std::move(extra));
+        first = false;
+      }
+      image_snapshots = &image_sources.snapshot_blocks;
+    }
     return WriteDolImageCFG(*volume, trace.snapshot_blocks, output_path,
-                            options.is_set("primehack")) ? EXIT_SUCCESS : EXIT_FAILURE;
+                            options.is_set("primehack"), trace_ranges, *image_snapshots) ?
+               EXIT_SUCCESS :
+               EXIT_FAILURE;
   }
 
   // 4. Run recursive descent disassembly

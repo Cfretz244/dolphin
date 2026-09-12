@@ -4,6 +4,7 @@
 
 #include "DolphinTool/OverlayImages.h"
 #include <set>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -15,9 +16,14 @@ namespace DolphinTool
 {
 // Opt-in snapshot-backed fixed-address images; separate from SDK REL modules.
 // Every emitted block has an instruction-content guard, including direct edges.
+// trace_ranges: address ranges whose code exists nowhere on disc (e.g. a
+// launcher's relocated DOL-loader stub); their bytes come from image_snapshots
+// (which must be self-consistent) and are stored in the CFG database.
 bool WriteDolImageCFG(const DiscIO::Volume& volume,
                       const std::vector<TraceSnapshotBlock>& snapshots, const std::string& path,
-                      bool primehack = false);
+                      bool primehack = false,
+                      const std::vector<std::pair<u32, u32>>& trace_ranges = {},
+                      const std::vector<TraceSnapshotBlock>& image_snapshots = {});
 bool IsDolImageCFG(const std::string& path);
 bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
                         const std::string& output, const std::string& prefix,

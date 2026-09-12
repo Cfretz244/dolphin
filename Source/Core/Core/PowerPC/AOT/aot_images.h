@@ -76,7 +76,13 @@ typedef struct AotImageDesc {
     uint32_t override_count;
     const AotImageBlockSize* block_sizes;
     uint32_t block_size_count;
+    uint32_t flags;             /* AOT_IMAGE_AUXILIARY: may be active alongside a DOL */
 } AotImageDesc;
+
+/* Auxiliary images (trace-sourced code such as a launcher's relocated loader
+ * stub) never overlap a DOL's text and are selected into a second slot, so
+ * the DOL image they load stays active as soon as it matches. */
+#define AOT_IMAGE_AUXILIARY 1u
 
 /* Runtime state read by the generated dispatch. */
 typedef struct AotActiveImage {
@@ -85,6 +91,7 @@ typedef struct AotActiveImage {
     AOTBlockFunc* table;
 } AotActiveImage;
 extern AotActiveImage aot_active_image;
+extern AotActiveImage aot_active_image_aux;
 /* Points at the emulated instruction cache's invalidation counter; dispatch
  * rescans when it differs from aot_images_seen. */
 extern const uint64_t* aot_images_generation;

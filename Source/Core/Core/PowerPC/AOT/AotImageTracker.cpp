@@ -14,6 +14,7 @@
 
 extern "C" {
 AotActiveImage aot_active_image = {0, 0, nullptr};
+AotActiveImage aot_active_image_aux = {0, 0, nullptr};
 static uint64_t s_idle_generation = 0;
 const uint64_t* aot_images_generation = &s_idle_generation;
 uint64_t aot_images_seen = 0;
@@ -26,6 +27,7 @@ namespace
 const AotImageDesc* s_images = nullptr;
 u32 s_image_count = 0;
 const AotImageDesc* s_active = nullptr;
+const AotImageDesc* s_active_aux = nullptr;
 u32 s_active_mask = 0;
 bool s_active_mask_valid = true;
 u64 s_forced_generation = 0;  // added to the cache counter by MarkDirty()
@@ -128,14 +130,24 @@ void Rescan()
   const u32 ram_size = ram ? memory.GetRamSizeReal() : 0;
 
   const AotImageDesc* selected = nullptr;
+  const AotImageDesc* aux = nullptr;
   for (u32 i = 0; i < s_image_count && ram; i++)
   {
+    const bool auxiliary = (s_images[i].flags & AOT_IMAGE_AUXILIARY) != 0;
+    if ((auxiliary ? aux : selected) != nullptr)
+      continue;
     if (ImageMatches(s_images[i], ram, ram_size))
-    {
-      selected = &s_images[i];
-      break;
-    }
+      (auxiliary ? aux : selected) = &s_images[i];
   }
+  if (aux != s_active_aux)
+  {
+    INFO_LOG_FMT(AOT, "AotImageTracker: auxiliary image {}", aux ? aux->name : "none");
+    s_active_aux = aux;
+  }
+  if (aux)
+    aot_active_image_aux = {aux->base, aux->size, aux->table};
+  else
+    aot_active_image_aux = {0, 0, nullptr};
 
   u32 mask = 0;
   bool valid = true;
@@ -174,9 +186,11 @@ void Init(const AotImageDesc* images, u32 count)
   s_images = images;
   s_image_count = count;
   s_active = nullptr;
+  s_active_aux = nullptr;
   s_active_mask = 0;
   s_active_mask_valid = true;
   aot_active_image = {0, 0, nullptr};
+  aot_active_image_aux = {0, 0, nullptr};
   if (count == 0)
   {
     aot_images_generation = &s_idle_generation;
@@ -202,7 +216,9 @@ void Shutdown()
   s_images = nullptr;
   s_image_count = 0;
   s_active = nullptr;
+  s_active_aux = nullptr;
   aot_active_image = {0, 0, nullptr};
+  aot_active_image_aux = {0, 0, nullptr};
   aot_images_generation = &s_idle_generation;
   aot_images_seen = s_idle_generation;
 }
@@ -230,6 +246,9 @@ extern "C" AOTBlockFunc aot_images_lookup(uint32_t pc)
   const u32 idx = (pc - aot_active_image.base) >> 2;
   if (idx < aot_active_image.size)
     return aot_active_image.table[idx];
+  const u32 aux_idx = (pc - aot_active_image_aux.base) >> 2;
+  if (aux_idx < aot_active_image_aux.size)
+    return aot_active_image_aux.table[aux_idx];
   return nullptr;
 }
 
@@ -239,6 +258,8 @@ extern "C" uint32_t aot_images_block_size(uint32_t pc)
   if (*aot_images_generation != aot_images_seen)
     aot_images_rescan();
   const AotImageDesc* image = s_active;
+  if (image && (pc - image->base) >> 2 >= image->size)
+    image = s_active_aux;
   if (!image)
     return 0;
   // Overrides first: the active variant's boundary can differ from the base.
