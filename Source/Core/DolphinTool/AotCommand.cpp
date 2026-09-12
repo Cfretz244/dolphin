@@ -132,6 +132,13 @@ int AotCommand(const std::vector<std::string>& args)
       .action("store")
       .help("Symbol prefix (default: game ID from disc)");
   parser.add_option("-v", "--verbose").action("store_true").help("Print detailed progress");
+  parser.add_option("--guarded-images")
+      .action("store_true")
+      .help("For --dol-images CFGs: emit the experimental content-guarded library instead of "
+            "the trusted multi-image one");
+  parser.add_option("--images")
+      .action("store")
+      .help("For --dol-images CFGs: comma-separated base image ids to emit (default: all)");
 
   const optparse::Values options = parser.parse_args(args);
 
@@ -208,8 +215,30 @@ int AotCommand(const std::vector<std::string>& args)
   }
 
   if (IsDolImageCFG(cfg_path))
-    return TranslateDolImages(*volume, cfg_path, output_dir, prefix, dol_sha256_hex) ?
+  {
+    if (options.is_set("guarded_images"))
+      return TranslateDolImages(*volume, cfg_path, output_dir, prefix, dol_sha256_hex) ?
+                 EXIT_SUCCESS : EXIT_FAILURE;
+    std::set<size_t> selected;
+    if (options.is_set("images"))
+    {
+      const std::string list = options["images"];
+      size_t pos = 0;
+      while (pos < list.size())
+      {
+        const size_t comma = list.find(',', pos);
+        const std::string item = list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        if (!item.empty())
+          selected.insert(static_cast<size_t>(std::strtoul(item.c_str(), nullptr, 10)));
+        if (comma == std::string::npos)
+          break;
+        pos = comma + 1;
+      }
+    }
+    return TranslateTrustedImages(*volume, cfg_path, output_dir, prefix, dol_sha256_hex,
+                                  selected) ?
                EXIT_SUCCESS : EXIT_FAILURE;
+  }
 
   // 2. Read CFG database
   std::vector<CFGBlockInfo> cfg_blocks;

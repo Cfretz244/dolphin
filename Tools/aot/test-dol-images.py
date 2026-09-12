@@ -59,7 +59,7 @@ def main():
         out = root / 'generated'
         out.mkdir()
         (out / 'translate.log').touch()  # stack.sh creates this before invoking translate
-        run(tool, 'translate', '--iso', str(disc), '--cfg', str(cfg), '--output', str(out))
+        run(tool, 'translate', '--guarded-images', '--iso', str(disc), '--cfg', str(cfg), '--output', str(out))
         harness = out / 'test.c'
         harness.write_text(r'''
 #include <assert.h>
@@ -141,7 +141,7 @@ int main(void) {
         # The alternate image must be pinned even when boot DOL is unchanged.
         iso[0x3103] = 3
         disc.write_bytes(iso)
-        text = run(tool, 'translate', '--iso', str(disc), '--cfg', str(cfg), '--output', str(root/'bad'), ok=False)
+        text = run(tool, 'translate', '--guarded-images', '--iso', str(disc), '--cfg', str(cfg), '--output', str(root/'bad'), ok=False)
         assert 'identity mismatch' in text
         print('PASS: alternate DOL attribution, native selection, stale direct entry, unknown/partial code, reload, and image pinning')
 

@@ -13,6 +13,7 @@
 // registration entry points) — the same header the generated code compiles
 // against.
 #include "Core/PowerPC/AOT/aot_runtime.h"
+#include "Core/PowerPC/AOT/aot_images.h"
 
 using AOTDispatchFunc = void (*)(AOTState*);
 using AOTLookupFunc = AOTBlockFunc (*)(uint32_t);
@@ -36,6 +37,9 @@ struct AotGameEntry
   std::string dol_sha256;
   // Dynamic boundaries for content-guarded fixed-address image variants.
   uint32_t (*image_block_size)(uint32_t) = nullptr;
+  // Trusted multi-image descriptors (aot_images.h); empty for other libraries.
+  const AotImageDesc* images = nullptr;
+  uint32_t image_count = 0;
 };
 
 // Multi-game registry, populated before main() by each linked AOT library's
@@ -52,6 +56,8 @@ public:
   void RegisterBlockSizes(const std::string& game_id, const AotBlockSize* blocks, uint32_t count,
                           const AotModuleBlockSize* module_blocks, uint32_t module_count);
   void RegisterImageBlockSizes(const std::string& game_id, uint32_t (*lookup)(uint32_t));
+  void RegisterImages(const std::string& game_id, const AotImageDesc* images, uint32_t count,
+                      uint32_t images_version);
   void RegisterImageHash(const std::string& game_id, const char* dol_sha256_hex);
   std::optional<AotGameEntry> Find(const std::string& game_id) const;
   std::vector<std::string> GetRegisteredGameIDs() const;

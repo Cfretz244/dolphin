@@ -71,8 +71,10 @@ public:
   // If from_trace is true, the block was observed during trace collection (hot).
   // A larger guard_instructions permits fallthrough fusion only after the caller
   // proves a single cache line containing no cache/mapping mutators or calls.
+  // own_symbol, when non-empty, names the emitted function instead of the
+  // prefix-derived block symbol (image variants of a block at the same pc).
   std::string TranslateBlock(u32 block_addr, u32 num_instructions, bool from_trace = true,
-                             u32 guard_instructions = 0);
+                             u32 guard_instructions = 0, const std::string& own_symbol = "");
 
   // Chain inlining (DOL mode only): a block in inline_targets has exactly one
   // non-dynamic CFG in-edge — the fallthrough from its predecessor — so the
@@ -89,6 +91,12 @@ public:
   // Alternate fixed-address images: every entry is checked, including direct
   // tail calls. Bounded resident-line chains may share their entry guard.
   void SetGuardedImages() { m_guarded_images = true; }
+
+  // Trusted multi-image mode: blocks whose native function is swapped at
+  // runtime (PrimeHack patch variants) are never direct-tail-called or
+  // chain-inlined; every edge into them probes the dispatch table so the
+  // override written by the image tracker is honored.
+  void SetVolatileTargets(std::unordered_set<u32> targets) { m_volatile_targets = std::move(targets); }
 
   // Get the set of unhandled opcodes encountered during translation.
   const std::map<std::string, u32>& GetUnhandledOpcodes() const { return m_unhandled_opcodes; }
@@ -235,6 +243,7 @@ private:
   // Chain inlining state (see SetInlineHints)
   std::unordered_map<u32, u32> m_block_sizes;
   std::unordered_set<u32> m_inline_targets;
+  std::unordered_set<u32> m_volatile_targets;
   int m_inline_depth = 0;   // nested EmitBlockBody calls in the current function
   u32 m_inline_insts = 0;   // total instructions emitted into the current function
 

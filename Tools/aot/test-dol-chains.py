@@ -44,7 +44,7 @@ def main():
         with sqlite3.connect(cfg) as db:
             assert db.execute('select pc,count from dol_image_blocks where image_id=0 order by pc').fetchall() == [
                 (0x80004000, 2), (0x80004008, 2), (0x80004010, 2)]
-        log = run(tool, 'translate', '--iso', str(disc), '--cfg', str(cfg), '--output', str(out))
+        log = run(tool, 'translate', '--guarded-images', '--iso', str(disc), '--cfg', str(cfg), '--output', str(out))
         assert 'chains at 2 native entries' in log, log
         generated = ''.join(p.read_text() for p in out.glob('*blocks*.c'))
         assert 'aot_match_chain(0x80004000u' in generated
@@ -109,7 +109,7 @@ int main(void) {
             image.write_bytes(modified)
             db, output = root / (name + '.db'), root / name
             run(tool, 'cfg', '--iso', str(image), '--trace', str(capture), '--dol-images', '--output', str(db))
-            run(tool, 'translate', '--iso', str(image), '--cfg', str(db), '--output', str(output))
+            run(tool, 'translate', '--guarded-images', '--iso', str(image), '--cfg', str(db), '--output', str(output))
             text = ''.join(p.read_text() for p in output.glob('*blocks*.c'))
             assert 'aot_match_chain(0x80004000u' not in text, name
         # Identical safe code at the end of a line cannot share the next line.
@@ -124,7 +124,7 @@ int main(void) {
         (root/'shifted.dpht').write_bytes(shifted_trace)
         run(tool, 'cfg', '--iso', str(root/'shifted.iso'), '--trace', str(root/'shifted.dpht'),
             '--dol-images', '--output', str(root/'shifted.db'))
-        run(tool, 'translate', '--iso', str(root/'shifted.iso'), '--cfg', str(root/'shifted.db'),
+        run(tool, 'translate', '--guarded-images', '--iso', str(root/'shifted.iso'), '--cfg', str(root/'shifted.db'),
             '--output', str(root/'shifted'))
         text = ''.join(p.read_text() for p in (root/'shifted').glob('*blocks*.c'))
         assert 'aot_match_chain(0x80004018u' not in text

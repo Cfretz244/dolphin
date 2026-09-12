@@ -73,7 +73,7 @@ def main():
             assert db.execute("select value from metadata where key='primehack_patch_set'").fetchone()[0] == 'mp1-r3me01-v1'
             assert db.execute('select count(*) from dol_image_blocks where image_id>0').fetchone()[0] > 0
         out = root / 'generated'
-        run(tool, 'translate', '--iso', str(disc), '--cfg', str(cfg), '--output', str(out))
+        run(tool, 'translate', '--guarded-images', '--iso', str(disc), '--cfg', str(cfg), '--output', str(out))
         harness = out / 'test.c'
         harness.write_text(r'''
 #include <assert.h>
@@ -135,7 +135,7 @@ int main(int argc,char** argv) {
         # Both disc identity and the exact patch recipe must survive validation.
         with sqlite3.connect(cfg) as db:
             db.execute("update dol_images set sha256='bad' where id=1")
-        assert 'identity mismatch' in run(tool, 'translate', '--iso', str(disc), '--cfg', str(cfg),
+        assert 'identity mismatch' in run(tool, 'translate', '--guarded-images', '--iso', str(disc), '--cfg', str(cfg),
                                          '--output', str(root/'bad'), ok=False)
         iso[3] = ord('X')
         disc.write_bytes(iso)

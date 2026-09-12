@@ -53,6 +53,21 @@ add_custom_command(
 )
 target_sources(dolphin-tool PRIVATE "${AOT_RUNTIME_HEADER_GEN}")
 
+# Same treatment for the multi-image tracker ABI header (trusted DOL images).
+set(AOT_IMAGES_HEADER "${CMAKE_SOURCE_DIR}/Source/Core/Core/PowerPC/AOT/aot_images.h")
+set(AOT_IMAGES_HEADER_GEN "${CMAKE_CURRENT_BINARY_DIR}/AotImagesHeaderGen.cpp")
+add_custom_command(
+  OUTPUT "${AOT_IMAGES_HEADER_GEN}"
+  COMMAND ${CMAKE_COMMAND}
+          -DINPUT=${AOT_IMAGES_HEADER}
+          -DOUTPUT=${AOT_IMAGES_HEADER_GEN}
+          -DVARIABLE=s_aot_images_header
+          -P ${CMAKE_SOURCE_DIR}/CMake/StringifyHeader.cmake
+  DEPENDS "${AOT_IMAGES_HEADER}" "${CMAKE_SOURCE_DIR}/CMake/StringifyHeader.cmake"
+  COMMENT "Embedding aot_images.h into dolphin-tool"
+)
+target_sources(dolphin-tool PRIVATE "${AOT_IMAGES_HEADER_GEN}")
+
 if (WIN32)
   target_sources(dolphin-tool PRIVATE DolphinTool.exe.manifest DolphinTool.rc)
 

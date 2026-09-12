@@ -16,6 +16,7 @@
 #include <utility>
 #include <unordered_map>
 #include <unordered_set>
+#include <ranges>
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
@@ -24,6 +25,7 @@
 
 #include "Common/Swap.h"
 #include "Core/Boot/DolReader.h"
+#include "Core/PowerPC/AOT/aot_images.h"
 #include "Core/PowerPC/PPCTables.h"
 #include "Core/PrimeHack/Patches.h"
 #include "DiscIO/DiscExtractor.h"
@@ -34,6 +36,7 @@
 #include "DolphinTool/CfgCommand.h"
 
 extern const char s_aot_runtime_header[];
+extern const char s_aot_images_header[];
 
 namespace DolphinTool
 {
@@ -630,6 +633,554 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
     fmt::println(std::cerr,
                  "Translated {} content-guarded DOL blocks (experimental; measure guard cost)",
                  blocks.size());
+    return true;
+  }
+  catch (const std::exception& e)
+  {
+    fmt::println(std::cerr, "DOL images: {}", e.what());
+    return false;
+  }
+}
+
+// ============================================================================
+// Trusted multi-image mode
+// ============================================================================
+//
+// Same CFG database as the guarded mode above, opposite runtime contract: no
+// per-block instruction guards. Each selected base DOL becomes a normal
+// single-image translation (flat table, direct tail calls, chain inlining,
+// per-site indirect probes) under its own symbol prefix, and AotImageTracker
+// picks the active table after instruction-cache invalidation events by
+// comparing sparse discriminator words against RAM. PrimeHack patch variants
+// become a small override list the tracker writes into the base table; every
+// edge into an overridden pc probes the table instead of binding a symbol.
+namespace
+{
+struct TrustedBlock
+{
+  u32 pc, count;
+};
+
+// Static branch/call targets of a block set, decoded from block terminators.
+// Fallthrough successors are not branch-entered (they stay chain-inlinable),
+// matching the normal single-image pipeline's criterion.
+std::unordered_set<u32> BranchEnteredTargets(const PPCMemoryImage& memory,
+                                             const std::map<u32, u32>& blocks)
+{
+  std::unordered_set<u32> targets;
+  for (const auto& [pc, count] : blocks)
+  {
+    const u32 last = pc + (count - 1) * 4;
+    const auto word = memory.ReadInstruction(last);
+    if (!word)
+      continue;
+    const UGeckoInstruction inst(*word);
+    if (inst.OPCD == 18)
+    {
+      const u32 target = inst.AA ? static_cast<u32>(inst.LI << 2) :
+                                   last + static_cast<u32>(inst.LI << 2);
+      targets.insert(target);
+    }
+    else if (inst.OPCD == 16)
+    {
+      const u32 target = inst.AA ? static_cast<u32>(inst.BD << 2) :
+                                   last + static_cast<u32>(inst.BD << 2);
+      targets.insert(target);
+    }
+  }
+  return targets;
+}
+
+// Sparse words identifying `image` against RAM. Every other base image must
+// differ (or lack the address) at min_distinct of them, so a partially
+// matching sibling can never be selected.
+std::vector<AotImageWord> ChooseDiscriminators(const std::vector<Image>& images, size_t self,
+                                               const std::set<u32>& excluded_lines)
+{
+  const auto& image = images[self];
+  std::vector<AotImageWord> chosen;
+  std::set<u32> used;
+  auto add_stride = [&](u32 stride) {
+    for (int i = 0; i < image.dol->GetNumTextSections(); ++i)
+    {
+      const u32 start = image.dol->GetTextSectionAddress(i);
+      const u32 size = image.dol->GetTextSectionSize(i);
+      if (size < 4)
+        continue;
+      std::vector<u32> addrs;
+      for (u32 a = start; a < start + size; a += stride)
+        addrs.push_back(a);
+      addrs.push_back(start + size - 4);
+      for (u32 a : addrs)
+      {
+        if (excluded_lines.contains(a & ~31u) || used.contains(a))
+          continue;
+        const auto word = image.memory.ReadInstruction(a);
+        if (!word)
+          continue;
+        used.insert(a);
+        chosen.push_back({a, *word});
+      }
+    }
+  };
+  auto distinct_from = [&](size_t other) {
+    u32 n = 0;
+    for (const auto& w : chosen)
+      if (images[other].memory.ReadInstruction(w.addr) != w.word)
+        ++n;
+    return n;
+  };
+  constexpr u32 min_distinct = 8;
+  for (u32 stride : {0x4000u, 0x1000u, 0x400u, 0x100u, 0x20u, 0x4u})
+  {
+    add_stride(stride);
+    bool ok = true;
+    for (size_t o = 0; o < images.size() && ok; ++o)
+      if (o != self && !images[o].base_image && distinct_from(o) < min_distinct)
+        ok = false;
+    if (ok)
+      return chosen;
+  }
+  // Every text word is now a discriminator (tiny synthetic images); the only
+  // remaining failure is a sibling that is byte-identical, which AddImage
+  // already deduplicates by hash.
+  for (size_t o = 0; o < images.size(); ++o)
+    if (o != self && !images[o].base_image && distinct_from(o) == 0)
+      throw std::runtime_error("Cannot distinguish DOL image " + image.name + " from a sibling");
+  return chosen;
+}
+
+u32 ParseVariantMask(const std::string& name)
+{
+  const auto pos = name.rfind("#primehack-");
+  if (pos == std::string::npos)
+    throw std::runtime_error("Unrecognized image variant name: " + name);
+  return static_cast<u32>(std::stoul(name.substr(pos + 11), nullptr, 16));
+}
+}  // namespace
+
+bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg,
+                            const std::string& output, const std::string& prefix,
+                            const std::string& boot_hash, const std::set<size_t>& selected)
+{
+  try
+  {
+    if (prefix.empty() || std::isdigit(static_cast<unsigned char>(prefix[0])) ||
+        !std::all_of(prefix.begin(), prefix.end(),
+                     [](unsigned char c) { return std::isalnum(c) || c == '_'; }))
+      throw std::runtime_error("Invalid C symbol prefix");
+    auto images = Discover(volume);
+    auto db = Open(cfg, SQLITE_OPEN_READONLY);
+    bool primehack = false;
+    {
+      auto patch_set =
+          Prepare(db.get(), "SELECT value FROM metadata WHERE key='primehack_patch_set'");
+      if (sqlite3_step(patch_set.get()) == SQLITE_ROW)
+      {
+        if (Text(patch_set.get(), 0) != "mp1-r3me01-v1")
+          throw std::runtime_error("Unsupported PrimeHack patch set; regenerate CFG");
+        AddPrimeHackImages(volume, images);
+        primehack = true;
+      }
+    }
+    {
+      auto version =
+          Prepare(db.get(), "SELECT value FROM metadata WHERE key='dol_images_version'");
+      if (sqlite3_step(version.get()) != SQLITE_ROW || Text(version.get(), 0) != "1")
+        throw std::runtime_error("Unsupported DOL image CFG version");
+      auto identities = Prepare(db.get(), "SELECT id,name,sha256 FROM dol_images ORDER BY id");
+      size_t seen = 0;
+      while (sqlite3_step(identities.get()) == SQLITE_ROW)
+      {
+        if (seen >= images.size() ||
+            sqlite3_column_int64(identities.get(), 0) != static_cast<sqlite3_int64>(seen) ||
+            Text(identities.get(), 1) != images[seen].name ||
+            Text(identities.get(), 2) != images[seen].hash)
+          throw std::runtime_error("DOL image identity mismatch; regenerate CFG from this disc");
+        ++seen;
+      }
+      if (seen != images.size())
+        throw std::runtime_error("DOL image inventory mismatch");
+    }
+    std::vector<std::map<u32, u32>> rows(images.size());
+    {
+      auto query = Prepare(db.get(), "SELECT image_id,pc,count FROM dol_image_blocks");
+      while (sqlite3_step(query.get()) == SQLITE_ROW)
+      {
+        const auto id = sqlite3_column_int64(query.get(), 0);
+        const auto pc = sqlite3_column_int64(query.get(), 1);
+        const auto count = sqlite3_column_int64(query.get(), 2);
+        if (id < 0 || id >= static_cast<sqlite3_int64>(images.size()) || pc < 0 ||
+            pc > UINT32_MAX || (pc & 3) || count <= 0 || count > (UINT32_MAX - pc) / 4)
+          throw std::runtime_error("Invalid DOL block bounds");
+        for (u32 n = 0; n < count; ++n)
+          if (!images[id].memory.ReadInstruction(static_cast<u32>(pc) + n * 4))
+            throw std::runtime_error("DOL block outside text");
+        rows[id].emplace(static_cast<u32>(pc), static_cast<u32>(count));
+      }
+    }
+    for (size_t id : selected)
+      if (id >= images.size() || images[id].base_image)
+        throw std::runtime_error(fmt::format("--images: {} is not a base DOL image", id));
+    std::vector<size_t> bases;
+    for (size_t id = 0; id < images.size(); ++id)
+    {
+      if (images[id].base_image || (!selected.empty() && !selected.contains(id)))
+        continue;
+      if (rows[id].empty())
+        throw std::runtime_error("Selected image has no blocks: " + images[id].name);
+      bases.push_back(id);
+    }
+    if (bases.empty())
+      throw std::runtime_error("No base DOL images selected");
+    if (std::filesystem::exists(output))
+    {
+      for (const auto& entry : std::filesystem::directory_iterator(output))
+      {
+        if (entry.path().filename() != "translate.log")
+          throw std::runtime_error("Use an empty output directory to avoid stale generated code");
+      }
+    }
+    std::filesystem::create_directories(output);
+    Output(output + "/aot_runtime.h") << s_aot_runtime_header;
+    Output(output + "/aot_images.h") << s_aot_images_header;
+
+    // Every base image is loaded at its own text range at some point; the
+    // flat table spans [min block, max block] of the base plus variant pcs.
+    struct Variant
+    {
+      size_t image;
+      u32 mask;
+    };
+    struct OverrideOut
+    {
+      u32 pc = 0;
+      u32 base_size = 0;
+      bool has_base = false;
+      std::vector<std::pair<bool, u32>> by_mask;  // (has variant, size)
+    };
+    struct BaseOut
+    {
+      size_t image = 0;
+      std::string sym;  // prefix_d<i>
+      u32 table_base = 0, table_size = 0;
+      std::vector<Variant> variants;
+      std::vector<AotImageWord> words;
+      std::vector<OverrideOut> overrides;
+      std::map<std::string, u32> unhandled;
+      size_t translated = 0, variant_blocks = 0, inline_targets = 0;
+    };
+    std::vector<BaseOut> outs;
+    size_t total_table_entries = 0;
+
+    for (size_t b : bases)
+    {
+      BaseOut out;
+      out.image = b;
+      out.sym = fmt::format("{}_d{}", prefix, b);
+      const auto& blocks = rows[b];
+      for (size_t v = 0; v < images.size(); ++v)
+        if (images[v].base_image && *images[v].base_image == b)
+          out.variants.push_back({v, ParseVariantMask(images[v].name)});
+
+      std::set<u32> known(std::views::keys(blocks).begin(), std::views::keys(blocks).end());
+      std::unordered_set<u32> volatile_pcs;
+      std::set<u32> excluded_lines;
+      for (const auto& var : out.variants)
+      {
+        for (const auto& [pc, count] : rows[var.image])
+        {
+          volatile_pcs.insert(pc);
+          known.insert(pc);
+        }
+      }
+      if (!out.variants.empty())
+      {
+        for (const auto& patch : PrimeHack::MP1_PATCHES)
+          excluded_lines.insert(patch.address & ~31u);
+      }
+      u32 lo = UINT32_MAX, hi = 0;
+      for (u32 pc : known)
+      {
+        lo = std::min(lo, pc);
+        hi = std::max(hi, pc);
+      }
+      if (hi >= 0x82000000u)
+        throw std::runtime_error("Trusted image block outside MEM1");
+      out.table_base = lo & ~3u;
+      out.table_size = ((hi - out.table_base) >> 2) + 1;
+      total_table_entries += out.table_size;
+      out.words = ChooseDiscriminators(images, b, excluded_lines);
+
+      // Inline hints exactly as the single-image pipeline computes them, minus
+      // runtime-swapped pcs (never inlined: their body is chosen at runtime).
+      const auto branch_entered = BranchEnteredTargets(images[b].memory, blocks);
+      std::unordered_map<u32, u32> sizes(blocks.begin(), blocks.end());
+      std::unordered_set<u32> inline_targets;
+      for (const auto& [pc, count] : blocks)
+        if (!branch_entered.contains(pc) && !volatile_pcs.contains(pc))
+          inline_targets.insert(pc);
+      out.inline_targets = inline_targets.size();
+
+      // Per-image forward declarations (block TUs of this image include it).
+      {
+        auto fwd = Output(fmt::format("{}/{}_forward_decls.h", output, out.sym));
+        fwd << fmt::format("#ifndef {0}_FORWARD_DECLS_H\n#define {0}_FORWARD_DECLS_H\n", out.sym);
+        fwd << "#include \"aot_images.h\"\n\n";
+        fwd << fmt::format("#define {}_TABLE_BASE {:#010x}u\n", out.sym, out.table_base);
+        fwd << fmt::format("#define {}_TABLE_SIZE {}u\n", out.sym, out.table_size);
+        fwd << fmt::format("extern AOTBlockFunc {}_fast_table[];\n", out.sym);
+        fwd << fmt::format("__attribute__((noinline)) void {}_dispatch(AOTState* s);\n", prefix);
+        fwd << fmt::format("#define {}_dispatch {}_dispatch\n\n", out.sym, prefix);
+        for (const auto& [pc, count] : blocks)
+          fwd << fmt::format("__attribute__((noinline)) void {}_block_{:08x}(AOTState* s);\n",
+                             out.sym, pc);
+        for (const auto& var : out.variants)
+          for (const auto& [pc, count] : rows[var.image])
+            fwd << fmt::format(
+                "__attribute__((noinline)) void {}_block_{:08x}_v{:02x}(AOTState* s);\n",
+                out.sym, pc, var.mask);
+        fwd << "#endif\n";
+      }
+
+      // Base blocks, grouped by 64KB like the single-image pipeline.
+      {
+        AOTCEmitter emitter(images[b].memory, known, out.sym);
+        emitter.SetInlineHints(sizes, inline_targets);
+        emitter.SetVolatileTargets(volatile_pcs);
+        std::map<u32, std::vector<TrustedBlock>> groups;
+        for (const auto& [pc, count] : blocks)
+          groups[pc >> 16].push_back({pc, count});
+        for (const auto& [group, list] : groups)
+        {
+          auto file = Output(fmt::format("{}/{}_blocks_d{}_{:04x}.c", output, prefix, b, group));
+          file << fmt::format("#include \"{}_forward_decls.h\"\n\n", out.sym);
+          for (const auto& tb : list)
+          {
+            file << emitter.TranslateBlock(tb.pc, tb.count, true) << "\n";
+            ++out.translated;
+          }
+        }
+        out.unhandled = emitter.GetUnhandledOpcodes();
+      }
+
+      // Variant blocks: compiled from the patched image, no chain inlining,
+      // symbol suffixed by mask. Their edges to base blocks bind directly
+      // (identical code in both images); edges to other volatile pcs probe.
+      if (!out.variants.empty())
+      {
+        auto file = Output(fmt::format("{}/{}_blocks_d{}_variants.c", output, prefix, b));
+        file << fmt::format("#include \"{}_forward_decls.h\"\n\n", out.sym);
+        for (const auto& var : out.variants)
+        {
+          AOTCEmitter emitter(images[var.image].memory, known, out.sym);
+          emitter.SetInlineHints(sizes, {});
+          emitter.SetVolatileTargets(volatile_pcs);
+          for (const auto& [pc, count] : rows[var.image])
+          {
+            file << emitter.TranslateBlock(pc, count, true, 0,
+                                           fmt::format("{}_block_{:08x}_v{:02x}", out.sym, pc,
+                                                       var.mask))
+                 << "\n";
+            ++out.variant_blocks;
+          }
+          for (const auto& [name, n] : emitter.GetUnhandledOpcodes())
+            out.unhandled[name] += n;
+        }
+        for (u32 pc : std::set<u32>(volatile_pcs.begin(), volatile_pcs.end()))
+        {
+          OverrideOut ov;
+          ov.pc = pc;
+          if (auto it = blocks.find(pc); it != blocks.end())
+          {
+            ov.has_base = true;
+            ov.base_size = it->second;
+          }
+          for (const auto& var : out.variants)
+          {
+            auto it = rows[var.image].find(pc);
+            ov.by_mask.emplace_back(it != rows[var.image].end(),
+                                    it != rows[var.image].end() ? it->second : 0);
+          }
+          out.overrides.push_back(ov);
+        }
+      }
+      fmt::println(std::cerr,
+                   "DOL image {}: {} -- {} blocks, {} variant blocks ({} masks), table {:#010x} "
+                   "x {} entries ({:.1f} MB), {} discriminators, {} chain-inline targets",
+                   b, images[b].name, out.translated, out.variant_blocks, out.variants.size(),
+                   out.table_base, out.table_size,
+                   out.table_size * sizeof(void*) / (1024.0 * 1024.0), out.words.size(),
+                   out.inline_targets);
+      outs.push_back(std::move(out));
+    }
+
+    // Shared dispatch: tables, descriptors, tracker-driven dispatch, registration.
+    {
+      auto file = Output(fmt::format("{}/{}_dispatch.c", output, prefix));
+      file << "#include \"aot_images.h\"\n";
+      for (const auto& out : outs)
+        file << fmt::format("#include \"{}_forward_decls.h\"\n", out.sym);
+      file << "\n";
+      for (const auto& out : outs)
+      {
+        const auto& blocks = rows[out.image];
+        file << fmt::format("AOTBlockFunc {}_fast_table[{}] = {{\n", out.sym, out.table_size);
+        auto it = blocks.begin();
+        for (u32 e = 0; e < out.table_size; ++e)
+        {
+          const u32 addr = out.table_base + (e << 2);
+          while (it != blocks.end() && it->first < addr)
+            ++it;
+          if (it != blocks.end() && it->first == addr)
+            file << fmt::format("    {}_block_{:08x},\n", out.sym, addr);
+          else
+            file << "    0,\n";
+        }
+        file << "};\n";
+        file << fmt::format("static const AotImageWord {}_words[] = {{\n", out.sym);
+        for (const auto& w : out.words)
+          file << fmt::format("    {{{:#010x}u,{:#010x}u}},\n", w.addr, w.word);
+        file << "};\n";
+        if (!out.variants.empty())
+        {
+          file << fmt::format("static const AotImagePatchSite {}_patches[] = {{\n", out.sym);
+          for (const auto& patch : PrimeHack::MP1_PATCHES)
+            file << fmt::format("    {{{:#010x}u,{:#010x}u,{:#010x}u}},\n", patch.address,
+                                patch.original, patch.replacement);
+          file << "};\n";
+          file << fmt::format("static const uint32_t {}_masks[] = {{", out.sym);
+          for (const auto& var : out.variants)
+            file << fmt::format("{:#x}u,", var.mask);
+          file << "};\n";
+          for (const auto& ov : out.overrides)
+          {
+            file << fmt::format("static const AOTBlockFunc {}_ov_{:08x}_fns[] = {{", out.sym,
+                                ov.pc);
+            for (size_t k = 0; k < out.variants.size(); ++k)
+              file << (ov.by_mask[k].first ?
+                           fmt::format("{}_block_{:08x}_v{:02x},", out.sym, ov.pc,
+                                       out.variants[k].mask) :
+                           "0,");
+            file << "};\n";
+            file << fmt::format("static const uint32_t {}_ov_{:08x}_sizes[] = {{", out.sym,
+                                ov.pc);
+            for (size_t k = 0; k < out.variants.size(); ++k)
+              file << fmt::format("{}u,", ov.by_mask[k].second);
+            file << "};\n";
+          }
+          file << fmt::format("static const AotImageOverride {}_overrides[] = {{\n", out.sym);
+          for (const auto& ov : out.overrides)
+            file << fmt::format("    {{{:#010x}u,{}u,{},{}_ov_{:08x}_fns,{}_ov_{:08x}_sizes}},\n",
+                                ov.pc, ov.base_size,
+                                ov.has_base ? fmt::format("{}_block_{:08x}", out.sym, ov.pc) : "0",
+                                out.sym, ov.pc, out.sym, ov.pc);
+          file << "};\n";
+        }
+        file << "#if AOT_HARNESS\n";
+        file << fmt::format("static const AotImageBlockSize {}_block_sizes[] = {{\n", out.sym);
+        for (const auto& [pc, count] : blocks)
+          file << fmt::format("    {{{:#010x}u,{}u}},\n", pc, count);
+        file << "};\n#endif\n";
+      }
+      file << fmt::format("static const AotImageDesc {}_images[] = {{\n", prefix);
+      for (const auto& out : outs)
+      {
+        const bool pv = !out.variants.empty();
+        file << fmt::format(
+            "    {{\"{}\",{:#010x}u,{}u,{}_fast_table,{}_words,{}u,{},{}u,{},{}u,{},{}u,\n",
+            images[out.image].name, out.table_base, out.table_size, out.sym, out.sym,
+            out.words.size(), pv ? out.sym + "_patches" : "0",
+            pv ? PrimeHack::MP1_PATCHES.size() : 0, pv ? out.sym + "_masks" : "0",
+            pv ? out.variants.size() : 0, pv ? out.sym + "_overrides" : "0",
+            pv ? out.overrides.size() : 0);
+        file << "#if AOT_HARNESS\n";
+        file << fmt::format("     {}_block_sizes,{}u}},\n", out.sym, rows[out.image].size());
+        file << "#else\n     0,0u},\n#endif\n";
+      }
+      file << "};\n\n";
+      file << fmt::format("__attribute__((noinline)) void {}_dispatch(AOTState* s) {{\n", prefix);
+      file << "#if AOT_HARNESS\n    if (aot_single_block_mode) return;\n#endif\n";
+      file << "    if (s->downcount <= 0) return;\n";
+      file << "    if (__builtin_expect(*aot_images_generation != aot_images_seen, 0))\n"
+              "        aot_images_rescan();\n";
+      file << "    uint32_t idx = (s->pc - aot_active_image.base) >> 2;\n";
+      file << "    if (idx < aot_active_image.size) {\n";
+      file << "        AOTBlockFunc fn = aot_active_image.table[idx];\n";
+      file << "        if (fn) { [[clang::musttail]] return fn(s); }\n    }\n";
+      file << "    [[clang::musttail]] return aot_interpreter_single_step(s);\n}\n\n";
+      file << fmt::format("AOTBlockFunc {}_lookup_block(uint32_t pc) {{ return "
+                          "aot_images_lookup(pc); }}\n",
+                          prefix);
+      file << "#if AOT_HARNESS\n";
+      file << "void aot_register_image_block_sizes(const char*, uint32_t (*)(uint32_t));\n";
+      file << fmt::format("static uint32_t {}_image_block_size(uint32_t pc) {{ return "
+                          "aot_images_block_size(pc); }}\n",
+                          prefix);
+      file << "#endif\n\n";
+      file << "__attribute__((constructor))\n";
+      file << fmt::format("static void aot_register_{}(void) {{\n", prefix);
+      file << fmt::format(
+          "    aot_register_game(\"{}\", {}_dispatch, {}_lookup_block, AOT_ABI_VERSION);\n",
+          prefix, prefix, prefix);
+      file << fmt::format("    aot_register_game_image(\"{}\", \"{}\");\n", prefix, boot_hash);
+      file << fmt::format(
+          "    aot_register_game_images(\"{}\", {}_images, {}u, AOT_IMAGES_VERSION);\n", prefix,
+          prefix, outs.size());
+      file << "#if AOT_HARNESS\n";
+      file << fmt::format("    aot_register_image_block_sizes(\"{}\", {}_image_block_size);\n",
+                          prefix, prefix);
+      file << "#endif\n}\n";
+    }
+
+    // Build script: identical flags to the single-image pipeline (and to
+    // build-aot-ios.sh, which globs the same <prefix>_blocks_*.c names).
+    {
+      const std::string path = output + "/build.sh";
+      auto script = Output(path);
+      script << "#!/bin/bash\nset -e\ncd \"$(dirname \"$0\")\"\n";
+      script << fmt::format("PREFIX=\"{}\"\n", prefix);
+      script << "BLOCK_CFLAGS=\"-Os -flto=thin -arch arm64 -mcpu=apple-a14 -moutline"
+                " -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1\"\n";
+      script << "DISPATCH_CFLAGS=\"-O2 -flto=thin -arch arm64 -mcpu=apple-a14"
+                " -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1\"\n";
+      script << "JOBS=\"${AOT_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}\"\n\n";
+      script << "echo \"Compiling AOT blocks with LTO (${JOBS} jobs)...\"\n";
+      script << "export BLOCK_CFLAGS\n";
+      script << "printf '%s\\0' ${PREFIX}_blocks_*.c | \\\n";
+      script << "    xargs -0 -n1 -P \"$JOBS\" sh -c"
+                " 'exec clang -c $BLOCK_CFLAGS -I. \"$1\" -o \"${1%.c}.o\"' sh\n";
+      script << "clang -c $DISPATCH_CFLAGS -I. \"${PREFIX}_dispatch.c\""
+                " -o \"${PREFIX}_dispatch.o\"\n";
+      script << "echo \"Creating static library...\"\n";
+      script << "ar rcs lib${PREFIX}_aot.a ${PREFIX}_*.o\n";
+      script << "echo \"Done: lib${PREFIX}_aot.a\"\n";
+      script.close();
+      std::filesystem::permissions(path, std::filesystem::perms::owner_exec |
+                                             std::filesystem::perms::group_exec |
+                                             std::filesystem::perms::others_exec,
+                                   std::filesystem::perm_options::add);
+    }
+    size_t translated = 0;
+    std::map<std::string, u32> unhandled;
+    for (const auto& out : outs)
+    {
+      translated += out.translated + out.variant_blocks;
+      for (const auto& [name, n] : out.unhandled)
+        unhandled[name] += n;
+    }
+    fmt::println(std::cerr, "Results:");
+    fmt::println(std::cerr, "  Translated: {} blocks ({} images, {:.1f} MB of tables)",
+                 translated, outs.size(), total_table_entries * sizeof(void*) / (1024.0 * 1024.0));
+    fmt::println(std::cerr, "  Skipped (SMC): 0 blocks");
+    if (!unhandled.empty())
+    {
+      fmt::println(std::cerr, "  Unhandled opcodes ({} types, falling back to interpreter):",
+                   unhandled.size());
+      for (const auto& [name, n] : unhandled)
+        fmt::println(std::cerr, "    {}: {} occurrences", name, n);
+    }
+    fmt::println(std::cerr, "Trusted multi-image library generated in {}/", output);
     return true;
   }
   catch (const std::exception& e)

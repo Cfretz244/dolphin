@@ -17,6 +17,7 @@
 #include "Core/CoreTiming.h"
 #include "Core/HW/CPU.h"
 #include "Core/HW/DVD/DVDThread.h"
+#include "Core/PowerPC/AOT/AotImageTracker.h"
 #include "Core/PowerPC/AOT/AotModuleTracker.h"
 #include "Core/PowerPC/AOT/AotRegistry.h"
 #include "Core/PowerPC/AOT/AotState.h"
@@ -68,6 +69,7 @@ void AOTCore::Init()
     m_image_checked = false;
     m_image_blocked = false;
     AotModuleTracker::Init(entry->modules, entry->module_count);
+    AotImageTracker::Init(entry->images, entry->image_count);
     INFO_LOG_FMT(AOT, "AOTCore: Found AOT library for game {} ({} REL modules{})", game_id,
                  entry->module_count,
                  m_expected_dol_sha256.empty() ? ", NO image hash -- pre-v24 library" : "");
@@ -100,6 +102,7 @@ void AOTCore::Shutdown()
 #ifdef DOLPHIN_AOT_HARNESS
   m_harness.reset();
 #endif
+  AotImageTracker::Shutdown();
   AotModuleTracker::Shutdown();
   m_dispatch = nullptr;
   aot_shutdown();
@@ -108,6 +111,7 @@ void AOTCore::Shutdown()
 void AOTCore::ClearCache()
 {
   AotModuleTracker::MarkDirty();
+  AotImageTracker::MarkDirty();
 }
 
 bool AOTCore::VerifyImageIdentity()

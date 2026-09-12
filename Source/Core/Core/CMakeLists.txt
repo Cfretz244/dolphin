@@ -879,12 +879,15 @@ if(ALL_AOT_LIBS)
     PowerPC/AOT/AOTCore.cpp
     PowerPC/AOT/AOTCore.h
     PowerPC/AOT/AotEmbedding.h
+    PowerPC/AOT/AotImageTracker.cpp
+    PowerPC/AOT/AotImageTracker.h
     PowerPC/AOT/AotModuleTracker.cpp
     PowerPC/AOT/AotModuleTracker.h
     PowerPC/AOT/AotRegistry.cpp
     PowerPC/AOT/AotRegistry.h
     PowerPC/AOT/AotRuntime.cpp
     PowerPC/AOT/AotState.h
+    PowerPC/AOT/aot_images.h
     PowerPC/AOT/aot_runtime.h
   )
 

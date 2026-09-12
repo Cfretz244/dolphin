@@ -132,3 +132,31 @@ extern "C" void aot_register_image_block_sizes(const char* game_id, uint32_t (*l
 {
   AotRegistry::Instance().RegisterImageBlockSizes(game_id, lookup);
 }
+
+void AotRegistry::RegisterImages(const std::string& game_id, const AotImageDesc* images,
+                                 uint32_t count, uint32_t images_version)
+{
+  if (IsRejected(game_id))
+    return;
+  if (images_version != AOT_IMAGES_VERSION)
+  {
+    ERROR_LOG_FMT(AOT,
+                  "AotRegistry: {} multi-image library was built against images ABI v{}, runtime "
+                  "is v{} -- rejecting library. Re-run `stack.sh translate {}` and rebuild.",
+                  game_id, images_version, AOT_IMAGES_VERSION, game_id);
+    m_rejected.push_back(game_id);
+    m_games.erase(game_id);
+    return;
+  }
+  auto& entry = m_games[game_id];
+  if (entry.game_id.empty())
+    entry.game_id = game_id;
+  entry.images = images;
+  entry.image_count = count;
+}
+
+extern "C" void aot_register_game_images(const char* game_id, const AotImageDesc* images,
+                                         uint32_t count, uint32_t images_version)
+{
+  AotRegistry::Instance().RegisterImages(game_id, images, count, images_version);
+}

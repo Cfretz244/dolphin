@@ -109,7 +109,7 @@ void AOTCEmitter::SetInlineHints(std::unordered_map<u32, u32> block_sizes,
 }
 
 std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bool from_trace,
-                                        u32 guard_instructions)
+                                        u32 guard_instructions, const std::string& own_symbol)
 {
   std::string out;
   // regular,pure_instructions marks these as code sections — without it the
@@ -120,7 +120,7 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
                                    : "__TEXT,__aot_cold,regular,pure_instructions";
   out += fmt::format("__attribute__((noinline, section(\"{}\")))"
                      " void {}(AOTState* s) {{\n",
-                     section, BlockFn(block_addr, false));
+                     section, own_symbol.empty() ? BlockFn(block_addr, false) : own_symbol);
 
   m_guarded_inline_end = 0;
   if (m_guarded_images)
@@ -269,7 +269,13 @@ void AOTCEmitter::EmitBlockBody(std::string& out, u32 block_addr, u32 num_instru
       }
     }
 
-    if (m_known_blocks.contains(next_pc))
+    if (m_known_blocks.contains(next_pc) && m_volatile_targets.contains(next_pc))
+    {
+      // Runtime-swapped target: probe the table so the active variant wins.
+      out += fmt::format("    s->pc={};\n", PcStr(next_pc));
+      EmitIndirectDispatch(out);
+    }
+    else if (m_known_blocks.contains(next_pc))
     {
       // Chain the fall-through edge like a taken static edge (same guard shape
       // as EmitBranchTo). Un-chained fall-throughs were the dominant source of
@@ -1102,7 +1108,14 @@ void AOTCEmitter::EmitBranchTo(std::string& out, u32 target, u32 current_pc,
   const bool known = dol_target ? m_module->dol_blocks->contains(target) :
                                   m_known_blocks.contains(target);
   const std::string pc_expr = dol_target ? fmt::format("{:#010x}u", target) : PcStr(target);
-  if (known)
+  if (known && !m_module && m_volatile_targets.contains(target))
+  {
+    // Runtime-swapped target (image variant): never bind the symbol statically.
+    out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
+    out += fmt::format("    s->pc={};\n", pc_expr);
+    EmitIndirectDispatch(out);
+  }
+  else if (known)
   {
     // Check downcount on every static edge so the Run loop regains control for
     // timing/interrupt delivery (matches upstream JIT practice; forward-edge
