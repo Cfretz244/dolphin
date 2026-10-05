@@ -665,11 +665,12 @@ TEST(AotFpConvertTest, ConvertToSingleAndFTZ)
 // diff gates prove it in-game; this pins the byte order, W=1 handling and the
 // ps1 = 1.0 rule against FastDequantize/FastQuantize's float case: big-endian
 // u32s through ConvertToDouble / ConvertToSingleFTZ). Only the inline path is
-// exercised: every case satisfies LSQE, float type and a RAM address.
+// exercised: every case satisfies LSQE, float type and a RAM (or locked L1) address.
 TEST(AotFpPsqTest, FloatPathMatchesConvert)
 {
   alignas(8) static u8 ram[0x1000];
-  const AotFastMem fm{ram, sizeof(ram), nullptr, 0};
+  alignas(8) static u8 l1[0x4000];  // locked L1 cache (0xE0000000), as Memory::GetL1Cache
+  AotFastMem fm{ram, sizeof(ram), nullptr, 0, nullptr, l1, sizeof(l1)};
 
   AOTState s{};
   s.spr[920] = 0x8000'0000u;  // HID2.LSQE
@@ -681,41 +682,77 @@ TEST(AotFpPsqTest, FloatPathMatchesConvert)
   for (int i = 0; i < 20000; ++i)
     doubles.push_back(rng());
   int bad = 0;
-  for (size_t k = 0; k + 1 < doubles.size(); ++k)
+  for (const int in_l1 : {0, 1})  // MEM1 at 0x80000100, then locked L1 at 0xE0000100
   {
-    const u32 ea = 0x8000'0100u + 8u * static_cast<u32>(k % 64);
-    const u32 off = ea - 0x8000'0000u;
-    const int gqr = static_cast<int>(k % 8);
-    for (const int w : {0, 1})
+    u8* const mem = in_l1 ? l1 : ram;
+    std::memset(ram, 0x5A, sizeof(ram));
+    for (size_t k = 0; k + 1 < doubles.size(); ++k)
     {
-      // store
-      std::memset(ram + off, 0xA5, 8);
-      s.ps[5].ps0 = doubles[k];
-      s.ps[5].ps1 = doubles[k + 1];
-      aot_psq_st_fast(&s, &fm, 5, 1, ea, gqr, w, 0);
-      const u32 w0 = Common::swap32(ConvertToSingleFTZ(doubles[k]));
-      const u32 w1 = w ? 0xA5A5'A5A5u : Common::swap32(ConvertToSingleFTZ(doubles[k + 1]));
-      u32 got0, got1;
-      std::memcpy(&got0, ram + off, 4);
-      std::memcpy(&got1, ram + off + 4, 4);
-      if ((got0 != w0 || got1 != w1) && bad++ < 5)
-        ADD_FAILURE() << fmt::format("psq_st w={} {:016x}/{:016x}: got {:08x} {:08x} want {:08x} {:08x}",
-                                     w, doubles[k], doubles[k + 1], got0, got1, w0, w1);
-      // load back the raw words
-      const u32 r0 = static_cast<u32>(doubles[k] >> 32), r1 = static_cast<u32>(doubles[k + 1]);
-      const u32 be0 = Common::swap32(r0), be1 = Common::swap32(r1);
-      std::memcpy(ram + off, &be0, 4);
-      std::memcpy(ram + off + 4, &be1, 4);
-      s.ps[6].ps0 = s.ps[6].ps1 = 0;
-      aot_psq_l_fast(&s, &fm, 6, 1, ea, gqr, w, 0);
-      const u64 want0 = ConvertToDouble(r0);
-      const u64 want1 = w ? 0x3FF0'0000'0000'0000ULL : ConvertToDouble(r1);
-      if ((s.ps[6].ps0 != want0 || s.ps[6].ps1 != want1) && bad++ < 5)
-        ADD_FAILURE() << fmt::format("psq_l w={} {:08x}/{:08x}: got {:016x}/{:016x} want {:016x}/{:016x}",
-                                     w, r0, r1, s.ps[6].ps0, s.ps[6].ps1, want0, want1);
+      const u32 ea = (in_l1 ? 0xE000'0100u : 0x8000'0100u) + 8u * static_cast<u32>(k % 64);
+      const u32 off = in_l1 ? (ea & 0x0FFF'FFFFu) : ea - 0x8000'0000u;
+      const int gqr = static_cast<int>(k % 8);
+      for (const int w : {0, 1})
+      for (const int upd : {0, 1})  // psq_l/st, then the update forms psq_lu/stu (ra=1)
+      {
+        constexpr u32 sentinel = 0xDEAD'BEEFu;
+        // store
+        std::memset(mem + off, 0xA5, 8);
+        s.ps[5].ps0 = doubles[k];
+        s.ps[5].ps1 = doubles[k + 1];
+        s.gpr[1] = sentinel;
+        if (upd)
+          aot_psq_stu_fast(&s, &fm, 5, 1, ea, gqr, w, 0);
+        else
+          aot_psq_st_fast(&s, &fm, 5, 1, ea, gqr, w, 0);
+        if (s.gpr[1] != (upd ? ea : sentinel) && bad++ < 5)
+          ADD_FAILURE() << fmt::format("psq_st{} w={}: gpr[1]={:08x}", upd ? "u" : "", w, s.gpr[1]);
+        const u32 w0 = Common::swap32(ConvertToSingleFTZ(doubles[k]));
+        const u32 w1 = w ? 0xA5A5'A5A5u : Common::swap32(ConvertToSingleFTZ(doubles[k + 1]));
+        u32 got0, got1;
+        std::memcpy(&got0, mem + off, 4);
+        std::memcpy(&got1, mem + off + 4, 4);
+        if ((got0 != w0 || got1 != w1) && bad++ < 5)
+          ADD_FAILURE() << fmt::format("psq_st{} w={} {:016x}/{:016x}: got {:08x} {:08x} want {:08x} {:08x}",
+                                       upd ? "u" : "", w, doubles[k], doubles[k + 1], got0, got1, w0, w1);
+        // load back the raw words
+        const u32 r0 = static_cast<u32>(doubles[k] >> 32), r1 = static_cast<u32>(doubles[k + 1]);
+        const u32 be0 = Common::swap32(r0), be1 = Common::swap32(r1);
+        std::memcpy(mem + off, &be0, 4);
+        std::memcpy(mem + off + 4, &be1, 4);
+        s.ps[6].ps0 = s.ps[6].ps1 = 0;
+        s.gpr[1] = sentinel;
+        if (upd)
+          aot_psq_lu_fast(&s, &fm, 6, 1, ea, gqr, w, 0);
+        else
+          aot_psq_l_fast(&s, &fm, 6, 1, ea, gqr, w, 0);
+        if (s.gpr[1] != (upd ? ea : sentinel) && bad++ < 5)
+          ADD_FAILURE() << fmt::format("psq_l{} w={}: gpr[1]={:08x}", upd ? "u" : "", w, s.gpr[1]);
+        const u64 want0 = ConvertToDouble(r0);
+        const u64 want1 = w ? 0x3FF0'0000'0000'0000ULL : ConvertToDouble(r1);
+        if ((s.ps[6].ps0 != want0 || s.ps[6].ps1 != want1) && bad++ < 5)
+          ADD_FAILURE() << fmt::format("psq_l{} w={} {:08x}/{:08x}: got {:016x}/{:016x} want {:016x}/{:016x}",
+                                       upd ? "u" : "", w, r0, r1, s.ps[6].ps0, s.ps[6].ps1, want0, want1);
+      }
     }
+    if (in_l1)
+      for (const u8 b : ram)
+        if (b != 0x5A)
+        {
+          ADD_FAILURE() << "L1 psq accesses touched RAM";
+          break;
+        }
   }
   EXPECT_EQ(bad, 0);
+
+  // aot_psq_host_ptr_fm: the L1 arm mirrors FastMemHostPtr's +8 guard.
+  EXPECT_EQ(aot_psq_host_ptr_fm(&fm, 0xE000'0000u), l1);
+  EXPECT_EQ(aot_psq_host_ptr_fm(&fm, 0xE000'3FF8u), l1 + 0x3FF8);  // +8 fits exactly
+  EXPECT_EQ(aot_psq_host_ptr_fm(&fm, 0xE000'3FFCu), nullptr);
+  EXPECT_EQ(aot_psq_host_ptr_fm(&fm, 0xE000'4000u), nullptr);
+  EXPECT_EQ(aot_psq_host_ptr_fm(&fm, 0x8000'0100u), ram + 0x100);
+  fm.l1 = nullptr;
+  for (const u32 a : {0xE000'0000u, 0xE000'0100u, 0xE000'3FF8u})
+    EXPECT_EQ(aot_psq_host_ptr_fm(&fm, a), nullptr);
 }
 
 // psq_st inline write-gather pipe path (float GQR): a store to the SDK's
@@ -791,6 +828,26 @@ TEST(AotFpPsqTest, GatherPipeFloatPath)
     }
   EXPECT_GT(stores, 0);
   EXPECT_EQ(bad, 0);
+
+  // psq_stu (update form) pair store into the pipe: same bytes, same advance,
+  // and gpr[ra] = ea.
+  {
+    std::memset(pipe, 0xA5, sizeof(pipe));
+    s.gather_pipe_ptr = pipe;
+    s.ps[5].ps0 = doubles[0];
+    s.ps[5].ps1 = doubles[1];
+    s.gpr[1] = 0xDEAD'BEEFu;
+    aot_psq_stu_fast(&s, &fm, 5, 1, 0xCC00'8000u, 0, 0, 0);
+    EXPECT_EQ(static_cast<u8*>(s.gather_pipe_ptr) - pipe, 8);
+    u32 got0, got1, tail;
+    std::memcpy(&got0, pipe, 4);
+    std::memcpy(&got1, pipe + 4, 4);
+    std::memcpy(&tail, pipe + 8, 4);
+    EXPECT_EQ(got0, Common::swap32(ConvertToSingleFTZ(doubles[0])));
+    EXPECT_EQ(got1, Common::swap32(ConvertToSingleFTZ(doubles[1])));
+    EXPECT_EQ(tail, 0xA5A5'A5A5u);
+    EXPECT_EQ(s.gpr[1], 0xCC00'8000u);
+  }
 
   // aot_gp_physical acceptance / rejection.
   EXPECT_EQ(aot_gp_physical(&s, &fm, 0xCC00'8000u, 8), 0x0C00'8000u);

@@ -98,6 +98,11 @@ typedef struct {
        (aot_gp_physical). APPEND-ONLY struct: the Jul-18 GALE01 iOS lib reads
        the first four fields by offset. */
     const uint32_t* dbat;
+    /* Locked L1 data cache (0xE0000000) host buffer and size, as in the
+       runtime's FastMemHostPtr. Used only by the psq fast paths
+       (aot_psq_host_ptr_fm). */
+    uint8_t* l1;
+    uint32_t l1_size;
 } AotFastMem;
 extern AotFastMem aot_fast_mem;  // filled by aot_init_fast_mem() before any block runs
 
@@ -615,19 +620,19 @@ static inline void aot_fp_fill_single(AOTState* s, int fd, float r, uint32_t cle
     s->fpscr = (s->fpscr & ~(AOT_FPSCR_FPRF_MASK | clear)) | (aot_classify_float(r) << 12);
 }
 
-static inline void aot_faddsx_fast(AOTState* s, int fd, int fa, int fb) {
+static inline __attribute__((always_inline)) void aot_faddsx_fast(AOTState* s, int fd, int fa, int fb) {
     double sum = aot_bits_to_double(s->ps[fa].ps0) + aot_bits_to_double(s->ps[fb].ps0);
     if (__builtin_expect(!__builtin_isfinite(sum), 0)) { aot_faddsx(s, fd, fa, fb); return; }
     aot_fp_fill_single(s, fd, aot_force_single(s->fpscr, sum), 0);
 }
 
-static inline void aot_fsubsx_fast(AOTState* s, int fd, int fa, int fb) {
+static inline __attribute__((always_inline)) void aot_fsubsx_fast(AOTState* s, int fd, int fa, int fb) {
     double diff = aot_bits_to_double(s->ps[fa].ps0) - aot_bits_to_double(s->ps[fb].ps0);
     if (__builtin_expect(!__builtin_isfinite(diff), 0)) { aot_fsubsx(s, fd, fa, fb); return; }
     aot_fp_fill_single(s, fd, aot_force_single(s->fpscr, diff), 0);
 }
 
-static inline void aot_fmulsx_fast(AOTState* s, int fd, int fa, int fc) {
+static inline __attribute__((always_inline)) void aot_fmulsx_fast(AOTState* s, int fd, int fa, int fc) {
     double product = aot_bits_to_double(s->ps[fa].ps0) * aot_force_25bit(aot_bits_to_double(s->ps[fc].ps0));
     if (__builtin_expect(__builtin_isnan(product), 0)) { aot_fmulsx(s, fd, fa, fc); return; }
     aot_fp_fill_single(s, fd, aot_force_single(s->fpscr, product), AOT_FPSCR_FI | AOT_FPSCR_FR);
@@ -641,28 +646,28 @@ static inline void aot_ps_set_both(AOTState* s, int fd, float r0, float r1) {
     s->fpscr = (s->fpscr & ~AOT_FPSCR_FPRF_MASK) | (aot_classify_float(r0) << 12);
 }
 
-static inline void aot_ps_add_fast(AOTState* s, int fd, int fa, int fb) {
+static inline __attribute__((always_inline)) void aot_ps_add_fast(AOTState* s, int fd, int fa, int fb) {
     double r0 = aot_bits_to_double(s->ps[fa].ps0) + aot_bits_to_double(s->ps[fb].ps0);
     double r1 = aot_bits_to_double(s->ps[fa].ps1) + aot_bits_to_double(s->ps[fb].ps1);
     if (__builtin_expect(!(__builtin_isfinite(r0) && __builtin_isfinite(r1)), 0)) { aot_ps_add(s, fd, fa, fb); return; }
     aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
 }
 
-static inline void aot_ps_sub_fast(AOTState* s, int fd, int fa, int fb) {
+static inline __attribute__((always_inline)) void aot_ps_sub_fast(AOTState* s, int fd, int fa, int fb) {
     double r0 = aot_bits_to_double(s->ps[fa].ps0) - aot_bits_to_double(s->ps[fb].ps0);
     double r1 = aot_bits_to_double(s->ps[fa].ps1) - aot_bits_to_double(s->ps[fb].ps1);
     if (__builtin_expect(!(__builtin_isfinite(r0) && __builtin_isfinite(r1)), 0)) { aot_ps_sub(s, fd, fa, fb); return; }
     aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
 }
 
-static inline void aot_ps_mul_fast(AOTState* s, int fd, int fa, int fc) {
+static inline __attribute__((always_inline)) void aot_ps_mul_fast(AOTState* s, int fd, int fa, int fc) {
     double r0 = aot_bits_to_double(s->ps[fa].ps0) * aot_force_25bit(aot_bits_to_double(s->ps[fc].ps0));
     double r1 = aot_bits_to_double(s->ps[fa].ps1) * aot_force_25bit(aot_bits_to_double(s->ps[fc].ps1));
     if (__builtin_expect(__builtin_isnan(r0) || __builtin_isnan(r1), 0)) { aot_ps_mul(s, fd, fa, fc); return; }
     aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
 }
 
-static inline void aot_ps_muls0_fast(AOTState* s, int fd, int fa, int fc) {
+static inline __attribute__((always_inline)) void aot_ps_muls0_fast(AOTState* s, int fd, int fa, int fc) {
     double c0 = aot_force_25bit(aot_bits_to_double(s->ps[fc].ps0));
     double r0 = aot_bits_to_double(s->ps[fa].ps0) * c0;
     double r1 = aot_bits_to_double(s->ps[fa].ps1) * c0;
@@ -670,7 +675,7 @@ static inline void aot_ps_muls0_fast(AOTState* s, int fd, int fa, int fc) {
     aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
 }
 
-static inline void aot_ps_muls1_fast(AOTState* s, int fd, int fa, int fc) {
+static inline __attribute__((always_inline)) void aot_ps_muls1_fast(AOTState* s, int fd, int fa, int fc) {
     double c1 = aot_force_25bit(aot_bits_to_double(s->ps[fc].ps1));
     double r0 = aot_bits_to_double(s->ps[fa].ps0) * c1;
     double r1 = aot_bits_to_double(s->ps[fa].ps1) * c1;
@@ -950,11 +955,26 @@ static inline __attribute__((always_inline)) void aot_gp_store_pair_u32(AOTState
     if (__builtin_expect((uintptr_t)(gp + 8) - (uintptr_t)s->gather_pipe_base_ptr >= AOT_GP_SIZE, 0)) aot_gp_flush(s);
 }
 
-static inline __attribute__((always_inline)) void aot_psq_l_fast(AOTState* s, const AotFastMem* fm, int fd, int ra, uint32_t ea, int i, int w, uint32_t inst) {
+/* Fast-path cores for psq_l/psq_st (and their update forms): return 1 when the
+   access was fully handled inline, 0 when the caller must fall back to the
+   helper (which recomputes EA, and for the update forms also writes gpr[ra]). */
+/* Host pointer for the psq fast paths: MEM1/MEM2 as aot_host_ptr_fm, then the
+   locked L1 cache. Exact mirror of AotRuntime.cpp FastMemHostPtr, including its
+   +8 guard: the +8 keeps a paired u32 inside the L1 buffer, so W=1 also uses +8
+   (same as the runtime); the last few L1 bytes go to the helper. */
+static inline __attribute__((always_inline)) uint8_t* aot_psq_host_ptr_fm(const AotFastMem* fm, uint32_t ea) {
+    uint8_t* p = aot_host_ptr_fm(fm, ea);
+    if (__builtin_expect(p != 0, 1)) return p;
+    if (fm->l1 != 0 && (ea >> 28) == 0xEu && ea + 8u <= 0xE0000000u + fm->l1_size)
+        return fm->l1 + (ea & 0x0FFFFFFFu);
+    return 0;
+}
+
+static inline __attribute__((always_inline)) int aot_psq_l_try(AOTState* s, const AotFastMem* fm, int fd, uint32_t ea, int i, int w) {
     uint8_t* p;
     if (__builtin_expect((s->spr[AOT_SPR_HID2] & AOT_HID2_LSQE) != 0 &&
                          (s->spr[AOT_SPR_GQR0 + i] & 0x70000u) == 0 &&
-                         (p = aot_host_ptr_fm(fm, ea)) != 0, 1)) {
+                         (p = aot_psq_host_ptr_fm(fm, ea)) != 0, 1)) {
         AOT_ASSUME_SEPARATE(p, s);
         if (w) {
             uint32_t v; __builtin_memcpy(&v, p, 4);
@@ -966,17 +986,17 @@ static inline __attribute__((always_inline)) void aot_psq_l_fast(AOTState* s, co
             s->ps[fd].ps0 = aot_convert_to_double_fast((uint32_t)(v >> 32));
             s->ps[fd].ps1 = aot_convert_to_double_fast((uint32_t)v);
         }
-        return;
+        return 1;
     }
-    aot_psq_l(s, fd, ra, inst);
+    return 0;
 }
 
-static inline __attribute__((always_inline)) void aot_psq_st_fast(AOTState* s, const AotFastMem* fm, int fs, int ra, uint32_t ea, int i, int w, uint32_t inst) {
+static inline __attribute__((always_inline)) int aot_psq_st_try(AOTState* s, const AotFastMem* fm, int fs, uint32_t ea, int i, int w) {
     if (__builtin_expect((s->spr[AOT_SPR_HID2] & AOT_HID2_LSQE) != 0 &&
                          (s->spr[AOT_SPR_GQR0 + i] & 0x7u) == 0, 1)) {
         uint8_t* p;
         uint32_t c0 = aot_convert_to_single_ftz_fast(s->ps[fs].ps0);
-        if (__builtin_expect(aot_fm_resolve(fm, ea, &p), 1)) {
+        if (__builtin_expect((p = aot_psq_host_ptr_fm(fm, ea)) != 0, 1)) {
             AOT_ASSUME_SEPARATE(p, s);
             if (w) {
                 uint32_t v = __builtin_bswap32(c0);
@@ -985,18 +1005,39 @@ static inline __attribute__((always_inline)) void aot_psq_st_fast(AOTState* s, c
                 uint64_t v = __builtin_bswap64(((uint64_t)c0 << 32) | aot_convert_to_single_ftz_fast(s->ps[fs].ps1));
                 __builtin_memcpy(p, &v, 8);
             }
-            return;
+            return 1;
         }
-        /* RAM miss: the write-gather pipe (GX vertex submission) inline; every
-           other target (L1, MMIO, DR off, remapped BATs) goes to the helper. */
+        /* RAM/L1 miss: the write-gather pipe (GX vertex submission) inline, as
+           FastQuantize then GatherPipeQuantize; every other target (MMIO, DR
+           off, remapped BATs) goes to the helper. */
         uint32_t phys = aot_gp_physical(s, fm, ea, w ? 4u : 8u);
         if (phys) {
             if (w) aot_gp_store_u32(s, phys, c0);
             else   aot_gp_store_pair_u32(s, phys, c0, aot_convert_to_single_ftz_fast(s->ps[fs].ps1));
-            return;
+            return 1;
         }
     }
-    aot_psq_st(s, fs, ra, inst);
+    return 0;
+}
+
+static inline __attribute__((always_inline)) void aot_psq_l_fast(AOTState* s, const AotFastMem* fm, int fd, int ra, uint32_t ea, int i, int w, uint32_t inst) {
+    if (!aot_psq_l_try(s, fm, fd, ea, i, w)) aot_psq_l(s, fd, ra, inst);
+}
+
+static inline __attribute__((always_inline)) void aot_psq_st_fast(AOTState* s, const AotFastMem* fm, int fs, int ra, uint32_t ea, int i, int w, uint32_t inst) {
+    if (!aot_psq_st_try(s, fm, fs, ea, i, w)) aot_psq_st(s, fs, ra, inst);
+}
+
+/* Update forms: ea = gpr[ra] + offset (ra != 0). The fallback helpers recompute
+   EA and write gpr[ra] themselves, matching the interpreter. */
+static inline __attribute__((always_inline)) void aot_psq_lu_fast(AOTState* s, const AotFastMem* fm, int fd, int ra, uint32_t ea, int i, int w, uint32_t inst) {
+    if (!aot_psq_l_try(s, fm, fd, ea, i, w)) aot_psq_lu(s, fd, ra, inst);
+    else s->gpr[ra] = ea;
+}
+
+static inline __attribute__((always_inline)) void aot_psq_stu_fast(AOTState* s, const AotFastMem* fm, int fs, int ra, uint32_t ea, int i, int w, uint32_t inst) {
+    if (!aot_psq_st_try(s, fm, fs, ea, i, w)) aot_psq_stu(s, fs, ra, inst);
+    else s->gpr[ra] = ea;
 }
 
 // CR helpers (inline for performance)

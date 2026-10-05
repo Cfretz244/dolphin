@@ -257,7 +257,7 @@ extern "C"
 // RAM fast-path descriptor exported to generated code: aot_runtime.h inlines
 // the RAM fast path into every block and calls the aot_*_slow functions below
 // for everything else. AotFastMem itself is defined in aot_runtime.h.
-AotFastMem aot_fast_mem = {nullptr, 0, nullptr, 0, nullptr};
+AotFastMem aot_fast_mem = {nullptr, 0, nullptr, 0, nullptr, nullptr, 0};
 
 void aot_init_fast_mem()
 {
@@ -285,6 +285,8 @@ void aot_init_fast_mem()
   aot_fast_mem.exram = s_exram_ptr;
   aot_fast_mem.exram_size = s_exram_size;
   aot_fast_mem.dbat = s_mmu->GetDBATTable().data();
+  aot_fast_mem.l1 = s_l1_ptr;
+  aot_fast_mem.l1_size = s_l1_size;
 }
 
 // Counterpart to aot_init_fast_mem, called from AOTCore::Shutdown. The RAM/L1
@@ -310,6 +312,8 @@ void aot_shutdown()
   aot_fast_mem.exram = nullptr;
   aot_fast_mem.exram_size = 0;
   aot_fast_mem.dbat = nullptr;
+  aot_fast_mem.l1 = nullptr;
+  aot_fast_mem.l1_size = 0;
   s_track_fallbacks = false;
   aot_stats_enabled = s_track_fallbacks ? 1 : 0;
   s_fallback_counts.clear();

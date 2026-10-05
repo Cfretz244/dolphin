@@ -437,9 +437,9 @@ bool AOTCEmitter::EmitInstruction(std::string& out, UGeckoInstruction inst, u32 
     case 54: EmitStfd(out, inst, false, false); return true;
     case 55: EmitStfd(out, inst, true, false); return true;
     case 56: EmitPsqFast(out, inst, false); return true;
-    case 57: out += fmt::format("    aot_psq_lu(s,{},{},{});\n", I(inst.RD), I(inst.RA), inst.hex); return true;
+    case 57: EmitPsqFast(out, inst, false, /*update=*/true); return true;
     case 60: EmitPsqFast(out, inst, true); return true;
-    case 61: out += fmt::format("    aot_psq_stu(s,{},{},{});\n", I(inst.RS), I(inst.RA), inst.hex); return true;
+    case 61: EmitPsqFast(out, inst, true, /*update=*/true); return true;
     case 59: return EmitTable59(out, inst, pc);
     case 63: return EmitTable63(out, inst, pc);
     case 4:  return EmitTable4(out, inst, pc);
@@ -1400,17 +1400,26 @@ void AOTCEmitter::EmitLfs(std::string& out, UGeckoInstruction inst, bool update,
   out += "    }\n";
 }
 
-// psq_l / psq_st (non-update, non-indexed): static inline fast path in
-// aot_runtime.h for the HID2.LSQE + GQR float type + RAM case, falling back to
-// aot_psq_l/aot_psq_st (which decode the instruction themselves) otherwise.
+// psq_l / psq_st / psq_lu / psq_stu (non-indexed): static inline fast path in
+// aot_runtime.h for the HID2.LSQE + GQR float type + RAM (or, for stores, the
+// write-gather pipe) case, falling back to aot_psq_{l,lu,st,stu} (which decode
+// the instruction themselves) otherwise. The update forms' fast path writes
+// gpr[ra]=ea itself; their helpers do the update on the fallback path. An update
+// form with RA==0 (invalid encoding) keeps the plain helper call.
 // The fast path bypasses the helpers' AOT_HARNESS stats counters.
-void AOTCEmitter::EmitPsqFast(std::string& out, UGeckoInstruction inst, bool store)
+void AOTCEmitter::EmitPsqFast(std::string& out, UGeckoInstruction inst, bool store, bool update)
 {
   const u32 rd = I(inst.RD), ra = I(inst.RA);
   const s32 offset = s32(inst.SIMM_12);
+  if (update && ra == 0)
+  {
+    out += fmt::format("    aot_psq_{}(s,{},{},{});\n", store ? "stu" : "lu", rd, ra, inst.hex);
+    return;
+  }
   const std::string ea = ra ? fmt::format("s->gpr[{}]+(uint32_t)({})", ra, offset) :
                               fmt::format("(uint32_t)({})", offset);
-  out += fmt::format("    aot_psq_{}_fast(s,&aot_fm,{},{},{},{},{},{}u);\n", store ? "st" : "l", rd, ra, ea,
+  out += fmt::format("    aot_psq_{}_fast(s,&aot_fm,{},{},{},{},{},{}u);\n",
+                     store ? (update ? "stu" : "st") : (update ? "lu" : "l"), rd, ra, ea,
                      I(inst.I), I(inst.W), inst.hex);
 }
 
