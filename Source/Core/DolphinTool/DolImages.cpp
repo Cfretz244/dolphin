@@ -1291,7 +1291,7 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
       auto script = Output(path);
       script << "#!/bin/bash\nset -e\ncd \"$(dirname \"$0\")\"\n";
       script << fmt::format("PREFIX=\"{}\"\n", prefix);
-      script << "BLOCK_CFLAGS=\"-Os -flto=thin -arch arm64 -mcpu=apple-a14 -moutline"
+      script << "BLOCK_CFLAGS=\"-Os -flto=thin -arch arm64 -mcpu=apple-a14"
                 " -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1\"\n";
       script << "DISPATCH_CFLAGS=\"-O2 -flto=thin -arch arm64 -mcpu=apple-a14"
                 " -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1\"\n";

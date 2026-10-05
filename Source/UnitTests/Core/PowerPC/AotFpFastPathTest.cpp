@@ -669,9 +669,7 @@ TEST(AotFpConvertTest, ConvertToSingleAndFTZ)
 TEST(AotFpPsqTest, FloatPathMatchesConvert)
 {
   alignas(8) static u8 ram[0x1000];
-  const AotFastMem saved_mem = aot_fast_mem;
-  aot_fast_mem = {ram, sizeof(ram), nullptr, 0};
-  Common::ScopeGuard restore{[&] { aot_fast_mem = saved_mem; }};
+  const AotFastMem fm{ram, sizeof(ram), nullptr, 0};
 
   AOTState s{};
   s.spr[920] = 0x8000'0000u;  // HID2.LSQE
@@ -694,7 +692,7 @@ TEST(AotFpPsqTest, FloatPathMatchesConvert)
       std::memset(ram + off, 0xA5, 8);
       s.ps[5].ps0 = doubles[k];
       s.ps[5].ps1 = doubles[k + 1];
-      aot_psq_st_fast(&s, 5, 1, ea, gqr, w, 0);
+      aot_psq_st_fast(&s, &fm, 5, 1, ea, gqr, w, 0);
       const u32 w0 = Common::swap32(ConvertToSingleFTZ(doubles[k]));
       const u32 w1 = w ? 0xA5A5'A5A5u : Common::swap32(ConvertToSingleFTZ(doubles[k + 1]));
       u32 got0, got1;
@@ -709,7 +707,7 @@ TEST(AotFpPsqTest, FloatPathMatchesConvert)
       std::memcpy(ram + off, &be0, 4);
       std::memcpy(ram + off + 4, &be1, 4);
       s.ps[6].ps0 = s.ps[6].ps1 = 0;
-      aot_psq_l_fast(&s, 6, 1, ea, gqr, w, 0);
+      aot_psq_l_fast(&s, &fm, 6, 1, ea, gqr, w, 0);
       const u64 want0 = ConvertToDouble(r0);
       const u64 want1 = w ? 0x3FF0'0000'0000'0000ULL : ConvertToDouble(r1);
       if ((s.ps[6].ps0 != want0 || s.ps[6].ps1 != want1) && bad++ < 5)
@@ -717,6 +715,82 @@ TEST(AotFpPsqTest, FloatPathMatchesConvert)
                                      w, r0, r1, s.ps[6].ps0, s.ps[6].ps1, want0, want1);
     }
   }
+  EXPECT_EQ(bad, 0);
+}
+
+// The `_fm` memory helpers (descriptor passed by pointer, what generated
+// blocks call) must resolve every address exactly like the global-descriptor
+// helpers, and their fast paths must move the same bytes. Slow paths need a
+// booted system, so loads/stores are only issued at addresses that resolve.
+TEST(AotFpFastMemTest, FmHelpersMatchGlobalHelpers)
+{
+  alignas(8) static u8 mem1[0x2000];
+  alignas(8) static u8 mem2[0x1000];
+  const AotFastMem fm{mem1, sizeof(mem1), mem2, sizeof(mem2)};
+  const AotFastMem saved_mem = aot_fast_mem;
+  aot_fast_mem = fm;
+  Common::ScopeGuard restore{[&] { aot_fast_mem = saved_mem; }};
+
+  std::mt19937_64 rng(0x5EED'AD07'F00D'0005ULL);
+  // Edges of both windows (cached/uncached), plus random addresses.
+  std::vector<u32> addrs;
+  for (const u32 base : {0x8000'0000u, 0xC000'0000u, 0x9000'0000u, 0xD000'0000u})
+    for (const u32 d : {0u, 1u, 7u, 0xFF8u, 0xFFFu, 0x1000u, 0x1FF8u, 0x1FFFu, 0x2000u,
+                        0xFFFF'FFFFu, 0xFFFF'FFF8u})
+      addrs.push_back(base + d);
+  for (const u32 a : {0u, 0x0000'1000u, 0x4000'0000u, 0x7FFF'FFFFu, 0xFFFF'FFFFu})
+    addrs.push_back(a);
+  for (int i = 0; i < 200000; ++i)
+  {
+    const u64 r = rng();
+    // Half anywhere, half biased into the two windows.
+    const u32 a = static_cast<u32>(r);
+    addrs.push_back((r >> 63) ? a : ((a & 0xD000'3FFFu) | 0x8000'0000u));
+  }
+
+  AOTState s{};
+  int bad = 0;
+  for (const u32 a : addrs)
+  {
+    u8* const p = aot_host_ptr_fm(&fm, a);
+    if ((p != aot_host_ptr(a) || aot_is_ram_fm(&fm, a) != aot_is_ram(a)) && bad++ < 5)
+      ADD_FAILURE() << fmt::format("host_ptr {:08x}: fm {} global {}", a, fmt::ptr(p),
+                                   fmt::ptr(aot_host_ptr(a)));
+    if (!p || aot_host_ptr_fm(&fm, a + 7) != p + 7)
+      continue;
+    const u64 v = rng();
+    // Stores: _fm variant and global variant must leave identical bytes.
+    u8 want[8], got[8];
+    const auto check = [&](const char* what, auto&& store_fm, auto&& store_global) {
+      std::memset(p, 0x5A, 8);
+      store_global();
+      std::memcpy(want, p, 8);
+      std::memset(p, 0x5A, 8);
+      store_fm();
+      std::memcpy(got, p, 8);
+      if (std::memcmp(want, got, 8) != 0 && bad++ < 5)
+        ADD_FAILURE() << fmt::format("{} {:08x} {:016x}", what, a, v);
+    };
+    check("w8", [&] { aot_write_u8_fm(&s, &fm, static_cast<u32>(v), a); },
+          [&] { aot_write_u8(&s, static_cast<u32>(v), a); });
+    check("w16", [&] { aot_write_u16_fm(&s, &fm, static_cast<u32>(v), a); },
+          [&] { aot_write_u16(&s, static_cast<u32>(v), a); });
+    check("w16br", [&] { aot_write_u16_br_fm(&s, &fm, static_cast<u32>(v), a); },
+          [&] { aot_write_u16_br(&s, static_cast<u32>(v), a); });
+    check("w32", [&] { aot_write_u32_fm(&s, &fm, static_cast<u32>(v), a); },
+          [&] { aot_write_u32(&s, static_cast<u32>(v), a); });
+    check("w64", [&] { aot_write_u64_fm(&s, &fm, v, a); }, [&] { aot_write_u64(&s, v, a); });
+    // Loads.
+    std::memcpy(p, &v, 8);
+    if ((aot_read_u8_fm(&s, &fm, a) != aot_read_u8(&s, a) ||
+         aot_read_u16_fm(&s, &fm, a) != aot_read_u16(&s, a) ||
+         aot_read_u16_se_fm(&s, &fm, a) != aot_read_u16_se(&s, a) ||
+         aot_read_u32_fm(&s, &fm, a) != aot_read_u32(&s, a) ||
+         aot_read_u64_fm(&s, &fm, a) != aot_read_u64(&s, a)) &&
+        bad++ < 5)
+      ADD_FAILURE() << fmt::format("read {:08x} {:016x}", a, v);
+  }
+  std::printf("AotFpFastMemTest: %zu addresses\n", addrs.size());
   EXPECT_EQ(bad, 0);
 }
 #endif  // DOLPHIN_HAS_AOT

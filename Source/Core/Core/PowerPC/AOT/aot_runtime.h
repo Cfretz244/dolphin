@@ -200,6 +200,143 @@ static inline void aot_write_u64(AOTState* s, uint64_t val, uint32_t addr) {
     aot_write_u64_slow(s, val, addr);
 }
 
+// ----------------------------------------------------------------------------
+// `_fm` memory helpers: what generated block code calls (emitter >= 2026-10-05).
+//
+// Same semantics as the helpers above, but the RAM descriptor comes from a
+// pointer the caller passes, not from the global. Each generated block
+// function that touches guest memory starts with
+//     const AotFastMem aot_fm=aot_fast_mem;
+// and passes &aot_fm. Copying the descriptor per block is sound: aot_fast_mem
+// is written only by aot_init_fast_mem() and aot_shutdown() (AotRuntime.cpp),
+// never while a block runs. Because the copy is a local whose address never
+// escapes (always_inline), a guest store through a uint8_t* cannot alias it,
+// so ram/size stay in registers across stores instead of being reloaded from
+// the global after every one (generated code is built -fno-strict-aliasing).
+//
+// AOT_ASSUME_SEPARATE(p, s) tells clang that the resolved MEM1/MEM2 host
+// pointer and the AOTState object do not overlap -- true by construction
+// (guest RAM is the emulator's RAM allocation; AOTState is PowerPCState). It
+// lets clang keep s->gpr[]/spr[] values in registers across a guest store.
+// It is a statement about two objects only and says nothing about calls.
+//
+// NEVER put `restrict` on an AOTState* (block signatures or helpers): many
+// extern runtime helpers ignore their `s` argument and reach the PPC state
+// through the global system singleton (interpreter fallbacks, slow paths), so
+// a restrict-qualified `s` lets clang -- especially under LTO -- keep stale
+// register copies of state across such calls. Tried 2026-10-05: block
+// 80303ec8 hung the game. See research/codegen-fm-ship-brief.md in
+// aot-dolphin-helper.
+// ----------------------------------------------------------------------------
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_assume_separate_storage)
+#define AOT_ASSUME_SEPARATE(p, s) __builtin_assume_separate_storage((p), (s))
+#endif
+#endif
+#ifndef AOT_ASSUME_SEPARATE
+#define AOT_ASSUME_SEPARATE(p, s) ((void)0)
+#endif
+
+static inline __attribute__((always_inline)) uint8_t* aot_host_ptr_fm(const AotFastMem* fm, uint32_t addr) {
+    uint32_t off1 = (addr & ~AOT_MEM_UNCACHED_BIT) - AOT_MEM_CACHED_BASE;
+    if (__builtin_expect(off1 < fm->size, 1))
+        return fm->ram + off1;
+    uint32_t off2 = off1 - AOT_MEM2_FOLDED_OFFSET;
+    if (off2 < fm->exram_size)
+        return fm->exram + off2;
+    return 0;
+}
+static inline __attribute__((always_inline)) int aot_is_ram_fm(const AotFastMem* fm, uint32_t addr) {
+    return aot_host_ptr_fm(fm, addr) != 0;
+}
+static inline __attribute__((always_inline)) uint32_t aot_read_u8_fm(AOTState* s, const AotFastMem* fm, uint32_t addr) {
+    uint8_t* p = aot_host_ptr_fm(fm, addr);
+    if (__builtin_expect(p != 0, 1)) {
+        AOT_ASSUME_SEPARATE(p, s);
+        return *p;
+    }
+    return aot_read_u8_slow(s, addr);
+}
+static inline __attribute__((always_inline)) uint32_t aot_read_u16_fm(AOTState* s, const AotFastMem* fm, uint32_t addr) {
+    uint8_t* p = aot_host_ptr_fm(fm, addr);
+    if (__builtin_expect(p != 0, 1)) {
+        AOT_ASSUME_SEPARATE(p, s);
+        uint16_t v; __builtin_memcpy(&v, p, 2);
+        return __builtin_bswap16(v);
+    }
+    return aot_read_u16_slow(s, addr);
+}
+static inline __attribute__((always_inline)) uint32_t aot_read_u16_se_fm(AOTState* s, const AotFastMem* fm, uint32_t addr) {
+    return (uint32_t)(int32_t)(int16_t)aot_read_u16_fm(s, fm, addr);
+}
+static inline __attribute__((always_inline)) uint32_t aot_read_u32_fm(AOTState* s, const AotFastMem* fm, uint32_t addr) {
+    uint8_t* p = aot_host_ptr_fm(fm, addr);
+    if (__builtin_expect(p != 0, 1)) {
+        AOT_ASSUME_SEPARATE(p, s);
+        uint32_t v; __builtin_memcpy(&v, p, 4);
+        return __builtin_bswap32(v);
+    }
+    return aot_read_u32_slow(s, addr);
+}
+static inline __attribute__((always_inline)) uint64_t aot_read_u64_fm(AOTState* s, const AotFastMem* fm, uint32_t addr) {
+    uint8_t* p = aot_host_ptr_fm(fm, addr);
+    if (__builtin_expect(p != 0, 1)) {
+        AOT_ASSUME_SEPARATE(p, s);
+        uint64_t v; __builtin_memcpy(&v, p, 8);
+        return __builtin_bswap64(v);
+    }
+    return aot_read_u64_slow(s, addr);
+}
+static inline __attribute__((always_inline)) void aot_write_u8_fm(AOTState* s, const AotFastMem* fm, uint32_t val, uint32_t addr) {
+    uint8_t* p = aot_host_ptr_fm(fm, addr);
+    if (__builtin_expect(p != 0, 1)) {
+        AOT_ASSUME_SEPARATE(p, s);
+        *p = (uint8_t)val;
+        return;
+    }
+    aot_write_u8_slow(s, val, addr);
+}
+static inline __attribute__((always_inline)) void aot_write_u16_fm(AOTState* s, const AotFastMem* fm, uint32_t val, uint32_t addr) {
+    uint8_t* p = aot_host_ptr_fm(fm, addr);
+    if (__builtin_expect(p != 0, 1)) {
+        AOT_ASSUME_SEPARATE(p, s);
+        uint16_t v = __builtin_bswap16((uint16_t)val);
+        __builtin_memcpy(p, &v, 2);
+        return;
+    }
+    aot_write_u16_slow(s, val, addr);
+}
+static inline __attribute__((always_inline)) void aot_write_u16_br_fm(AOTState* s, const AotFastMem* fm, uint32_t val, uint32_t addr) {
+    uint8_t* p = aot_host_ptr_fm(fm, addr);
+    if (__builtin_expect(p != 0, 1)) {
+        AOT_ASSUME_SEPARATE(p, s);
+        uint16_t v = (uint16_t)val;  // no swap — byte-reversed store
+        __builtin_memcpy(p, &v, 2);
+        return;
+    }
+    aot_write_u16_br_slow(s, val, addr);
+}
+static inline __attribute__((always_inline)) void aot_write_u32_fm(AOTState* s, const AotFastMem* fm, uint32_t val, uint32_t addr) {
+    uint8_t* p = aot_host_ptr_fm(fm, addr);
+    if (__builtin_expect(p != 0, 1)) {
+        AOT_ASSUME_SEPARATE(p, s);
+        uint32_t v = __builtin_bswap32(val);
+        __builtin_memcpy(p, &v, 4);
+        return;
+    }
+    aot_write_u32_slow(s, val, addr);
+}
+static inline __attribute__((always_inline)) void aot_write_u64_fm(AOTState* s, const AotFastMem* fm, uint64_t val, uint32_t addr) {
+    uint8_t* p = aot_host_ptr_fm(fm, addr);
+    if (__builtin_expect(p != 0, 1)) {
+        AOT_ASSUME_SEPARATE(p, s);
+        uint64_t v = __builtin_bswap64(val);
+        __builtin_memcpy(p, &v, 8);
+        return;
+    }
+    aot_write_u64_slow(s, val, addr);
+}
+
 // ============================================================================
 // Registration — each game's dispatch.c registers itself from an
 // __attribute__((constructor)) before main(). The abi_version argument is
@@ -714,7 +851,7 @@ static inline uint32_t aot_convert_to_single_ftz_fast(uint64_t x) {
 // psq_l / psq_st (non-update, non-indexed) GQR float case, inlined. Mirrors
 // AotRuntime.cpp aot_psq_l/aot_psq_st -> FastDequantize/FastQuantize exactly:
 // only when HID2.LSQE is set, the GQR ld/st type is QUANTIZE_FLOAT (0; scale
-// unused) and EA is plain MEM1/MEM2 (aot_host_ptr; the runtime's FastMemHostPtr
+// unused) and EA is plain MEM1/MEM2 (aot_host_ptr_fm; the runtime's FastMemHostPtr
 // additionally accepts the locked L1 cache, and a NULL pointer on psq_st is
 // the gather pipe -- both are left to the helper). The pair is read/written as
 // one big-endian u64 at EA, like FastReadPair/FastWritePair. Everything else
@@ -725,11 +862,12 @@ static inline uint32_t aot_convert_to_single_ftz_fast(uint64_t x) {
 #define AOT_SPR_HID2  920
 #define AOT_HID2_LSQE (1u << 31)
 
-static inline void aot_psq_l_fast(AOTState* s, int fd, int ra, uint32_t ea, int i, int w, uint32_t inst) {
+static inline __attribute__((always_inline)) void aot_psq_l_fast(AOTState* s, const AotFastMem* fm, int fd, int ra, uint32_t ea, int i, int w, uint32_t inst) {
     uint8_t* p;
     if (__builtin_expect((s->spr[AOT_SPR_HID2] & AOT_HID2_LSQE) != 0 &&
                          (s->spr[AOT_SPR_GQR0 + i] & 0x70000u) == 0 &&
-                         (p = aot_host_ptr(ea)) != 0, 1)) {
+                         (p = aot_host_ptr_fm(fm, ea)) != 0, 1)) {
+        AOT_ASSUME_SEPARATE(p, s);
         if (w) {
             uint32_t v; __builtin_memcpy(&v, p, 4);
             s->ps[fd].ps0 = aot_convert_to_double_fast(__builtin_bswap32(v));
@@ -745,11 +883,12 @@ static inline void aot_psq_l_fast(AOTState* s, int fd, int ra, uint32_t ea, int 
     aot_psq_l(s, fd, ra, inst);
 }
 
-static inline void aot_psq_st_fast(AOTState* s, int fs, int ra, uint32_t ea, int i, int w, uint32_t inst) {
+static inline __attribute__((always_inline)) void aot_psq_st_fast(AOTState* s, const AotFastMem* fm, int fs, int ra, uint32_t ea, int i, int w, uint32_t inst) {
     uint8_t* p;
     if (__builtin_expect((s->spr[AOT_SPR_HID2] & AOT_HID2_LSQE) != 0 &&
                          (s->spr[AOT_SPR_GQR0 + i] & 0x7u) == 0 &&
-                         (p = aot_host_ptr(ea)) != 0, 1)) {
+                         (p = aot_host_ptr_fm(fm, ea)) != 0, 1)) {
+        AOT_ASSUME_SEPARATE(p, s);
         uint32_t c0 = aot_convert_to_single_ftz_fast(s->ps[fs].ps0);
         if (w) {
             uint32_t v = __builtin_bswap32(c0);

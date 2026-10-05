@@ -144,6 +144,13 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
           block_addr : 0;
   EmitBlockBody(out, block_addr, num_instructions);
 
+  // Memory ops go through the `_fm` helpers, which read the RAM descriptor
+  // from a per-function local copy (see aot_runtime.h): clang then keeps
+  // ram/size in registers across guest stores instead of reloading the
+  // global after each one. aot_fast_mem never changes while a block runs.
+  if (out.find("&aot_fm") != std::string::npos)
+    out.insert(out.find('\n') + 1, "    const AotFastMem aot_fm=aot_fast_mem;\n");
+
   out += "}\n";
   return out;
 }
@@ -785,10 +792,10 @@ bool AOTCEmitter::EmitTable31(std::string& out, UGeckoInstruction inst, u32 pc)
   case 983:
     EmitFpuCheck(out, pc);
     if (I(inst.RA))
-      out += fmt::format("    aot_write_u32(s,(uint32_t)s->ps[{}].ps0,s->gpr[{}]+s->gpr[{}]);\n",
+      out += fmt::format("    aot_write_u32_fm(s,&aot_fm,(uint32_t)s->ps[{}].ps0,s->gpr[{}]+s->gpr[{}]);\n",
                          I(inst.RS), I(inst.RA), I(inst.RB));
     else
-      out += fmt::format("    aot_write_u32(s,(uint32_t)s->ps[{}].ps0,s->gpr[{}]);\n",
+      out += fmt::format("    aot_write_u32_fm(s,&aot_fm,(uint32_t)s->ps[{}].ps0,s->gpr[{}]);\n",
                          I(inst.RS), I(inst.RB));
     return true;
   default:  return false;
@@ -1282,7 +1289,7 @@ void AOTCEmitter::EmitLoadInt(std::string& out, UGeckoInstruction inst, const ch
     else
       out += fmt::format("        uint32_t ea=(uint32_t){};\n", DispExpr(offset));
   }
-  out += fmt::format("        uint32_t val={}(s,ea);\n", helper);
+  out += fmt::format("        uint32_t val={}_fm(s,&aot_fm,ea);\n", helper);
   out += fmt::format("        s->gpr[{}]=val;\n", rd);
   if (update && ra)
     out += fmt::format("        s->gpr[{}]=ea;\n", ra);
@@ -1310,7 +1317,7 @@ void AOTCEmitter::EmitStoreInt(std::string& out, UGeckoInstruction inst, const c
     else
       out += fmt::format("        uint32_t ea=(uint32_t){};\n", DispExpr(offset));
   }
-  out += fmt::format("        {}(s,s->gpr[{}],ea);\n", helper, rs);
+  out += fmt::format("        {}_fm(s,&aot_fm,s->gpr[{}],ea);\n", helper, rs);
   if (update && ra)
     out += fmt::format("        s->gpr[{}]=ea;\n", ra);
   out += "    }\n";
@@ -1328,14 +1335,17 @@ void AOTCEmitter::EmitLmw(std::string& out, UGeckoInstruction inst)
   // Bulk fast path: one host-pointer check for the whole contiguous span
   // (both ends must resolve into the same RAM region), then plain byte-swapped
   // loads. Falls back to the per-word helper for anything else.
+  // AOT_ASSUME_SEPARATE: the span is guest RAM, never the AOTState (see the
+  // `_fm` helpers in aot_runtime.h), so clang may keep state in registers.
   const u32 count = 32 - rd;
-  out += fmt::format("        uint8_t* p=aot_host_ptr(ea); uint8_t* q=aot_host_ptr(ea+{}u);\n",
+  out += fmt::format("        uint8_t* p=aot_host_ptr_fm(&aot_fm,ea); uint8_t* q=aot_host_ptr_fm(&aot_fm,ea+{}u);\n",
                      (count - 1) * 4);
-  out += fmt::format("        if(__builtin_expect(p!=0&&q==p+{}u,1)) {{\n", (count - 1) * 4);
+  out += fmt::format("        if(__builtin_expect(p!=0&&q==p+{}u,1)) {{ AOT_ASSUME_SEPARATE(p,s);\n",
+                     (count - 1) * 4);
   out += fmt::format("            for(int r={};r<32;r++,p+=4) {{ uint32_t v; __builtin_memcpy(&v,p,4); "
                      "s->gpr[r]=__builtin_bswap32(v); }}\n", rd);
   out += "        } else {\n";
-  out += fmt::format("            for(int r={};r<32;r++,ea+=4) s->gpr[r]=aot_read_u32(s,ea);\n", rd);
+  out += fmt::format("            for(int r={};r<32;r++,ea+=4) s->gpr[r]=aot_read_u32_fm(s,&aot_fm,ea);\n", rd);
   out += "        }\n";
   out += "    }\n";
 }
@@ -1350,13 +1360,14 @@ void AOTCEmitter::EmitStmw(std::string& out, UGeckoInstruction inst)
   else
     out += fmt::format("        uint32_t ea=(uint32_t){};\n", DispExpr(offset));
   const u32 count = 32 - rs;
-  out += fmt::format("        uint8_t* p=aot_host_ptr(ea); uint8_t* q=aot_host_ptr(ea+{}u);\n",
+  out += fmt::format("        uint8_t* p=aot_host_ptr_fm(&aot_fm,ea); uint8_t* q=aot_host_ptr_fm(&aot_fm,ea+{}u);\n",
                      (count - 1) * 4);
-  out += fmt::format("        if(__builtin_expect(p!=0&&q==p+{}u,1)) {{\n", (count - 1) * 4);
+  out += fmt::format("        if(__builtin_expect(p!=0&&q==p+{}u,1)) {{ AOT_ASSUME_SEPARATE(p,s);\n",
+                     (count - 1) * 4);
   out += fmt::format("            for(int r={};r<32;r++,p+=4) {{ uint32_t v=__builtin_bswap32(s->gpr[r]); "
                      "__builtin_memcpy(p,&v,4); }}\n", rs);
   out += "        } else {\n";
-  out += fmt::format("            for(int r={};r<32;r++,ea+=4) aot_write_u32(s,s->gpr[r],ea);\n", rs);
+  out += fmt::format("            for(int r={};r<32;r++,ea+=4) aot_write_u32_fm(s,&aot_fm,s->gpr[r],ea);\n", rs);
   out += "        }\n";
   out += "    }\n";
 }
@@ -1381,7 +1392,7 @@ void AOTCEmitter::EmitLfs(std::string& out, UGeckoInstruction inst, bool update,
     out += fmt::format("        uint32_t ea={}+{};\n",
                        ra ? fmt::format("s->gpr[{}]", ra) : "0", DispExpr(offset));
   }
-  out += "        uint32_t raw=aot_read_u32(s,ea);\n";
+  out += "        uint32_t raw=aot_read_u32_fm(s,&aot_fm,ea);\n";
   out += fmt::format("        uint64_t dv=aot_convert_to_double_fast(raw); "
                      "s->ps[{}].ps0=dv; s->ps[{}].ps1=dv;\n", fd, fd);
   if (update && ra)
@@ -1399,7 +1410,7 @@ void AOTCEmitter::EmitPsqFast(std::string& out, UGeckoInstruction inst, bool sto
   const s32 offset = s32(inst.SIMM_12);
   const std::string ea = ra ? fmt::format("s->gpr[{}]+(uint32_t)({})", ra, offset) :
                               fmt::format("(uint32_t)({})", offset);
-  out += fmt::format("    aot_psq_{}_fast(s,{},{},{},{},{},{}u);\n", store ? "st" : "l", rd, ra, ea,
+  out += fmt::format("    aot_psq_{}_fast(s,&aot_fm,{},{},{},{},{},{}u);\n", store ? "st" : "l", rd, ra, ea,
                      I(inst.I), I(inst.W), inst.hex);
 }
 
@@ -1419,7 +1430,7 @@ void AOTCEmitter::EmitLfd(std::string& out, UGeckoInstruction inst, bool update,
     out += fmt::format("        uint32_t ea={}+{};\n",
                        ra ? fmt::format("s->gpr[{}]", ra) : "0", DispExpr(offset));
   }
-  out += fmt::format("        s->ps[{}].ps0=aot_read_u64(s,ea);\n", fd);
+  out += fmt::format("        s->ps[{}].ps0=aot_read_u64_fm(s,&aot_fm,ea);\n", fd);
   if (update && ra)
     out += fmt::format("        s->gpr[{}]=ea;\n", ra);
   out += "    }\n";
@@ -1441,7 +1452,7 @@ void AOTCEmitter::EmitStfs(std::string& out, UGeckoInstruction inst, bool update
     out += fmt::format("        uint32_t ea={}+{};\n",
                        ra ? fmt::format("s->gpr[{}]", ra) : "0", DispExpr(offset));
   }
-  out += fmt::format("        aot_write_u32(s,aot_convert_to_single_fast(s->ps[{}].ps0),ea);\n", fs);
+  out += fmt::format("        aot_write_u32_fm(s,&aot_fm,aot_convert_to_single_fast(s->ps[{}].ps0),ea);\n", fs);
   if (update && ra)
     out += fmt::format("        s->gpr[{}]=ea;\n", ra);
   out += "    }\n";
@@ -1463,7 +1474,7 @@ void AOTCEmitter::EmitStfd(std::string& out, UGeckoInstruction inst, bool update
     out += fmt::format("        uint32_t ea={}+{};\n",
                        ra ? fmt::format("s->gpr[{}]", ra) : "0", DispExpr(offset));
   }
-  out += fmt::format("        aot_write_u64(s,s->ps[{}].ps0,ea);\n", fs);
+  out += fmt::format("        aot_write_u64_fm(s,&aot_fm,s->ps[{}].ps0,ea);\n", fs);
   if (update && ra)
     out += fmt::format("        s->gpr[{}]=ea;\n", ra);
   out += "    }\n";

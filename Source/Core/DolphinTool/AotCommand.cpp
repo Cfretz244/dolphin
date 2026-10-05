@@ -919,7 +919,7 @@ int AotCommand(const std::vector<std::string>& args)
     // LCG RNGs); -fno-strict-aliasing: insurance for generated pointer casts.
     // -DAOT_HARNESS=1: macOS libs keep the aot_single_block_mode test on block edges
     // so the AOT_COMPARE harness can stop chaining; iOS libs compile it out.
-    script << "BLOCK_CFLAGS=\"-Os -flto=thin -arch arm64 -mcpu=apple-a14 -moutline"
+    script << "BLOCK_CFLAGS=\"-Os -flto=thin -arch arm64 -mcpu=apple-a14"
               " -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1\"\n";
     script << "DISPATCH_CFLAGS=\"-O2 -flto=thin -arch arm64 -mcpu=apple-a14"
               " -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1\"\n";
