@@ -368,6 +368,160 @@ extern void aot_psq_stx(AOTState* s, uint32_t inst);
 extern void aot_psq_lux(AOTState* s, uint32_t inst);
 extern void aot_psq_stux(AOTState* s, uint32_t inst);
 
+// ============================================================================
+// Single-precision FP fast paths (static inline, generated code calls these).
+//
+// Bit-identical to the interpreter (Interpreter_FloatingPoint.cpp fmulsx /
+// faddsx / fsubsx, Interpreter_PairedUtils.h PS_Add / PS_Sub / PS_Mul /
+// PS_Muls0 / PS_Muls1) on the path where the interpreter touches NO FPSCR
+// exception state: the double-precision op produced a finite result (add/sub:
+// NI_add/NI_sub also clear FI/FR when an operand is infinite, so an infinite
+// result is sent to the slow path too; mul: NI_mul only reacts to a NaN
+// result). Everything else -- NaN, SNaN, inf-inf, inf*0, VE handling --
+// falls back to the exact out-of-line helpers above, which run the
+// interpreter's own code. The host FPU already runs in the mode
+// RoundingModeUpdated() derived from FPSCR (RN + NI flush-to-zero), exactly as
+// it does for the interpreter, so the double arithmetic here rounds/flushes
+// identically. Purely additive: the helpers keep their names and semantics,
+// so libraries generated against older headers keep linking (no ABI bump).
+//
+// FPSCR layout (UReg_FPSCR): NI bit 2, FPRF bits 12-16, FI bit 17, FR bit 18.
+// ============================================================================
+#define AOT_FPSCR_NI        (1u << 2)
+#define AOT_FPSCR_FPRF_MASK (0x1Fu << 12)
+#define AOT_FPSCR_FI        (1u << 17)
+#define AOT_FPSCR_FR        (1u << 18)
+
+static inline double aot_bits_to_double(uint64_t b) { double d; __builtin_memcpy(&d, &b, 8); return d; }
+static inline uint64_t aot_double_to_bits(double d) { uint64_t b; __builtin_memcpy(&b, &d, 8); return b; }
+static inline float aot_bits_to_float(uint32_t b) { float f; __builtin_memcpy(&f, &b, 4); return f; }
+static inline uint32_t aot_float_to_bits(float f) { uint32_t b; __builtin_memcpy(&b, &f, 4); return b; }
+
+// Common::ClassifyFloat -> PPC_FPCLASS_* (the 5-bit FPRF value).
+static inline uint32_t aot_classify_float(float f) {
+    uint32_t i = aot_float_to_bits(f);
+    uint32_t sign = i & 0x80000000u;
+    uint32_t exp = i & 0x7F800000u;
+    if (exp > 0 && exp < 0x7F800000u)
+        return sign ? 0x8u : 0x4u;          /* NN : PN */
+    uint32_t mantissa = i & 0x007FFFFFu;
+    if (mantissa) {
+        if (exp)
+            return 0x11u;                   /* QNAN */
+        return sign ? 0x18u : 0x14u;        /* ND : PD */
+    }
+    if (exp)
+        return sign ? 0x9u : 0x5u;          /* NINF : PINF */
+    return sign ? 0x12u : 0x2u;             /* NZ : PZ */
+}
+
+// Interpreter_FPUtils.h ForceSingle(fpscr, value). The interpreter's trailing
+// `if (!cpu_info.bFlushToZero && fpscr.NI) FlushToZero(x)` is omitted: every
+// host the AOT runtime targets (arm64, x86-64 with SSE) reports bFlushToZero,
+// so that branch is dead there and the host FZ bit does the flushing instead.
+static inline float aot_force_single(uint32_t fpscr, double value) {
+    if (fpscr & AOT_FPSCR_NI) {
+        uint64_t bits = aot_double_to_bits(value);
+        uint64_t value_without_sign = bits & 0x7FFFFFFFFFFFFFFFull;
+        if (value_without_sign < 0x3810000000000000ull)  /* subnormal as a single: flush */
+            return aot_bits_to_float((uint32_t)((bits & 0x8000000000000000ull) >> 32));
+    }
+    return (float)value;
+}
+
+// Interpreter_FPUtils.h Force25Bit(d): round the mantissa of frC to 25 bits.
+static inline double aot_force_25bit(double d) {
+    uint64_t integral = aot_double_to_bits(d);
+    uint64_t exponent = integral & 0x7FF0000000000000ull;
+    uint64_t fraction = integral & 0x000FFFFFFFFFFFFFull;
+    if (exponent == 0 && fraction != 0) {
+        /* Subnormals are "normalized" before rounding: shift the keep mask and
+           the rounding bit right until the fraction's MSB would reach the
+           exponent. */
+        int64_t keep_mask = (int64_t)0xFFFFFFFFF8000000ull;
+        uint64_t round = 0x8000000ull;
+        uint32_t shift = (uint32_t)__builtin_clzll(fraction) - (63 - 52);
+        keep_mask >>= shift;
+        round >>= shift;
+        integral = (integral & (uint64_t)keep_mask) + (integral & round);
+    } else {
+        integral = (integral & 0xFFFFFFFFF8000000ull) + (integral & 0x8000000ull);
+    }
+    return aot_bits_to_double(integral);
+}
+
+// ps[fd].Fill(float) + UpdateFPRFSingle; `clear` is the extra FPSCR bits the
+// instruction zeroes (fmulsx clears FI|FR, faddsx/fsubsx clear nothing).
+static inline void aot_fp_fill_single(AOTState* s, int fd, float r, uint32_t clear) {
+    uint64_t bits = aot_double_to_bits((double)r);
+    s->ps[fd].ps0 = bits;
+    s->ps[fd].ps1 = bits;
+    s->fpscr = (s->fpscr & ~(AOT_FPSCR_FPRF_MASK | clear)) | (aot_classify_float(r) << 12);
+}
+
+static inline void aot_faddsx_fast(AOTState* s, int fd, int fa, int fb) {
+    double sum = aot_bits_to_double(s->ps[fa].ps0) + aot_bits_to_double(s->ps[fb].ps0);
+    if (__builtin_expect(!__builtin_isfinite(sum), 0)) { aot_faddsx(s, fd, fa, fb); return; }
+    aot_fp_fill_single(s, fd, aot_force_single(s->fpscr, sum), 0);
+}
+
+static inline void aot_fsubsx_fast(AOTState* s, int fd, int fa, int fb) {
+    double diff = aot_bits_to_double(s->ps[fa].ps0) - aot_bits_to_double(s->ps[fb].ps0);
+    if (__builtin_expect(!__builtin_isfinite(diff), 0)) { aot_fsubsx(s, fd, fa, fb); return; }
+    aot_fp_fill_single(s, fd, aot_force_single(s->fpscr, diff), 0);
+}
+
+static inline void aot_fmulsx_fast(AOTState* s, int fd, int fa, int fc) {
+    double product = aot_bits_to_double(s->ps[fa].ps0) * aot_force_25bit(aot_bits_to_double(s->ps[fc].ps0));
+    if (__builtin_expect(__builtin_isnan(product), 0)) { aot_fmulsx(s, fd, fa, fc); return; }
+    aot_fp_fill_single(s, fd, aot_force_single(s->fpscr, product), AOT_FPSCR_FI | AOT_FPSCR_FR);
+}
+
+// ps[fd].SetBoth(ps0, ps1) + UpdateFPRFSingle(ps0). Both results are computed
+// before anything is written, so fd aliasing fa/fb/fc is fine.
+static inline void aot_ps_set_both(AOTState* s, int fd, float r0, float r1) {
+    s->ps[fd].ps0 = aot_double_to_bits((double)r0);
+    s->ps[fd].ps1 = aot_double_to_bits((double)r1);
+    s->fpscr = (s->fpscr & ~AOT_FPSCR_FPRF_MASK) | (aot_classify_float(r0) << 12);
+}
+
+static inline void aot_ps_add_fast(AOTState* s, int fd, int fa, int fb) {
+    double r0 = aot_bits_to_double(s->ps[fa].ps0) + aot_bits_to_double(s->ps[fb].ps0);
+    double r1 = aot_bits_to_double(s->ps[fa].ps1) + aot_bits_to_double(s->ps[fb].ps1);
+    if (__builtin_expect(!(__builtin_isfinite(r0) && __builtin_isfinite(r1)), 0)) { aot_ps_add(s, fd, fa, fb); return; }
+    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
+}
+
+static inline void aot_ps_sub_fast(AOTState* s, int fd, int fa, int fb) {
+    double r0 = aot_bits_to_double(s->ps[fa].ps0) - aot_bits_to_double(s->ps[fb].ps0);
+    double r1 = aot_bits_to_double(s->ps[fa].ps1) - aot_bits_to_double(s->ps[fb].ps1);
+    if (__builtin_expect(!(__builtin_isfinite(r0) && __builtin_isfinite(r1)), 0)) { aot_ps_sub(s, fd, fa, fb); return; }
+    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
+}
+
+static inline void aot_ps_mul_fast(AOTState* s, int fd, int fa, int fc) {
+    double r0 = aot_bits_to_double(s->ps[fa].ps0) * aot_force_25bit(aot_bits_to_double(s->ps[fc].ps0));
+    double r1 = aot_bits_to_double(s->ps[fa].ps1) * aot_force_25bit(aot_bits_to_double(s->ps[fc].ps1));
+    if (__builtin_expect(__builtin_isnan(r0) || __builtin_isnan(r1), 0)) { aot_ps_mul(s, fd, fa, fc); return; }
+    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
+}
+
+static inline void aot_ps_muls0_fast(AOTState* s, int fd, int fa, int fc) {
+    double c0 = aot_force_25bit(aot_bits_to_double(s->ps[fc].ps0));
+    double r0 = aot_bits_to_double(s->ps[fa].ps0) * c0;
+    double r1 = aot_bits_to_double(s->ps[fa].ps1) * c0;
+    if (__builtin_expect(__builtin_isnan(r0) || __builtin_isnan(r1), 0)) { aot_ps_muls0(s, fd, fa, fc); return; }
+    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
+}
+
+static inline void aot_ps_muls1_fast(AOTState* s, int fd, int fa, int fc) {
+    double c1 = aot_force_25bit(aot_bits_to_double(s->ps[fc].ps1));
+    double r0 = aot_bits_to_double(s->ps[fa].ps0) * c1;
+    double r1 = aot_bits_to_double(s->ps[fa].ps1) * c1;
+    if (__builtin_expect(__builtin_isnan(r0) || __builtin_isnan(r1), 0)) { aot_ps_muls1(s, fd, fa, fc); return; }
+    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
+}
+
 // CR helpers (inline for performance)
 // Values from ConditionRegister::PPCToInternal() — Dolphin's optimized 64-bit CR encoding.
 // Index = 4-bit PPC CR field value (LT=8, GT=4, EQ=2, SO=1).
