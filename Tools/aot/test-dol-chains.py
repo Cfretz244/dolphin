@@ -82,7 +82,8 @@ int main(void) {
   assert(s.gpr[3]==7 && fallbacks==1 && guards==2); // one guard shared by first two bodies
   s=state(2,0);guards=fallbacks=0;entry(&s);
   assert(s.pc==0x80004008u && s.gpr[3]==1 && s.downcount==0 && guards==1 && !fallbacks);
-  s=state(100,0);s.exceptions=1;entry(&s);assert(s.pc==0x80004008u && s.gpr[3]==1);
+  s=state(100,0);s.exceptions=2;entry(&s);assert(s.pc==0x80004008u && s.gpr[3]==1); // synchronous exception exits the edge
+  s=state(100,0);s.exceptions=1;entry(&s);assert(s.gpr[3]==7 && s.pc==0x80004018u); // masked async DECREMENTER no longer forces an exit
   s=state(100,1);guards=fallbacks=0;entry(&s);
   assert(s.gpr[3]==1 && fallbacks==1 && guards==1); // taken branch exits before inline body
 #if AOT_HARNESS
@@ -128,7 +129,7 @@ int main(void) {
             '--output', str(root/'shifted'))
         text = ''.join(p.read_text() for p in (root/'shifted').glob('*blocks*.c'))
         assert 'aot_match_chain(0x80004018u' not in text
-        print('PASS: shared resident guard, fallthrough/taken edges, timing, exceptions, harness boundaries, and image switching')
+        print('PASS: shared resident guard, fallthrough/taken edges, timing, sync/async exceptions, harness boundaries, and image switching')
 
 
 if __name__ == '__main__':
