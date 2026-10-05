@@ -43,6 +43,7 @@ const Info<bool> GFX_SHOW_VPS{{System::GFX, "Settings", "ShowVPS"}, false};
 const Info<bool> GFX_SHOW_VTIMES{{System::GFX, "Settings", "ShowVTimes"}, false};
 const Info<bool> GFX_SHOW_GRAPHS{{System::GFX, "Settings", "ShowGraphs"}, false};
 const Info<bool> GFX_SHOW_SPEED{{System::GFX, "Settings", "ShowSpeed"}, false};
+const Info<int> GFX_PERF_LOG_SECONDS{{System::GFX, "Settings", "PerfLogSeconds"}, 0};
 const Info<bool> GFX_SHOW_SPEED_COLORS{{System::GFX, "Settings", "ShowSpeedColors"}, true};
 const Info<bool> GFX_MOVABLE_PERFORMANCE_METRICS{
     {System::GFX, "Settings", "MovablePerformanceMetrics"}, false};

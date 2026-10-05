@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <deque>
 
 #include "Common/CommonTypes.h"
@@ -51,6 +52,7 @@ public:
 private:
   PerformanceTracker m_fps_counter{"render_times.txt"};
   PerformanceTracker m_vps_counter{"vblank_times.txt"};
+  std::chrono::steady_clock::time_point m_last_perf_log{};
 
   double m_graph_max_time = 0.0;
 

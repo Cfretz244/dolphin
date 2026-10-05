@@ -47,6 +47,9 @@ extern const Info<bool> GFX_SHOW_VPS;
 extern const Info<bool> GFX_SHOW_VTIMES;
 extern const Info<bool> GFX_SHOW_GRAPHS;
 extern const Info<bool> GFX_SHOW_SPEED;
+// Headless perf diagnostics: every N seconds log "PerfLog fps= vps= speed=" to the
+// VIDEO log (NOTICE). 0 = off. Reads the same counters the OSD overlay shows.
+extern const Info<int> GFX_PERF_LOG_SECONDS;
 extern const Info<bool> GFX_SHOW_SPEED_COLORS;
 extern const Info<bool> GFX_MOVABLE_PERFORMANCE_METRICS;
 extern const Info<int> GFX_PERF_SAMP_WINDOW;
