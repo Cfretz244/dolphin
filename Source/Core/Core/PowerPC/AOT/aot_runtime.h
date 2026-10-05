@@ -91,6 +91,13 @@ typedef struct {
     uint32_t size;        /* MEM1 real size */
     uint8_t* exram;       /* Wii MEM2 host buffer, NULL on GC */
     uint32_t exram_size;  /* 0 on GC */
+    /* MMU::m_dbat_table.data(); live, never copied. MMU::DBATUpdated rewrites
+       the table in place, so reading it through the per-block copy of this
+       descriptor is always current: only the pointer is copied, and it is
+       stable for the session. Used by the inline gather-pipe path
+       (aot_gp_physical). APPEND-ONLY struct: the Jul-18 GALE01 iOS lib reads
+       the first four fields by offset. */
+    const uint32_t* dbat;
 } AotFastMem;
 extern AotFastMem aot_fast_mem;  // filled by aot_init_fast_mem() before any block runs
 
@@ -869,15 +876,79 @@ static inline uint32_t aot_convert_to_single_ftz_fast(uint64_t x) {
 // AotRuntime.cpp aot_psq_l/aot_psq_st -> FastDequantize/FastQuantize exactly:
 // only when HID2.LSQE is set, the GQR ld/st type is QUANTIZE_FLOAT (0; scale
 // unused) and EA is plain MEM1/MEM2 (aot_host_ptr_fm; the runtime's FastMemHostPtr
-// additionally accepts the locked L1 cache, and a NULL pointer on psq_st is
-// the gather pipe -- both are left to the helper). The pair is read/written as
-// one big-endian u64 at EA, like FastReadPair/FastWritePair. Everything else
-// calls the unchanged helper, which recomputes EA from the instruction.
+// additionally accepts the locked L1 cache -- left to the helper). The pair is
+// read/written as one big-endian u64 at EA, like FastReadPair/FastWritePair.
+// psq_st additionally handles the write-gather pipe at the SDK's 0xCC008000
+// mapping inline (aot_gp_physical / aot_gp_store_*; = GatherPipeQuantize's
+// float case). Everything else calls the unchanged helper, which recomputes EA
+// from the instruction.
 // UGQR: st_type bits 0-2, ld_type bits 16-18. HID2 LSQE = bit 31.
 // ----------------------------------------------------------------------------
 #define AOT_SPR_GQR0  912
 #define AOT_SPR_HID2  920
 #define AOT_HID2_LSQE (1u << 31)
+
+// Write-gather pipe constants (static_asserted against PowerPC::/GPFifo:: in
+// AotRuntime.cpp).
+#define AOT_BAT_INDEX_SHIFT 17
+#define AOT_BAT_MAPPED_BIT  1u
+#define AOT_BAT_RESULT_MASK (~7u)
+#define AOT_MSR_DR          0x10u
+#define AOT_GP_EA_PAGE      0xCC008000u
+#define AOT_GP_PHYS_PAGE    0x0C008000u
+#define AOT_GP_SIZE         32u
+
+// ----------------------------------------------------------------------------
+// Inline write-gather pipe path for psq_st (float GQR). Mirrors AotRuntime.cpp
+// GatherPipePhysical + GatherPipeElement (= MMU::WriteToHardware's pipe branch
+// -> GPFifo::Write32): the big-endian element is stored through
+// s->gather_pipe_ptr and the fill level is checked afterwards; aot_gp_flush is
+// GPFifo::CheckGatherPipe. A ps0,ps1 pair is one 8-byte store and ONE check,
+// which is state-equivalent to the interpreter's store/check/store/check
+// (UpdateGatherPipe drains every full 32-byte chunk and keeps the spill).
+// Harness builds record each element twice, like MMU::WriteToHardware's
+// generic MMIO record plus its gather-pipe record.
+// ----------------------------------------------------------------------------
+extern void aot_gp_flush(AOTState* s);
+#if defined(AOT_HARNESS) && AOT_HARNESS
+extern void aot_gp_capture(uint32_t physical, uint32_t val, uint32_t size);
+#define AOT_GP_CAPTURE(p, v, n) aot_gp_capture((p), (v), (n))
+#else
+#define AOT_GP_CAPTURE(p, v, n) ((void)0)
+#endif
+
+/* Physical pipe address for a size-byte store at ea, or 0. Exact mirror of
+   AotRuntime.cpp GatherPipePhysical, preceded by a cheap effective-page filter:
+   anything not at the SDK's 0xCC008000 mapping (DR off, remapped BATs, EFB,
+   MMIO, locked L1) returns 0 and goes to the helper, which handles it. */
+static inline __attribute__((always_inline)) uint32_t aot_gp_physical(const AOTState* s, const AotFastMem* fm, uint32_t ea, uint32_t size) {
+    if ((ea & 0xFFFFF000u) != AOT_GP_EA_PAGE) return 0;
+    if (!(s->msr & AOT_MSR_DR)) return 0;
+    uint32_t bat = fm->dbat[ea >> AOT_BAT_INDEX_SHIFT];
+    if (!(bat & AOT_BAT_MAPPED_BIT)) return 0;
+    uint32_t phys = (bat & AOT_BAT_RESULT_MASK) | (ea & ((1u << AOT_BAT_INDEX_SHIFT) - 1u));
+    if ((phys & 0xFFFFF000u) != AOT_GP_PHYS_PAGE) return 0;
+    if ((ea & 0xFFFu) + size > 0x1000u) return 0;
+    return phys;
+}
+/* One big-endian u32 (or a ps0,ps1 pair) into the pipe, then the fill check. */
+static inline __attribute__((always_inline)) void aot_gp_store_u32(AOTState* s, uint32_t phys, uint32_t val) {
+    AOT_GP_CAPTURE(phys, val, 4); AOT_GP_CAPTURE(phys, val, 4);
+    uint8_t* gp = (uint8_t*)s->gather_pipe_ptr;
+    AOT_ASSUME_SEPARATE(gp, s);
+    uint32_t v = __builtin_bswap32(val); __builtin_memcpy(gp, &v, 4);
+    s->gather_pipe_ptr = gp + 4;
+    if (__builtin_expect((uintptr_t)(gp + 4) - (uintptr_t)s->gather_pipe_base_ptr >= AOT_GP_SIZE, 0)) aot_gp_flush(s);
+}
+static inline __attribute__((always_inline)) void aot_gp_store_pair_u32(AOTState* s, uint32_t phys, uint32_t v0, uint32_t v1) {
+    AOT_GP_CAPTURE(phys, v0, 4); AOT_GP_CAPTURE(phys, v0, 4);
+    AOT_GP_CAPTURE(phys + 4, v1, 4); AOT_GP_CAPTURE(phys + 4, v1, 4);
+    uint8_t* gp = (uint8_t*)s->gather_pipe_ptr;
+    AOT_ASSUME_SEPARATE(gp, s);
+    uint64_t v = __builtin_bswap64(((uint64_t)v0 << 32) | v1); __builtin_memcpy(gp, &v, 8);
+    s->gather_pipe_ptr = gp + 8;
+    if (__builtin_expect((uintptr_t)(gp + 8) - (uintptr_t)s->gather_pipe_base_ptr >= AOT_GP_SIZE, 0)) aot_gp_flush(s);
+}
 
 static inline __attribute__((always_inline)) void aot_psq_l_fast(AOTState* s, const AotFastMem* fm, int fd, int ra, uint32_t ea, int i, int w, uint32_t inst) {
     uint8_t* p;
@@ -901,20 +972,29 @@ static inline __attribute__((always_inline)) void aot_psq_l_fast(AOTState* s, co
 }
 
 static inline __attribute__((always_inline)) void aot_psq_st_fast(AOTState* s, const AotFastMem* fm, int fs, int ra, uint32_t ea, int i, int w, uint32_t inst) {
-    uint8_t* p;
     if (__builtin_expect((s->spr[AOT_SPR_HID2] & AOT_HID2_LSQE) != 0 &&
-                         (s->spr[AOT_SPR_GQR0 + i] & 0x7u) == 0 &&
-                         (p = aot_host_ptr_fm(fm, ea)) != 0, 1)) {
-        AOT_ASSUME_SEPARATE(p, s);
+                         (s->spr[AOT_SPR_GQR0 + i] & 0x7u) == 0, 1)) {
+        uint8_t* p;
         uint32_t c0 = aot_convert_to_single_ftz_fast(s->ps[fs].ps0);
-        if (w) {
-            uint32_t v = __builtin_bswap32(c0);
-            __builtin_memcpy(p, &v, 4);
-        } else {
-            uint64_t v = __builtin_bswap64(((uint64_t)c0 << 32) | aot_convert_to_single_ftz_fast(s->ps[fs].ps1));
-            __builtin_memcpy(p, &v, 8);
+        if (__builtin_expect(aot_fm_resolve(fm, ea, &p), 1)) {
+            AOT_ASSUME_SEPARATE(p, s);
+            if (w) {
+                uint32_t v = __builtin_bswap32(c0);
+                __builtin_memcpy(p, &v, 4);
+            } else {
+                uint64_t v = __builtin_bswap64(((uint64_t)c0 << 32) | aot_convert_to_single_ftz_fast(s->ps[fs].ps1));
+                __builtin_memcpy(p, &v, 8);
+            }
+            return;
         }
-        return;
+        /* RAM miss: the write-gather pipe (GX vertex submission) inline; every
+           other target (L1, MMIO, DR off, remapped BATs) goes to the helper. */
+        uint32_t phys = aot_gp_physical(s, fm, ea, w ? 4u : 8u);
+        if (phys) {
+            if (w) aot_gp_store_u32(s, phys, c0);
+            else   aot_gp_store_pair_u32(s, phys, c0, aot_convert_to_single_ftz_fast(s->ps[fs].ps1));
+            return;
+        }
     }
     aot_psq_st(s, fs, ra, inst);
 }

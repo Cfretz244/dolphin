@@ -718,6 +718,102 @@ TEST(AotFpPsqTest, FloatPathMatchesConvert)
   EXPECT_EQ(bad, 0);
 }
 
+// psq_st inline write-gather pipe path (float GQR): a store to the SDK's
+// 0xCC008000 pipe mapping must append the big-endian ConvertToSingleFTZ words
+// (ps0 then ps1) at gather_pipe_ptr and advance it, without touching RAM. Each
+// sequence stays below GATHER_PIPE_SIZE so the fill-level flush (aot_gp_flush,
+// which needs a booted System) is never reached. aot_gp_physical's rejections
+// are checked directly: those cases call the helper, which needs a System too.
+TEST(AotFpPsqTest, GatherPipeFloatPath)
+{
+  alignas(8) static u8 ram[0x1000];
+  static u32 dbat[1u << 15]{};  // 128 KB, like MMU::m_dbat_table
+  std::memset(dbat, 0, sizeof(dbat));
+  dbat[0xCC00'8000u >> 17] = 0x0C00'0000u | 1u;  // SDK DBAT1: 0xC0000000 -> 0, uncached
+  const AotFastMem fm{ram, sizeof(ram), nullptr, 0, dbat};
+
+  AOTState s{};
+  s.msr = 0x10;               // MSR.DR
+  s.spr[920] = 0x8000'0000u;  // HID2.LSQE
+  for (int i = 0; i < 8; ++i)  // float st types, garbage scales (ignored for float)
+    s.spr[912 + i] = 0x3F00'3F00u;
+  alignas(32) static u8 pipe[64];
+  s.gather_pipe_base_ptr = pipe;
+
+  std::vector<u64> doubles(double_test_values.begin(), double_test_values.end());
+  std::memset(ram, 0x5A, sizeof(ram));
+  int bad = 0;
+  int stores = 0;
+  for (size_t k = 0; k + 6 <= doubles.size(); k += 3)
+  {
+    for (const int w : {0, 1})
+    {
+      // Three consecutive stores (24 / 12 bytes) from an empty pipe.
+      std::memset(pipe, 0xA5, sizeof(pipe));
+      s.gather_pipe_ptr = pipe;
+      std::vector<u32> want;
+      for (size_t j = 0; j < 3; ++j)
+      {
+        const u64 d0 = doubles[k + j], d1 = doubles[k + j + 3];
+        s.ps[5].ps0 = d0;
+        s.ps[5].ps1 = d1;
+        const int gqr = static_cast<int>((k + j) % 8);
+        u8* const before = static_cast<u8*>(s.gather_pipe_ptr);
+        aot_psq_st_fast(&s, &fm, 5, 1, 0xCC00'8000u, gqr, w, 0);
+        ++stores;
+        const ptrdiff_t adv = static_cast<u8*>(s.gather_pipe_ptr) - before;
+        if (adv != (w ? 4 : 8) && bad++ < 5)
+          ADD_FAILURE() << fmt::format("w={} k={} j={}: gather_pipe_ptr advanced {}", w, k, j,
+                                       adv);
+        want.push_back(Common::swap32(ConvertToSingleFTZ(d0)));
+        if (!w)
+          want.push_back(Common::swap32(ConvertToSingleFTZ(d1)));
+      }
+      for (size_t n = 0; n < want.size(); ++n)
+      {
+        u32 got;
+        std::memcpy(&got, pipe + 4 * n, 4);
+        if (got != want[n] && bad++ < 5)
+          ADD_FAILURE() << fmt::format("w={} k={} word {}: got {:08x} want {:08x}", w, k, n, got,
+                                       want[n]);
+      }
+      u32 tail;
+      std::memcpy(&tail, pipe + 4 * want.size(), 4);
+      if (tail != 0xA5A5'A5A5u && bad++ < 5)
+        ADD_FAILURE() << fmt::format("w={} k={}: wrote past the expected end", w, k);
+    }
+  }
+  for (const u8 b : ram)
+    if (b != 0x5A)
+    {
+      ADD_FAILURE() << "pipe stores touched RAM";
+      break;
+    }
+  EXPECT_GT(stores, 0);
+  EXPECT_EQ(bad, 0);
+
+  // aot_gp_physical acceptance / rejection.
+  EXPECT_EQ(aot_gp_physical(&s, &fm, 0xCC00'8000u, 8), 0x0C00'8000u);
+  EXPECT_EQ(aot_gp_physical(&s, &fm, 0xCC00'8FF8u, 8), 0x0C00'8FF8u);
+  EXPECT_EQ(aot_gp_physical(&s, &fm, 0xCC00'8FFCu, 4), 0x0C00'8FFCu);
+  EXPECT_EQ(aot_gp_physical(&s, &fm, 0xCC00'8FFCu, 8), 0u);  // page-crossing
+  EXPECT_EQ(aot_gp_physical(&s, &fm, 0xCC00'9000u, 4), 0u);  // not the pipe page
+  EXPECT_EQ(aot_gp_physical(&s, &fm, 0x8C00'8000u, 4), 0u);  // other effective page
+  {
+    AOTState s_nodr = s;
+    s_nodr.msr = 0;  // DR clear: helper path (physical == effective there)
+    EXPECT_EQ(aot_gp_physical(&s_nodr, &fm, 0xCC00'8000u, 8), 0u);
+  }
+  const u32 saved = dbat[0xCC00'8000u >> 17];
+  dbat[0xCC00'8000u >> 17] = 0x0C00'0000u;  // unmapped (BAT_MAPPED_BIT clear)
+  EXPECT_EQ(aot_gp_physical(&s, &fm, 0xCC00'8000u, 8), 0u);
+  dbat[0xCC00'8000u >> 17] = 0x0D00'0000u | 1u;  // mapped elsewhere
+  EXPECT_EQ(aot_gp_physical(&s, &fm, 0xCC00'8000u, 8), 0u);
+  dbat[0xCC00'8000u >> 17] = 0x0C00'0000u | 1u | 6u;  // low attribute bits are masked off
+  EXPECT_EQ(aot_gp_physical(&s, &fm, 0xCC00'8000u, 8), 0x0C00'8000u);
+  dbat[0xCC00'8000u >> 17] = saved;
+}
+
 // The `_fm` memory helpers (descriptor passed by pointer, what generated
 // blocks call; they branch on aot_fm_resolve's verdict) must resolve every
 // address exactly like the global-descriptor helpers, and their fast paths

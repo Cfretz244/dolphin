@@ -78,6 +78,20 @@ AOT_ASSERT_FIELD(spr, spr);
 static_assert(sizeof(AOTState) <= sizeof(PowerPC::PowerPCState),
               "AOTState must not extend beyond PowerPCState");
 
+// Constants behind the inline gather-pipe path in aot_runtime.h (aot_gp_physical).
+static_assert(AOT_BAT_INDEX_SHIFT == PowerPC::BAT_INDEX_SHIFT);
+static_assert((1u << AOT_BAT_INDEX_SHIFT) == PowerPC::BAT_PAGE_SIZE);
+static_assert(AOT_BAT_MAPPED_BIT == PowerPC::BAT_MAPPED_BIT);
+static_assert(AOT_BAT_RESULT_MASK == PowerPC::BAT_RESULT_MASK);
+static_assert(AOT_GP_PHYS_PAGE == GPFifo::GATHER_PIPE_PHYSICAL_ADDRESS);
+static_assert(AOT_GP_SIZE == GPFifo::GATHER_PIPE_SIZE);
+// UReg_MSR's constructor is not constexpr; check the bitfield's position instead.
+static_assert(decltype(UReg_MSR::DR)::NumBits() == 1 &&
+                  (1u << decltype(UReg_MSR::DR)::StartBit()) == AOT_MSR_DR,
+              "AOT_MSR_DR must be exactly MSR.DR");
+static_assert(std::is_same_v<PowerPC::BatTable::value_type, uint32_t>,
+              "AotFastMem::dbat reads the DBAT table as uint32_t");
+
 // Single-block mode flag for diff harness: when set, dispatch returns
 // immediately without calling any block. Declared in aot_runtime.h; defined
 // here as the single authoritative definition.
@@ -193,6 +207,8 @@ extern "C" int aot_stats_enabled = 0;
 extern "C" uint64_t aot_stat_exception_checks = 0;   // Run-loop CheckExceptions calls
 extern "C" uint64_t aot_stat_exception_bits[16] = {};  // pending bit histogram at those calls
 extern "C" uint64_t aot_stat_exception_masked = 0;   // ... with MSR.EE clear
+// s_stat_gp_psq counts only helper-path pipe psq_st: the inline float path in
+// aot_runtime.h (aot_psq_st_fast) bypasses it, like the other _fast paths.
 static u64 s_stat_rfi = 0, s_stat_idle = 0, s_stat_mtmsr = 0, s_stat_gp_store = 0,
            s_stat_gp_psq = 0;
 
@@ -241,7 +257,7 @@ extern "C"
 // RAM fast-path descriptor exported to generated code: aot_runtime.h inlines
 // the RAM fast path into every block and calls the aot_*_slow functions below
 // for everything else. AotFastMem itself is defined in aot_runtime.h.
-AotFastMem aot_fast_mem = {nullptr, 0, nullptr, 0};
+AotFastMem aot_fast_mem = {nullptr, 0, nullptr, 0, nullptr};
 
 void aot_init_fast_mem()
 {
@@ -268,6 +284,7 @@ void aot_init_fast_mem()
   aot_fast_mem.size = s_ram_size;
   aot_fast_mem.exram = s_exram_ptr;
   aot_fast_mem.exram_size = s_exram_size;
+  aot_fast_mem.dbat = s_mmu->GetDBATTable().data();
 }
 
 // Counterpart to aot_init_fast_mem, called from AOTCore::Shutdown. The RAM/L1
@@ -292,6 +309,7 @@ void aot_shutdown()
   aot_fast_mem.size = 0;
   aot_fast_mem.exram = nullptr;
   aot_fast_mem.exram_size = 0;
+  aot_fast_mem.dbat = nullptr;
   s_track_fallbacks = false;
   aot_stats_enabled = s_track_fallbacks ? 1 : 0;
   s_fallback_counts.clear();
@@ -409,6 +427,30 @@ static inline bool TryGatherPipeWrite(AOTState* s, uint32_t addr, uint32_t val, 
     ++s_stat_gp_store;
   GatherPipeElement(physical, val, size);
   return true;
+}
+
+// Fill-level check for the inline gather-pipe path in aot_runtime.h (called only
+// when the pipe holds >= GATHER_PIPE_SIZE bytes). CheckGatherPipe, not
+// FastCheckGatherPipe: identical to what GPFifo::Write32 does after each element.
+void aot_gp_flush(AOTState* s)
+{
+  (void)s;
+  GetSystem().GetGPFifo().CheckGatherPipe();
+}
+
+// Harness mirror of GatherPipeElement's capture records (one call = one record;
+// the header calls it twice per element, as MMU::WriteToHardware records twice).
+// Defined unconditionally: the macOS lib is compiled with -DAOT_HARNESS=1 and
+// must link against a core built with or without DOLPHIN_AOT_HARNESS.
+void aot_gp_capture(uint32_t physical, uint32_t val, uint32_t size)
+{
+#ifdef DOLPHIN_AOT_HARNESS
+  MMIOCaptureRecord(physical, val, size);
+#else
+  (void)physical;
+  (void)val;
+  (void)size;
+#endif
 }
 
 void aot_write_u8_slow(AOTState* s, uint32_t val, uint32_t addr)
@@ -1272,6 +1314,10 @@ bool FastDequantize(PowerPC::PowerPCState& ppcs, u32 addr, u32 instI, u32 instRD
 // psq_st into the write-gather pipe (GX packed vertex attributes). Quantizes
 // into a scratch buffer with the RAM fast path's routines, then pushes each
 // element in the interpreter's order (ps0 then ps1) as separate pipe writes.
+// The float case normally no longer arrives here from non-update psq_st: the
+// inline path in aot_runtime.h (aot_psq_st_fast -> aot_gp_store_*) handles it.
+// It still serves quantized types, psq_stu/stx/stux, DR-off / remapped-BAT
+// cases and page-crossing stores, so keep it complete.
 static bool GatherPipeQuantize(PowerPC::PowerPCState& ppcs, u32 addr, u32 instI, u32 instRS,
                                u32 instW)
 {
