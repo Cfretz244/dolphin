@@ -170,7 +170,7 @@ Dolphin uses an optimized 64-bit format per CR field (NOT standard PPC 4-bit). A
 
 ### FP/Paired-Singles
 
-All FP arithmetic delegates to Dolphin's interpreter methods via macro-generated `extern "C"` wrappers in `AotRuntime.cpp`. Critical: `ps_neg`/`ps_abs`/`ps_nabs` operate on BOTH PS0 and PS1 (unlike scalar `fneg`/`fabs`/`fnabs` which only affect PS0).
+FP arithmetic delegates to Dolphin's interpreter methods via macro-generated `extern "C"` wrappers in `AotRuntime.cpp`, except fadds/fsubs/fmuls, the fmadds family (scalar + ps_madd/msub/nmadd/nmsub/madds0/madds1), ps_add/sub/mul/muls0/muls1, the lfs/stfs bit converts and float-GQR psq_l/psq_st: those use `static inline *_fast` paths in `aot_runtime.h` that are bit-identical to the interpreter and call the wrappers for NaN/inf results, fmadds even ties, and non-RAM/non-float psq cases (`UnitTests/Core/PowerPC/AotFpFastPathTest.cpp` is the proof). Critical: `ps_neg`/`ps_abs`/`ps_nabs` operate on BOTH PS0 and PS1 (unlike scalar `fneg`/`fabs`/`fnabs` which only affect PS0).
 
 ### Vertex Loader AOT
 

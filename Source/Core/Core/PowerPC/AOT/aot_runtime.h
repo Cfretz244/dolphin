@@ -522,6 +522,247 @@ static inline void aot_ps_muls1_fast(AOTState* s, int fd, int fa, int fc) {
     aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
 }
 
+// ----------------------------------------------------------------------------
+// fmadds family (fmaddsx/fmsubsx/fnmaddsx/fnmsubsx, ps_madd/msub/nmadd/nmsub,
+// ps_madds0/madds1). Interpreter_FPUtils.h NI_madd_msub<sub, single=true>:
+// r = fma(a, Force25Bit(c), sub ? -b : b) in double, then ForceSingle. The
+// interpreter only does extra work when (1) r's low 29 bits are an even tie for
+// the single rounding (error-free-transform correction of r by +-1 ulp), (2) r
+// is NaN (NaN ordering / VXSNAN / VXIMZ / VXISI), or (3) an operand is infinite
+// (ClearFIFR). A finite r implies finite a, b and Force25Bit(c), hence finite c,
+// so "r finite and not a tie" is exactly the path where the interpreter's
+// result is r itself and FPSCR is untouched by the core. Everything else falls
+// back to the exact helper. No -ffast-math: __builtin_fma is a single fused op.
+// ----------------------------------------------------------------------------
+
+/* Returns 0 => the caller must take the exact helper. */
+static inline int aot_fmadds_core(double a, double c, double b, int sub, double* out) {
+    double r = __builtin_fma(a, aot_force_25bit(c), sub ? -b : b);
+    uint64_t bits = aot_double_to_bits(r);
+    if (__builtin_expect((bits & 0x1FFFFFFFull) == 0x10000000ull, 0))
+        return 0; /* even tie: the interpreter corrects the rounding direction */
+    if (__builtin_expect(!__builtin_isfinite(r), 0))
+        return 0; /* NaN logic, or an infinite operand => ClearFIFR */
+    *out = r;
+    return 1;
+}
+
+// fmaddsx is the only one of the four that writes FI/FR.
+static inline void aot_fmaddsx_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+    double r;
+    if (__builtin_expect(!aot_fmadds_core(aot_bits_to_double(s->ps[fa].ps0), aot_bits_to_double(s->ps[fc].ps0),
+                                          aot_bits_to_double(s->ps[fb].ps0), 0, &r), 0)) {
+        aot_fmaddsx(s, fd, fa, fc, fb);
+        return;
+    }
+    float res = aot_force_single(s->fpscr, r);
+    uint32_t fi = (r != (double)res) ? AOT_FPSCR_FI : 0u;
+    aot_fp_fill_single(s, fd, res, AOT_FPSCR_FI | AOT_FPSCR_FR);
+    s->fpscr |= fi;
+}
+
+static inline void aot_fmsubsx_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+    double r;
+    if (__builtin_expect(!aot_fmadds_core(aot_bits_to_double(s->ps[fa].ps0), aot_bits_to_double(s->ps[fc].ps0),
+                                          aot_bits_to_double(s->ps[fb].ps0), 1, &r), 0)) {
+        aot_fmsubsx(s, fd, fa, fc, fb);
+        return;
+    }
+    aot_fp_fill_single(s, fd, aot_force_single(s->fpscr, r), 0);
+}
+
+// fnmadds/fnmsubs: result = isnan(tmp) ? tmp : -tmp; tmp is never NaN here.
+static inline void aot_fnmaddsx_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+    double r;
+    if (__builtin_expect(!aot_fmadds_core(aot_bits_to_double(s->ps[fa].ps0), aot_bits_to_double(s->ps[fc].ps0),
+                                          aot_bits_to_double(s->ps[fb].ps0), 0, &r), 0)) {
+        aot_fnmaddsx(s, fd, fa, fc, fb);
+        return;
+    }
+    aot_fp_fill_single(s, fd, -aot_force_single(s->fpscr, r), 0);
+}
+
+static inline void aot_fnmsubsx_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+    double r;
+    if (__builtin_expect(!aot_fmadds_core(aot_bits_to_double(s->ps[fa].ps0), aot_bits_to_double(s->ps[fc].ps0),
+                                          aot_bits_to_double(s->ps[fb].ps0), 1, &r), 0)) {
+        aot_fnmsubsx(s, fd, fa, fc, fb);
+        return;
+    }
+    aot_fp_fill_single(s, fd, -aot_force_single(s->fpscr, r), 0);
+}
+
+// Paired forms: both halves go through the core before anything is written;
+// if either half needs the exact path the whole op is sent to the helper.
+// c0/c1 select frC's halves (ps_madds0: c.ps0 twice, ps_madds1: c.ps1 twice).
+static inline int aot_ps_madd_core(AOTState* s, int fa, double c0, double c1, int fb, int sub,
+                                   double* r0, double* r1) {
+    return aot_fmadds_core(aot_bits_to_double(s->ps[fa].ps0), c0, aot_bits_to_double(s->ps[fb].ps0), sub, r0) &
+           aot_fmadds_core(aot_bits_to_double(s->ps[fa].ps1), c1, aot_bits_to_double(s->ps[fb].ps1), sub, r1);
+}
+
+static inline void aot_ps_madd_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+    double r0, r1;
+    if (__builtin_expect(!aot_ps_madd_core(s, fa, aot_bits_to_double(s->ps[fc].ps0), aot_bits_to_double(s->ps[fc].ps1),
+                                           fb, 0, &r0, &r1), 0)) {
+        aot_ps_madd(s, fd, fa, fc, fb);
+        return;
+    }
+    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
+}
+
+static inline void aot_ps_msub_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+    double r0, r1;
+    if (__builtin_expect(!aot_ps_madd_core(s, fa, aot_bits_to_double(s->ps[fc].ps0), aot_bits_to_double(s->ps[fc].ps1),
+                                           fb, 1, &r0, &r1), 0)) {
+        aot_ps_msub(s, fd, fa, fc, fb);
+        return;
+    }
+    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
+}
+
+static inline void aot_ps_nmadd_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+    double r0, r1;
+    if (__builtin_expect(!aot_ps_madd_core(s, fa, aot_bits_to_double(s->ps[fc].ps0), aot_bits_to_double(s->ps[fc].ps1),
+                                           fb, 0, &r0, &r1), 0)) {
+        aot_ps_nmadd(s, fd, fa, fc, fb);
+        return;
+    }
+    aot_ps_set_both(s, fd, -aot_force_single(s->fpscr, r0), -aot_force_single(s->fpscr, r1));
+}
+
+static inline void aot_ps_nmsub_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+    double r0, r1;
+    if (__builtin_expect(!aot_ps_madd_core(s, fa, aot_bits_to_double(s->ps[fc].ps0), aot_bits_to_double(s->ps[fc].ps1),
+                                           fb, 1, &r0, &r1), 0)) {
+        aot_ps_nmsub(s, fd, fa, fc, fb);
+        return;
+    }
+    aot_ps_set_both(s, fd, -aot_force_single(s->fpscr, r0), -aot_force_single(s->fpscr, r1));
+}
+
+static inline void aot_ps_madds0_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+    double r0, r1;
+    double c0 = aot_bits_to_double(s->ps[fc].ps0);
+    if (__builtin_expect(!aot_ps_madd_core(s, fa, c0, c0, fb, 0, &r0, &r1), 0)) {
+        aot_ps_madds0(s, fd, fa, fc, fb);
+        return;
+    }
+    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
+}
+
+static inline void aot_ps_madds1_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+    double r0, r1;
+    double c1 = aot_bits_to_double(s->ps[fc].ps1);
+    if (__builtin_expect(!aot_ps_madd_core(s, fa, c1, c1, fb, 0, &r0, &r1), 0)) {
+        aot_ps_madds1(s, fd, fa, fc, fb);
+        return;
+    }
+    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
+}
+
+// ----------------------------------------------------------------------------
+// Single <-> double bit conversions for lfs/stfs and psq float loads/stores:
+// straight ports of Interpreter_FPUtils.h ConvertToDouble / ConvertToSingle /
+// ConvertToSingleFTZ (pure integer ops; no host FPU involvement).
+// ----------------------------------------------------------------------------
+static inline uint64_t aot_convert_to_double_fast(uint32_t value) {
+    uint64_t x = value;
+    uint64_t exp = (x >> 23) & 0xFF;
+    uint64_t frac = x & 0x007FFFFF;
+    if (__builtin_expect(exp > 0 && exp < 255, 1)) {  /* normal */
+        uint64_t y = !(exp >> 7);
+        uint64_t z = y << 61 | y << 60 | y << 59;
+        return ((x & 0xC0000000u) << 32) | z | ((x & 0x3FFFFFFFu) << 29);
+    }
+    if (exp == 0 && frac != 0) {  /* subnormal: normalize so bit 23 is set */
+        /* The interpreter's loop shifts (and decrements exp) until bit 23 is
+           set: shift = 23 - msb(frac) = clz32(frac) - 8, at least 1. */
+        uint32_t shift = (uint32_t)__builtin_clz((uint32_t)frac) - 8;
+        frac <<= shift;
+        exp = 1023 - 126 - shift;
+        return ((x & 0x80000000u) << 32) | (exp << 52) | ((frac & 0x007FFFFF) << 29);
+    }
+    /* QNaN, SNaN or zero */
+    uint64_t y = exp >> 7;
+    uint64_t z = y << 61 | y << 60 | y << 59;
+    return ((x & 0xC0000000u) << 32) | z | ((x & 0x3FFFFFFFu) << 29);
+}
+
+static inline uint32_t aot_convert_to_single_fast(uint64_t x) {
+    uint32_t exp = (uint32_t)((x >> 52) & 0x7FF);
+    if (__builtin_expect(exp > 896 || (x & 0x7FFFFFFFFFFFFFFFull) == 0, 1))
+        return (uint32_t)(((x >> 32) & 0xC0000000u) | ((x >> 29) & 0x3FFFFFFFu));
+    if (exp >= 874) {
+        uint32_t t = (uint32_t)(0x80000000u | ((x & 0x000FFFFFFFFFFFFFull) >> 21));
+        t = t >> (905 - exp);
+        t |= (uint32_t)((x >> 32) & 0x80000000u);
+        return t;
+    }
+    /* "Undefined" per the manual; hardware-tested behaviour. */
+    return (uint32_t)(((x >> 32) & 0xC0000000u) | ((x >> 29) & 0x3FFFFFFFu));
+}
+
+static inline uint32_t aot_convert_to_single_ftz_fast(uint64_t x) {
+    uint32_t exp = (uint32_t)((x >> 52) & 0x7FF);
+    if (__builtin_expect(exp > 896 || (x & 0x7FFFFFFFFFFFFFFFull) == 0, 1))
+        return (uint32_t)(((x >> 32) & 0xC0000000u) | ((x >> 29) & 0x3FFFFFFFu));
+    return (uint32_t)((x >> 32) & 0x80000000u);
+}
+
+// ----------------------------------------------------------------------------
+// psq_l / psq_st (non-update, non-indexed) GQR float case, inlined. Mirrors
+// AotRuntime.cpp aot_psq_l/aot_psq_st -> FastDequantize/FastQuantize exactly:
+// only when HID2.LSQE is set, the GQR ld/st type is QUANTIZE_FLOAT (0; scale
+// unused) and EA is plain MEM1/MEM2 (aot_host_ptr; the runtime's FastMemHostPtr
+// additionally accepts the locked L1 cache, and a NULL pointer on psq_st is
+// the gather pipe -- both are left to the helper). The pair is read/written as
+// one big-endian u64 at EA, like FastReadPair/FastWritePair. Everything else
+// calls the unchanged helper, which recomputes EA from the instruction.
+// UGQR: st_type bits 0-2, ld_type bits 16-18. HID2 LSQE = bit 31.
+// ----------------------------------------------------------------------------
+#define AOT_SPR_GQR0  912
+#define AOT_SPR_HID2  920
+#define AOT_HID2_LSQE (1u << 31)
+
+static inline void aot_psq_l_fast(AOTState* s, int fd, int ra, uint32_t ea, int i, int w, uint32_t inst) {
+    uint8_t* p;
+    if (__builtin_expect((s->spr[AOT_SPR_HID2] & AOT_HID2_LSQE) != 0 &&
+                         (s->spr[AOT_SPR_GQR0 + i] & 0x70000u) == 0 &&
+                         (p = aot_host_ptr(ea)) != 0, 1)) {
+        if (w) {
+            uint32_t v; __builtin_memcpy(&v, p, 4);
+            s->ps[fd].ps0 = aot_convert_to_double_fast(__builtin_bswap32(v));
+            s->ps[fd].ps1 = 0x3FF0000000000000ull;  /* 1.0 */
+        } else {
+            uint64_t v; __builtin_memcpy(&v, p, 8);
+            v = __builtin_bswap64(v);
+            s->ps[fd].ps0 = aot_convert_to_double_fast((uint32_t)(v >> 32));
+            s->ps[fd].ps1 = aot_convert_to_double_fast((uint32_t)v);
+        }
+        return;
+    }
+    aot_psq_l(s, fd, ra, inst);
+}
+
+static inline void aot_psq_st_fast(AOTState* s, int fs, int ra, uint32_t ea, int i, int w, uint32_t inst) {
+    uint8_t* p;
+    if (__builtin_expect((s->spr[AOT_SPR_HID2] & AOT_HID2_LSQE) != 0 &&
+                         (s->spr[AOT_SPR_GQR0 + i] & 0x7u) == 0 &&
+                         (p = aot_host_ptr(ea)) != 0, 1)) {
+        uint32_t c0 = aot_convert_to_single_ftz_fast(s->ps[fs].ps0);
+        if (w) {
+            uint32_t v = __builtin_bswap32(c0);
+            __builtin_memcpy(p, &v, 4);
+        } else {
+            uint64_t v = __builtin_bswap64(((uint64_t)c0 << 32) | aot_convert_to_single_ftz_fast(s->ps[fs].ps1));
+            __builtin_memcpy(p, &v, 8);
+        }
+        return;
+    }
+    aot_psq_st(s, fs, ra, inst);
+}
+
 // CR helpers (inline for performance)
 // Values from ConditionRegister::PPCToInternal() — Dolphin's optimized 64-bit CR encoding.
 // Index = 4-bit PPC CR field value (LT=8, GT=4, EQ=2, SO=1).

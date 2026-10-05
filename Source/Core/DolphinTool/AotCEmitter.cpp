@@ -429,9 +429,9 @@ bool AOTCEmitter::EmitInstruction(std::string& out, UGeckoInstruction inst, u32 
     case 53: EmitStfs(out, inst, true, false); return true;
     case 54: EmitStfd(out, inst, false, false); return true;
     case 55: EmitStfd(out, inst, true, false); return true;
-    case 56: out += fmt::format("    aot_psq_l(s,{},{},{});\n", I(inst.RD), I(inst.RA), inst.hex); return true;
+    case 56: EmitPsqFast(out, inst, false); return true;
     case 57: out += fmt::format("    aot_psq_lu(s,{},{},{});\n", I(inst.RD), I(inst.RA), inst.hex); return true;
-    case 60: out += fmt::format("    aot_psq_st(s,{},{},{});\n", I(inst.RS), I(inst.RA), inst.hex); return true;
+    case 60: EmitPsqFast(out, inst, true); return true;
     case 61: out += fmt::format("    aot_psq_stu(s,{},{},{});\n", I(inst.RS), I(inst.RA), inst.hex); return true;
     case 59: return EmitTable59(out, inst, pc);
     case 63: return EmitTable63(out, inst, pc);
@@ -1382,11 +1382,25 @@ void AOTCEmitter::EmitLfs(std::string& out, UGeckoInstruction inst, bool update,
                        ra ? fmt::format("s->gpr[{}]", ra) : "0", DispExpr(offset));
   }
   out += "        uint32_t raw=aot_read_u32(s,ea);\n";
-  out += fmt::format("        uint64_t dv=aot_convert_to_double(raw); "
+  out += fmt::format("        uint64_t dv=aot_convert_to_double_fast(raw); "
                      "s->ps[{}].ps0=dv; s->ps[{}].ps1=dv;\n", fd, fd);
   if (update && ra)
     out += fmt::format("        s->gpr[{}]=ea;\n", ra);
   out += "    }\n";
+}
+
+// psq_l / psq_st (non-update, non-indexed): static inline fast path in
+// aot_runtime.h for the HID2.LSQE + GQR float type + RAM case, falling back to
+// aot_psq_l/aot_psq_st (which decode the instruction themselves) otherwise.
+// The fast path bypasses the helpers' AOT_HARNESS stats counters.
+void AOTCEmitter::EmitPsqFast(std::string& out, UGeckoInstruction inst, bool store)
+{
+  const u32 rd = I(inst.RD), ra = I(inst.RA);
+  const s32 offset = s32(inst.SIMM_12);
+  const std::string ea = ra ? fmt::format("s->gpr[{}]+(uint32_t)({})", ra, offset) :
+                              fmt::format("(uint32_t)({})", offset);
+  out += fmt::format("    aot_psq_{}_fast(s,{},{},{},{},{},{}u);\n", store ? "st" : "l", rd, ra, ea,
+                     I(inst.I), I(inst.W), inst.hex);
 }
 
 void AOTCEmitter::EmitLfd(std::string& out, UGeckoInstruction inst, bool update, bool indexed)
@@ -1427,7 +1441,7 @@ void AOTCEmitter::EmitStfs(std::string& out, UGeckoInstruction inst, bool update
     out += fmt::format("        uint32_t ea={}+{};\n",
                        ra ? fmt::format("s->gpr[{}]", ra) : "0", DispExpr(offset));
   }
-  out += fmt::format("        aot_write_u32(s,aot_convert_to_single(s->ps[{}].ps0),ea);\n", fs);
+  out += fmt::format("        aot_write_u32(s,aot_convert_to_single_fast(s->ps[{}].ps0),ea);\n", fs);
   if (update && ra)
     out += fmt::format("        s->gpr[{}]=ea;\n", ra);
   out += "    }\n";
@@ -1588,10 +1602,12 @@ void AOTCEmitter::EmitMcrf(std::string& out, UGeckoInstruction inst)
 }
 
 // ============================================================================
-// FP instructions — runtime helpers for correctness. fadds/fsubs/fmuls use the
-// static inline *_fast paths in aot_runtime.h (bit-identical to the interpreter,
-// fall back to the exact helpers on NaN/inf results); everything else calls
-// the out-of-line helpers, which run the interpreter.
+// FP instructions — runtime helpers for correctness. fadds/fsubs/fmuls and the
+// fmadds/fmsubs/fnmadds/fnmsubs family use the static inline *_fast paths in
+// aot_runtime.h (bit-identical to the interpreter; fall back to the exact
+// helpers on NaN/inf results and, for the fmadds family, on the even-tie
+// pattern the interpreter corrects); everything else calls the out-of-line
+// helpers, which run the interpreter.
 // ============================================================================
 
 bool AOTCEmitter::EmitTable59(std::string& out, UGeckoInstruction inst, u32 pc)
@@ -1605,10 +1621,10 @@ bool AOTCEmitter::EmitTable59(std::string& out, UGeckoInstruction inst, u32 pc)
   case 21: out += fmt::format("    aot_faddsx_fast(s,{},{},{});\n", fd, fa, fb); return true;
   case 24: out += fmt::format("    aot_fresx(s,{},{});\n", fd, fb); return true;
   case 25: out += fmt::format("    aot_fmulsx_fast(s,{},{},{});\n", fd, fa, fc); return true;
-  case 28: out += fmt::format("    aot_fmsubsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 29: out += fmt::format("    aot_fmaddsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 30: out += fmt::format("    aot_fnmsubsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 31: out += fmt::format("    aot_fnmaddsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 28: out += fmt::format("    aot_fmsubsx_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 29: out += fmt::format("    aot_fmaddsx_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 30: out += fmt::format("    aot_fnmsubsx_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 31: out += fmt::format("    aot_fnmaddsx_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   default: return false;
   }
 }
@@ -1687,7 +1703,8 @@ bool AOTCEmitter::EmitTable63(std::string& out, UGeckoInstruction inst, u32 pc)
 
 // ============================================================================
 // Paired singles (table 4) — via runtime helpers; ps_add/ps_sub/ps_mul/
-// ps_muls0/ps_muls1 use the static inline *_fast paths in aot_runtime.h.
+// ps_muls0/ps_muls1 and ps_madd/msub/nmadd/nmsub/madds0/madds1 use the static
+// inline *_fast paths in aot_runtime.h.
 // ============================================================================
 
 bool AOTCEmitter::EmitTable4(std::string& out, UGeckoInstruction inst, u32 pc)
@@ -1716,8 +1733,8 @@ bool AOTCEmitter::EmitTable4(std::string& out, UGeckoInstruction inst, u32 pc)
   case 11: out += fmt::format("    aot_ps_sum1(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 12: out += fmt::format("    aot_ps_muls0_fast(s,{},{},{});\n", fd, fa, fc); return true;
   case 13: out += fmt::format("    aot_ps_muls1_fast(s,{},{},{});\n", fd, fa, fc); return true;
-  case 14: out += fmt::format("    aot_ps_madds0(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 15: out += fmt::format("    aot_ps_madds1(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 14: out += fmt::format("    aot_ps_madds0_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 15: out += fmt::format("    aot_ps_madds1_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 18: out += fmt::format("    aot_ps_div(s,{},{},{});\n", fd, fa, fb); return true;
   case 20: out += fmt::format("    aot_ps_sub_fast(s,{},{},{});\n", fd, fa, fb); return true;
   case 21: out += fmt::format("    aot_ps_add_fast(s,{},{},{});\n", fd, fa, fb); return true;
@@ -1725,10 +1742,10 @@ bool AOTCEmitter::EmitTable4(std::string& out, UGeckoInstruction inst, u32 pc)
   case 24: out += fmt::format("    aot_ps_res(s,{},{});\n", fd, fb); return true;
   case 25: out += fmt::format("    aot_ps_mul_fast(s,{},{},{});\n", fd, fa, fc); return true;
   case 26: out += fmt::format("    aot_ps_rsqrte(s,{},{});\n", fd, fb); return true;
-  case 28: out += fmt::format("    aot_ps_msub(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 29: out += fmt::format("    aot_ps_madd(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 30: out += fmt::format("    aot_ps_nmsub(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 31: out += fmt::format("    aot_ps_nmadd(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 28: out += fmt::format("    aot_ps_msub_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 29: out += fmt::format("    aot_ps_madd_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 30: out += fmt::format("    aot_ps_nmsub_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 31: out += fmt::format("    aot_ps_nmadd_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   default: break;
   }
 

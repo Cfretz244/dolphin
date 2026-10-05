@@ -181,6 +181,7 @@ private:
   // Load/store FP
   void EmitLfs(std::string& out, UGeckoInstruction inst, bool update, bool indexed);
   void EmitLfd(std::string& out, UGeckoInstruction inst, bool update, bool indexed);
+  void EmitPsqFast(std::string& out, UGeckoInstruction inst, bool store);
   void EmitStfs(std::string& out, UGeckoInstruction inst, bool update, bool indexed);
   void EmitStfd(std::string& out, UGeckoInstruction inst, bool update, bool indexed);
 
