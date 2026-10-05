@@ -46,6 +46,7 @@ endif()
 
 target_sources(PowerPCTest PRIVATE
   PowerPC/AotCodeGuardTest.cpp
+  PowerPC/AotFpFastPathTest.cpp
   PowerPC/TestValues.h
   StubJit.h
 )

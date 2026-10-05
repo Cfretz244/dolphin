@@ -1588,7 +1588,10 @@ void AOTCEmitter::EmitMcrf(std::string& out, UGeckoInstruction inst)
 }
 
 // ============================================================================
-// FP instructions — all go through runtime helpers for correctness
+// FP instructions — runtime helpers for correctness. fadds/fsubs/fmuls use the
+// static inline *_fast paths in aot_runtime.h (bit-identical to the interpreter,
+// fall back to the exact helpers on NaN/inf results); everything else calls
+// the out-of-line helpers, which run the interpreter.
 // ============================================================================
 
 bool AOTCEmitter::EmitTable59(std::string& out, UGeckoInstruction inst, u32 pc)
@@ -1598,10 +1601,10 @@ bool AOTCEmitter::EmitTable59(std::string& out, UGeckoInstruction inst, u32 pc)
   switch (I(inst.SUBOP5))
   {
   case 18: out += fmt::format("    aot_fdivsx(s,{},{},{});\n", fd, fa, fb); return true;
-  case 20: out += fmt::format("    aot_fsubsx(s,{},{},{});\n", fd, fa, fb); return true;
-  case 21: out += fmt::format("    aot_faddsx(s,{},{},{});\n", fd, fa, fb); return true;
+  case 20: out += fmt::format("    aot_fsubsx_fast(s,{},{},{});\n", fd, fa, fb); return true;
+  case 21: out += fmt::format("    aot_faddsx_fast(s,{},{},{});\n", fd, fa, fb); return true;
   case 24: out += fmt::format("    aot_fresx(s,{},{});\n", fd, fb); return true;
-  case 25: out += fmt::format("    aot_fmulsx(s,{},{},{});\n", fd, fa, fc); return true;
+  case 25: out += fmt::format("    aot_fmulsx_fast(s,{},{},{});\n", fd, fa, fc); return true;
   case 28: out += fmt::format("    aot_fmsubsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 29: out += fmt::format("    aot_fmaddsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 30: out += fmt::format("    aot_fnmsubsx(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
@@ -1683,7 +1686,8 @@ bool AOTCEmitter::EmitTable63(std::string& out, UGeckoInstruction inst, u32 pc)
 }
 
 // ============================================================================
-// Paired singles (table 4) — all via runtime helpers
+// Paired singles (table 4) — via runtime helpers; ps_add/ps_sub/ps_mul/
+// ps_muls0/ps_muls1 use the static inline *_fast paths in aot_runtime.h.
 // ============================================================================
 
 bool AOTCEmitter::EmitTable4(std::string& out, UGeckoInstruction inst, u32 pc)
@@ -1710,16 +1714,16 @@ bool AOTCEmitter::EmitTable4(std::string& out, UGeckoInstruction inst, u32 pc)
   {
   case 10: out += fmt::format("    aot_ps_sum0(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 11: out += fmt::format("    aot_ps_sum1(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 12: out += fmt::format("    aot_ps_muls0(s,{},{},{});\n", fd, fa, fc); return true;
-  case 13: out += fmt::format("    aot_ps_muls1(s,{},{},{});\n", fd, fa, fc); return true;
+  case 12: out += fmt::format("    aot_ps_muls0_fast(s,{},{},{});\n", fd, fa, fc); return true;
+  case 13: out += fmt::format("    aot_ps_muls1_fast(s,{},{},{});\n", fd, fa, fc); return true;
   case 14: out += fmt::format("    aot_ps_madds0(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 15: out += fmt::format("    aot_ps_madds1(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 18: out += fmt::format("    aot_ps_div(s,{},{},{});\n", fd, fa, fb); return true;
-  case 20: out += fmt::format("    aot_ps_sub(s,{},{},{});\n", fd, fa, fb); return true;
-  case 21: out += fmt::format("    aot_ps_add(s,{},{},{});\n", fd, fa, fb); return true;
+  case 20: out += fmt::format("    aot_ps_sub_fast(s,{},{},{});\n", fd, fa, fb); return true;
+  case 21: out += fmt::format("    aot_ps_add_fast(s,{},{},{});\n", fd, fa, fb); return true;
   case 23: out += fmt::format("    aot_ps_sel(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 24: out += fmt::format("    aot_ps_res(s,{},{});\n", fd, fb); return true;
-  case 25: out += fmt::format("    aot_ps_mul(s,{},{},{});\n", fd, fa, fc); return true;
+  case 25: out += fmt::format("    aot_ps_mul_fast(s,{},{},{});\n", fd, fa, fc); return true;
   case 26: out += fmt::format("    aot_ps_rsqrte(s,{},{});\n", fd, fb); return true;
   case 28: out += fmt::format("    aot_ps_msub(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 29: out += fmt::format("    aot_ps_madd(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
