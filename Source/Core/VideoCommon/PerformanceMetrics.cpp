@@ -45,6 +45,22 @@ void PerformanceMetrics::CountFrame()
 void PerformanceMetrics::CountVBlank()
 {
   m_vps_counter.Count();
+
+  // Headless diagnostics: the ImGui overlay is invisible without a window (and
+  // never drawn on the Null backend), so optionally mirror its numbers into the
+  // log at a fixed cadence from the vblank path, which every backend hits.
+  if (const int perf_log_seconds = Config::Get(Config::GFX_PERF_LOG_SECONDS); perf_log_seconds > 0)
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - m_last_perf_log >= std::chrono::seconds(perf_log_seconds))
+    {
+      m_last_perf_log = now;
+      m_vps_counter.UpdateStats();
+      m_fps_counter.UpdateStats();
+      NOTICE_LOG_FMT(VIDEO, "PerfLog fps={:.2f} vps={:.2f} speed={:.1f}%", GetFPS(), GetVPS(),
+                     GetSpeed() * 100.0);
+    }
+  }
 }
 
 void PerformanceMetrics::CountThrottleSleep(DT sleep)
@@ -113,19 +129,6 @@ void PerformanceMetrics::DrawImGuiStats(const float backbuffer_scale)
 {
   m_vps_counter.UpdateStats();
   m_fps_counter.UpdateStats();
-
-  // Headless diagnostics: the overlay below is invisible without a window, so
-  // optionally mirror its numbers into the log at a fixed cadence.
-  if (const int perf_log_seconds = Config::Get(Config::GFX_PERF_LOG_SECONDS); perf_log_seconds > 0)
-  {
-    const auto now = std::chrono::steady_clock::now();
-    if (now - m_last_perf_log >= std::chrono::seconds(perf_log_seconds))
-    {
-      m_last_perf_log = now;
-      NOTICE_LOG_FMT(VIDEO, "PerfLog fps={:.2f} vps={:.2f} speed={:.1f}%", GetFPS(), GetVPS(),
-                     GetSpeed() * 100.0);
-    }
-  }
 
   const bool movable_overlays = Config::Get(Config::GFX_MOVABLE_PERFORMANCE_METRICS);
   const int movable_flag = movable_overlays ? ImGuiWindowFlags_None : ImGuiWindowFlags_NoMove;
