@@ -120,6 +120,21 @@ void PrepareInput(WiimoteEmu::DesiredWiimoteState* state, bool sensor_bar)
   if (!s_input_enabled.load() || !Pad::IsInitialized())
     return;
   const GCPadStatus pad = Pad::GetStatus(0);
+  {
+    // iOS bring-up diagnostics (CPU thread only).
+    static u64 s_prep_calls = 0;
+    static u64 s_prep_last_button_log = 0;
+    const u64 n = ++s_prep_calls;
+    const bool button_log =
+        pad.button != 0 && (s_prep_last_button_log == 0 || n - s_prep_last_button_log >= 60);
+    if (button_log)
+      s_prep_last_button_log = n;
+    if (button_log || n % 300 == 0)
+    {
+      NOTICE_LOG_FMT(CORE, "PrimeHack: PrepareInput #{} button={:#06x} stick=({},{})", n,
+                     pad.button, pad.stickX, pad.stickY);
+    }
+  }
   std::lock_guard lock(s_input_mutex);
   s_reports_active = true;
   auto mode = s_pointer_mode.load();
@@ -143,6 +158,16 @@ u16 GetCurrentlyPressedButtons()
   s_pointer = {};
   WiimoteEmu::DesiredWiimoteState state;
   MapPad(pad, &state, 0, 0, false);
+  {
+    // iOS bring-up diagnostics (CPU thread only).
+    static u64 s_bt_inactive_polls = 0;
+    const u64 n = ++s_bt_inactive_polls;
+    if (n % 60 == 0)
+    {
+      NOTICE_LOG_FMT(CORE, "PrimeHack: BT-inactive poll #{} button={:#06x} -> wm={:#06x}", n,
+                     pad.button, state.buttons.hex);
+    }
+  }
   return state.buttons.hex;
 }
 
@@ -165,6 +190,19 @@ void Update(const Core::CPUThreadGuard& guard)
   const bool enabled = supported && Config::Get(Config::MAIN_PRIMEHACK_ENABLED) &&
                        !NetPlay::IsNetPlayRunning() && !system.GetMovie().IsMovieActive();
   s_input_enabled = enabled;
+  {
+    // iOS bring-up diagnostics: log support/enable transitions.
+    static int s_last_logged = -1;
+    const int now = (supported ? 1 : 0) | (enabled ? 2 : 0);
+    if (now != s_last_logged)
+    {
+      s_last_logged = now;
+      NOTICE_LOG_FMT(CORE, "PrimeHack: supported={} enabled={} (gameid={} rev={} wii={} cfg={})",
+                     supported, enabled, SConfig::GetInstance().GetGameID(),
+                     SConfig::GetInstance().GetRevision(), system.IsWii(),
+                     Config::Get(Config::MAIN_PRIMEHACK_ENABLED));
+    }
+  }
   if (!supported)
   {
     s_camera_player = 0;
