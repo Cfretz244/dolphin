@@ -719,8 +719,9 @@ TEST(AotFpPsqTest, FloatPathMatchesConvert)
 }
 
 // The `_fm` memory helpers (descriptor passed by pointer, what generated
-// blocks call) must resolve every address exactly like the global-descriptor
-// helpers, and their fast paths must move the same bytes. Slow paths need a
+// blocks call; they branch on aot_fm_resolve's verdict) must resolve every
+// address exactly like the global-descriptor helpers, and their fast paths
+// must move the same bytes. Slow paths need a
 // booted system, so loads/stores are only issued at addresses that resolve.
 TEST(AotFpFastMemTest, FmHelpersMatchGlobalHelpers)
 {
@@ -755,6 +756,13 @@ TEST(AotFpFastMemTest, FmHelpersMatchGlobalHelpers)
     u8* const p = aot_host_ptr_fm(&fm, a);
     if ((p != aot_host_ptr(a) || aot_is_ram_fm(&fm, a) != aot_is_ram(a)) && bad++ < 5)
       ADD_FAILURE() << fmt::format("host_ptr {:08x}: fm {} global {}", a, fmt::ptr(p),
+                                   fmt::ptr(aot_host_ptr(a)));
+    // aot_fm_resolve is what the _fm load/store helpers branch on: its verdict
+    // must be "aot_host_ptr resolves" and its pointer that same host pointer.
+    u8* rp = nullptr;
+    const int ok = aot_fm_resolve(&fm, a, &rp);
+    if ((ok != (aot_host_ptr(a) != nullptr) || (ok && rp != aot_host_ptr(a))) && bad++ < 5)
+      ADD_FAILURE() << fmt::format("resolve {:08x}: ok {} p {} global {}", a, ok, fmt::ptr(rp),
                                    fmt::ptr(aot_host_ptr(a)));
     if (!p || aot_host_ptr_fm(&fm, a + 7) != p + 7)
       continue;
