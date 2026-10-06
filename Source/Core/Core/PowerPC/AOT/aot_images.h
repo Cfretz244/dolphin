@@ -26,7 +26,8 @@
 extern "C" {
 #endif
 
-#define AOT_IMAGES_VERSION 1
+/* 2: AOT_IMAGE_REAL_MODE images + the aot_active_image_real dispatch slot. */
+#define AOT_IMAGES_VERSION 2
 
 /* One expected instruction word at a fixed address. */
 typedef struct AotImageWord {
@@ -84,6 +85,16 @@ typedef struct AotImageDesc {
  * the DOL image they load stays active as soon as it matches. */
 #define AOT_IMAGE_AUXILIARY 1u
 
+/* Real-mode images (the OS's exception vectors at physical 0x100-0x1700,
+ * entered with MSR.IR=DR=0): table indices are PHYSICAL pcs (base is a
+ * physical address), and the code was emitted with every memory access on the
+ * MMU slow path (which honours MSR.DR). They are selected into a third slot,
+ * independently of the DOL and auxiliary slots. Their discriminator addresses
+ * are the cached virtual alias (0x80000000 | physical) of the vector words, so
+ * the tracker reads them like any other image's; every translated word is a
+ * discriminator (the vectors are a few hundred words). */
+#define AOT_IMAGE_REAL_MODE 2u
+
 /* Runtime state read by the generated dispatch. */
 typedef struct AotActiveImage {
     uint32_t base;
@@ -92,6 +103,7 @@ typedef struct AotActiveImage {
 } AotActiveImage;
 extern AotActiveImage aot_active_image;
 extern AotActiveImage aot_active_image_aux;
+extern AotActiveImage aot_active_image_real;
 /* Points at the emulated instruction cache's invalidation counter; dispatch
  * rescans when it differs from aot_images_seen. */
 extern const uint64_t* aot_images_generation;

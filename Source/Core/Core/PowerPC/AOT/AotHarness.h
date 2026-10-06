@@ -85,6 +85,9 @@ private:
     s32 downcount;
     u8 xer_ca, xer_so_ov;
     u32 spr_lr, spr_ctr, spr_xer;
+    // Exception-handling SPRs (kSysSprs): the real-mode vectors and rfi paths
+    // read and write them, so they are compared and restored like the GPRs.
+    u32 spr_sys[9];
   };
 
   void RunDiff();

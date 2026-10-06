@@ -99,6 +99,14 @@ public:
   // override written by the image tracker is honored.
   void SetVolatileTargets(std::unordered_set<u32> targets) { m_volatile_targets = std::move(targets); }
 
+  // Real-mode image (MSR.IR=DR=0: the OS exception vectors). pcs are physical;
+  // every load/store's effective address is physical, so the per-block fast-mem
+  // descriptor is emitted EMPTY (no MEM1/MEM2/L1 range ever matches) and every
+  // access takes the out-of-line helper, which goes through the MMU and honours
+  // MSR.DR. Only the live DBAT pointer is kept, for aot_gp_physical (which
+  // itself returns 0 when DR is clear).
+  void SetRealMode() { m_real_mode = true; }
+
   // Get the set of unhandled opcodes encountered during translation.
   const std::map<std::string, u32>& GetUnhandledOpcodes() const { return m_unhandled_opcodes; }
 
@@ -234,6 +242,12 @@ private:
   void EmitBlockBody(std::string& out, u32 block_addr, u32 num_instructions);
 
   bool m_guarded_images = false;
+  bool m_real_mode = false;
+  // Initializer of the per-block `aot_fm` copy (see SetRealMode).
+  const char* FastMemSource() const
+  {
+    return m_real_mode ? "(AotFastMem){.dbat=aot_fast_mem.dbat}" : "aot_fast_mem";
+  }
   u32 m_guarded_inline_end = 0;
   const PPCMemoryImage& m_memory;
   std::set<u32> m_known_blocks;

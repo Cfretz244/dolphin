@@ -265,6 +265,15 @@ static inline u8* FastMemHostPtr(u32 addr)
   return nullptr;
 }
 
+// Fallback-report opcode lookup: real-mode pcs (the exception vectors) are
+// physical MEM1 addresses, which FastMemHostPtr (effective addresses) rejects.
+static inline const u8* StatsCodePtr(u32 pc)
+{
+  if (const u8* p = FastMemHostPtr(pc))
+    return p;
+  return s_ram_ptr && pc + 4 <= s_ram_size ? s_ram_ptr + pc : nullptr;
+}
+
 extern "C"
 {
 
@@ -614,7 +623,7 @@ void aot_log_fallback_stats(int top_n)
   {
     const u32 pc = sorted[i].first;
     std::string opname = "???";
-    if (const u8* code = FastMemHostPtr(pc))
+    if (const u8* code = StatsCodePtr(pc))
     {
       u32 inst_word;
       std::memcpy(&inst_word, code, sizeof(u32));
@@ -665,7 +674,7 @@ void aot_dump_fallback_stats()
     const u32 pc = sorted[i].first;
     const u64 count = sorted[i].second;
     std::string opname = "???";
-    if (const u8* code = FastMemHostPtr(pc))
+    if (const u8* code = StatsCodePtr(pc))
     {
       u32 inst_word;
       std::memcpy(&inst_word, code, sizeof(u32));

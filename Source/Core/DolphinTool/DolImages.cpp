@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <ranges>
+#include <iterator>
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
@@ -26,6 +27,7 @@
 #include "Common/Swap.h"
 #include "Core/Boot/DolReader.h"
 #include "Core/PowerPC/AOT/aot_images.h"
+#include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/PPCTables.h"
 #include "Core/PrimeHack/Patches.h"
 #include "DiscIO/DiscExtractor.h"
@@ -55,6 +57,10 @@ struct Image
   std::vector<std::pair<u32, u32>> ranges;
   // Trace-sourced images only: addr -> word, persisted in trace_image_words.
   std::map<u32, u32> trace_words;
+  // Real-mode images (translate --real-mode-image): physical-pc blocks
+  // discovered statically from the exception vectors of a low-memory dump.
+  bool real_mode = false;
+  std::map<u32, u32> real_blocks;
 };
 using DB = std::unique_ptr<sqlite3, decltype(&sqlite3_close)>;
 using Statement = std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)>;
@@ -888,6 +894,148 @@ std::vector<AotImageWord> ChooseDiscriminators(const std::vector<Image>& images,
   return chosen;
 }
 
+// Real-mode (MSR.IR=DR=0) code: the OS exception vectors. A dump of physical
+// MEM1 [0, N) taken after OSInit installed them (dolphin-tool diff with
+// AOT_DIFF_DUMP_LOWMEM=<file>). Blocks are discovered statically from every
+// architected vector entry (0x100-0x1700) holding a valid instruction: walk to
+// the first FL_ENDBLOCK instruction (the same boundary rule the JIT uses, so
+// mtspr ends a block), follow direct branch targets and fallthroughs, stop at
+// rfi / indirect branches; then split blocks at every discovered leader.
+constexpr u32 kRealModeLo = 0x100;
+constexpr u32 kRealModeHi = 0x3000;
+
+std::map<u32, u32> DiscoverRealModeBlocks(const PPCMemoryImage& memory, u32 hi)
+{
+  auto valid = [&](u32 pc) -> std::optional<UGeckoInstruction> {
+    if (pc < kRealModeLo || pc + 4 > hi)
+      return std::nullopt;
+    const auto word = memory.ReadInstruction(pc);
+    if (!word || *word == 0)
+      return std::nullopt;
+    const UGeckoInstruction inst(*word);
+    if (!PPCTables::IsValidInstruction(inst, pc))
+      return std::nullopt;
+    return inst;
+  };
+  std::set<u32> leaders;
+  std::vector<u32> work;
+  auto add = [&](u32 pc) {
+    if (valid(pc) && leaders.insert(pc).second)
+      work.push_back(pc);
+  };
+  for (u32 vector = 0x100; vector <= 0x1700; vector += 0x100)
+    add(vector);
+  while (!work.empty())
+  {
+    u32 pc = work.back();
+    work.pop_back();
+    for (;; pc += 4)
+    {
+      const auto inst = valid(pc);
+      if (!inst)
+        break;
+      const auto* info = PPCTables::GetOpInfo(*inst, pc);
+      if (!(info->flags & FL_ENDBLOCK))
+        continue;
+      if (inst->OPCD == 18)
+      {
+        add(u32(SignExt26(inst->LI << 2)) + (inst->AA ? 0 : pc));
+        if (inst->LK)
+          add(pc + 4);
+      }
+      else if (inst->OPCD == 16)
+      {
+        add(u32(SignExt16(s16(inst->BD << 2))) + (inst->AA ? 0 : pc));
+        const bool always = (inst->BO & BO_DONT_DECREMENT_FLAG) && (inst->BO & BO_DONT_CHECK_CONDITION);
+        if (!always || inst->LK)
+          add(pc + 4);
+      }
+      else if (inst->OPCD == 19 && (inst->SUBOP10 == 16 || inst->SUBOP10 == 528))
+      {
+        const bool always = (inst->BO_2 & BO_DONT_CHECK_CONDITION) &&
+                            (inst->SUBOP10 == 528 || (inst->BO_2 & BO_DONT_DECREMENT_FLAG));
+        if (!always || inst->LK_3)
+          add(pc + 4);
+      }
+      else if (!(inst->OPCD == 19 && inst->SUBOP10 == 50))  // everything but rfi resumes
+      {
+        add(pc + 4);
+      }
+      break;
+    }
+  }
+  std::map<u32, u32> blocks;
+  for (auto it = leaders.begin(); it != leaders.end(); ++it)
+  {
+    const auto next = std::next(it);
+    u32 count = 0;
+    for (u32 pc = *it; ; pc += 4)
+    {
+      if (next != leaders.end() && pc == *next)
+        break;
+      const auto inst = valid(pc);
+      if (!inst)
+        break;
+      ++count;
+      if (PPCTables::GetOpInfo(*inst, pc)->flags & FL_ENDBLOCK)
+        break;
+    }
+    if (count)
+      blocks.emplace(*it, count);
+  }
+  return blocks;
+}
+
+// Appends one real-mode image per distinct dump (identical translated words
+// are deduplicated: the dumps of DOLs built from the same SDK can agree).
+void AddRealModeImages(std::vector<Image>& images, const std::vector<std::string>& dumps)
+{
+  for (const auto& path : dumps)
+  {
+    std::ifstream in(path, std::ios::binary);
+    std::vector<u8> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (!in.good() && !in.eof())
+      throw std::runtime_error("Cannot read --real-mode-image " + path);
+    if (bytes.size() < 0x200 || bytes.size() > kRealModeHi || (bytes.size() & 3))
+      throw std::runtime_error(fmt::format(
+          "--real-mode-image {}: expected a dump of physical [0, N) with 0x200 <= N <= {:#x}",
+          path, kRealModeHi));
+    Image image;
+    image.real_mode = true;
+    image.patched_sections.push_back(std::move(bytes));
+    const auto& stored = image.patched_sections.back();
+    image.memory.AddSection(0, stored.data(), static_cast<u32>(stored.size()));
+    image.real_blocks = DiscoverRealModeBlocks(image.memory, static_cast<u32>(stored.size()));
+    if (image.real_blocks.empty())
+      throw std::runtime_error("--real-mode-image " + path + ": no exception vectors found");
+    std::vector<u8> digest_input;
+    for (const auto& [pc, count] : image.real_blocks)
+    {
+      for (u32 n = 0; n < count; ++n)
+      {
+        const u32 addr = pc + n * 4;
+        const u32 word = *image.memory.ReadInstruction(addr);
+        for (u32 v : {addr, word})
+          for (int b = 3; b >= 0; --b)
+            digest_input.push_back(static_cast<u8>(v >> (b * 8)));
+      }
+    }
+    u8 digest[32];
+    if (mbedtls_sha256_ret(digest_input.data(), digest_input.size(), digest, 0) != 0)
+      throw std::runtime_error("Cannot hash real-mode image");
+    for (u8 b : digest)
+      image.hash += fmt::format("{:02x}", b);
+    if (std::any_of(images.begin(), images.end(),
+                    [&](const Image& i) { return i.real_mode && i.hash == image.hash; }))
+    {
+      fmt::println(std::cerr, "Real-mode image {}: identical to an earlier dump, skipped", path);
+      continue;
+    }
+    image.name = "<real:" + std::filesystem::path(path).filename().string() + ">";
+    images.push_back(std::move(image));
+  }
+}
+
 u32 ParseVariantMask(const std::string& name)
 {
   const auto pos = name.rfind("#primehack-");
@@ -899,7 +1047,8 @@ u32 ParseVariantMask(const std::string& name)
 
 bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg,
                             const std::string& output, const std::string& prefix,
-                            const std::string& boot_hash, const std::set<size_t>& selected)
+                            const std::string& boot_hash, const std::set<size_t>& selected,
+                            const std::vector<std::string>& real_mode_dumps)
 {
   try
   {
@@ -941,7 +1090,11 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
       if (seen != images.size())
         throw std::runtime_error("DOL image inventory mismatch");
     }
+    const size_t cfg_image_count = images.size();
+    AddRealModeImages(images, real_mode_dumps);
     std::vector<std::map<u32, u32>> rows(images.size());
+    for (size_t id = cfg_image_count; id < images.size(); ++id)
+      rows[id] = images[id].real_blocks;
     {
       auto query = Prepare(db.get(), "SELECT image_id,pc,count FROM dol_image_blocks");
       while (sqlite3_step(query.get()) == SQLITE_ROW)
@@ -949,7 +1102,7 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
         const auto id = sqlite3_column_int64(query.get(), 0);
         const auto pc = sqlite3_column_int64(query.get(), 1);
         const auto count = sqlite3_column_int64(query.get(), 2);
-        if (id < 0 || id >= static_cast<sqlite3_int64>(images.size()) || pc < 0 ||
+        if (id < 0 || id >= static_cast<sqlite3_int64>(cfg_image_count) || pc < 0 ||
             pc > UINT32_MAX || (pc & 3) || count <= 0 || count > (UINT32_MAX - pc) / 4)
           throw std::runtime_error("Invalid DOL block bounds");
         for (u32 n = 0; n < count; ++n)
@@ -964,9 +1117,10 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
     std::vector<size_t> bases;
     for (size_t id = 0; id < images.size(); ++id)
     {
-      // Trace-sourced (auxiliary) images are always emitted: the user asked for them.
-      if (images[id].base_image ||
-          (!selected.empty() && !selected.contains(id) && images[id].trace_words.empty()))
+      // Trace-sourced (auxiliary) and real-mode images are always emitted: the
+      // user asked for them.
+      if (images[id].base_image || (!selected.empty() && !selected.contains(id) &&
+                                    images[id].trace_words.empty() && !images[id].real_mode))
         continue;
       if (rows[id].empty())
         throw std::runtime_error("Selected image has no blocks: " + images[id].name);
@@ -1051,7 +1205,17 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
       out.table_base = lo & ~3u;
       out.table_size = ((hi - out.table_base) >> 2) + 1;
       total_table_entries += out.table_size;
-      out.words = ChooseDiscriminators(images, b, excluded_lines);
+      if (images[b].real_mode)
+      {
+        // Every translated word, at its cached virtual alias (aot_images.h).
+        for (const auto& [pc, count] : blocks)
+          for (u32 n = 0; n < count; ++n)
+            out.words.push_back({0x80000000u | (pc + n * 4), *images[b].memory.ReadInstruction(pc + n * 4)});
+      }
+      else
+      {
+        out.words = ChooseDiscriminators(images, b, excluded_lines);
+      }
 
       // Inline hints exactly as the single-image pipeline computes them, minus
       // runtime-swapped pcs (never inlined: their body is chosen at runtime).
@@ -1089,6 +1253,8 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
         AOTCEmitter emitter(images[b].memory, known, out.sym);
         emitter.SetInlineHints(sizes, inline_targets);
         emitter.SetVolatileTargets(volatile_pcs);
+        if (images[b].real_mode)
+          emitter.SetRealMode();
         std::map<u32, std::vector<TrustedBlock>> groups;
         for (const auto& [pc, count] : blocks)
           groups[pc >> 16].push_back({pc, count});
@@ -1235,7 +1401,9 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
             pv ? PrimeHack::MP1_PATCHES.size() : 0, pv ? out.sym + "_masks" : "0",
             pv ? out.variants.size() : 0, pv ? out.sym + "_overrides" : "0",
             pv ? out.overrides.size() : 0);
-        const u32 flags = images[out.image].trace_words.empty() ? 0 : 1;
+        const u32 flags = images[out.image].real_mode         ? AOT_IMAGE_REAL_MODE :
+                          !images[out.image].trace_words.empty() ? AOT_IMAGE_AUXILIARY :
+                                                                   0u;
         file << "#if AOT_HARNESS\n";
         file << fmt::format("     {}_block_sizes,{}u,{}u}},\n", out.sym, rows[out.image].size(),
                             flags);
@@ -1258,6 +1426,16 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
         file << "    if (idx < aot_active_image_aux.size) {\n";
         file << "        AOTBlockFunc fn = aot_active_image_aux.table[idx];\n";
         file << "        if (fn) { [[clang::musttail]] return fn(s); }\n    }\n";
+      }
+      if (std::any_of(outs.begin(), outs.end(),
+                      [&](const BaseOut& o) { return images[o.image].real_mode; }))
+      {
+        // Real-mode slot: physical pcs, MSR.IR clear only (the exception vectors).
+        file << "    if (!(s->msr & 0x20u)) {\n";
+        file << "        idx = (s->pc - aot_active_image_real.base) >> 2;\n";
+        file << "        if (idx < aot_active_image_real.size) {\n";
+        file << "            AOTBlockFunc fn = aot_active_image_real.table[idx];\n";
+        file << "            if (fn) { [[clang::musttail]] return fn(s); }\n        }\n    }\n";
       }
       file << "    [[clang::musttail]] return aot_interpreter_single_step(s);\n}\n\n";
       file << fmt::format("AOTBlockFunc {}_lookup_block(uint32_t pc) {{ return "

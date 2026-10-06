@@ -31,7 +31,10 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
 // Trusted multi-image translation of the same CFG: per-image flat tables with
 // no per-block guards, selected at runtime by AotImageTracker (aot_images.h).
 // `selected` restricts emission to those base image ids (empty = all bases).
+// `real_mode_dumps`: raw dumps of physical MEM1 [0, N<=0x3000) holding the OS
+// exception vectors; each distinct one becomes an AOT_IMAGE_REAL_MODE image.
 bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg,
                             const std::string& output, const std::string& prefix,
-                            const std::string& boot_hash, const std::set<size_t>& selected);
+                            const std::string& boot_hash, const std::set<size_t>& selected,
+                            const std::vector<std::string>& real_mode_dumps = {});
 } // namespace DolphinTool

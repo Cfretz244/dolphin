@@ -45,6 +45,12 @@ constexpr u32 MMIO_RANGE_END = 0xCE000000;
 
 namespace
 {
+// Snapshot SPRs beyond LR/CTR/XER (see PPCSnapshot::spr_sys).
+constexpr int kSysSprs[9] = {SPR_SRR0,  SPR_SRR1,  SPR_SPRG0, SPR_SPRG1, SPR_SPRG2,
+                             SPR_SPRG3, SPR_DAR,   SPR_DSISR, SPR_HID0};
+constexpr const char* kSysSprNames[9] = {"SRR0",  "SRR1", "SPRG0", "SPRG1", "SPRG2",
+                                         "SPRG3", "DAR",  "DSISR", "HID0"};
+
 // MEM1 (+ Wii MEM2) treated as one logical shadow image: MEM2 follows MEM1 at
 // offset mem1_size in every shadow/dump buffer. GetExRamSizeReal() reports the
 // retail MEM2 size even on GC — only the allocation is Wii-gated — so key off
@@ -607,6 +613,8 @@ void AotHarness::CaptureSnapshot(PPCSnapshot& snap)
   snap.spr_lr = m_ppc_state.spr[SPR_LR];
   snap.spr_ctr = m_ppc_state.spr[SPR_CTR];
   snap.spr_xer = m_ppc_state.spr[SPR_XER];
+  for (int i = 0; i < 9; i++)
+    snap.spr_sys[i] = m_ppc_state.spr[kSysSprs[i]];
 }
 
 void AotHarness::RestoreSnapshot(const PPCSnapshot& snap)
@@ -629,6 +637,8 @@ void AotHarness::RestoreSnapshot(const PPCSnapshot& snap)
   m_ppc_state.spr[SPR_LR] = snap.spr_lr;
   m_ppc_state.spr[SPR_CTR] = snap.spr_ctr;
   m_ppc_state.spr[SPR_XER] = snap.spr_xer;
+  for (int i = 0; i < 9; i++)
+    m_ppc_state.spr[kSysSprs[i]] = snap.spr_sys[i];
 }
 
 bool AotHarness::CompareSnapshots(const PPCSnapshot& a, const PPCSnapshot& b, u32 block_pc,
@@ -663,6 +673,11 @@ bool AotHarness::CompareSnapshots(const PPCSnapshot& a, const PPCSnapshot& b, u3
     match = false;
   if (a.exceptions != b.exceptions)
     match = false;
+  for (int i = 0; i < 9; i++)
+  {
+    if (a.spr_sys[i] != b.spr_sys[i])
+      match = false;
+  }
 
   return match;
 }
@@ -737,6 +752,12 @@ void AotHarness::LogDivergence(u32 block_pc, u32 num_instr, const PPCSnapshot& p
   if (aot_result.exceptions != interp_result.exceptions)
     fmt::print(log, "  EXCEPTIONS: AOT={:#010x}  INTERP={:#010x}\n", aot_result.exceptions,
                interp_result.exceptions);
+  for (int i = 0; i < 9; i++)
+  {
+    if (aot_result.spr_sys[i] != interp_result.spr_sys[i])
+      fmt::print(log, "  {}: AOT={:#010x}  INTERP={:#010x}  (pre={:#010x})\n", kSysSprNames[i],
+                 aot_result.spr_sys[i], interp_result.spr_sys[i], pre.spr_sys[i]);
+  }
 
   // Disassembly
   fmt::print(log, "\nDISASSEMBLY:\n");
@@ -928,6 +949,8 @@ void AotHarness::RunDiff()
   // Blocks run on both sides but NOT compared because either side raised an
   // exception (they used to be counted as "compared").
   u32 blocks_skipped_exception = 0;
+  // Of blocks_compared: blocks entered with MSR.IR clear (real-mode images).
+  u32 blocks_compared_real = 0;
   u32 blocks_skipped_unknown = 0;
   u32 blocks_skipped_mmio = 0;
   u32 divergence_count = 0;
@@ -995,6 +1018,36 @@ void AotHarness::RunDiff()
       cpu.Break();
       return;
     }
+  }
+
+  // AOT_DIFF_DUMP_LOWMEM=<file>: write physical MEM1 [0, 0x3000) -- the OS's
+  // exception vectors (0x100-0x1700) -- as raw big-endian bytes, right after
+  // the savestate (if any) is applied. Input for `translate --real-mode-image`.
+  if (const char* lowmem_path = std::getenv("AOT_DIFF_DUMP_LOWMEM"); lowmem_path && !reentered)
+  {
+    if (FILE* f = std::fopen(lowmem_path, "wb"))
+    {
+      const size_t written = std::fwrite(guest_ram.mem1, 1, 0x3000, f);
+      std::fclose(f);
+      fmt::print(log, "Dumped physical 0x0-0x3000 ({} bytes) to {}\n", written, lowmem_path);
+    }
+    else
+    {
+      fmt::print(log, "AOT_DIFF_DUMP_LOWMEM: cannot open {}\n", lowmem_path);
+    }
+    std::fflush(log);
+  }
+  // AOT_DIFF_DUMP_RAM=<file>: the whole guest RAM (MEM1, then MEM2 on Wii) at
+  // the same point -- offline analysis of runtime-loaded code (RSO modules).
+  if (const char* ram_path = std::getenv("AOT_DIFF_DUMP_RAM"); ram_path && !reentered)
+  {
+    if (FILE* f = std::fopen(ram_path, "wb"))
+    {
+      DumpGuestRam(guest_ram, f);
+      std::fclose(f);
+      fmt::print(log, "Dumped guest RAM ({} bytes) to {}\n", guest_ram.Total(), ram_path);
+    }
+    std::fflush(log);
   }
 
   while (cpu.GetState() == CPU::State::Running && !s_shutdown_requested.load())
@@ -1467,6 +1520,8 @@ void AotHarness::RunDiff()
       }
 
       blocks_compared++;
+      if (!(pre_snap.msr & 0x20))
+        blocks_compared_real++;
       if (max_blocks > 0 && blocks_compared >= max_blocks)
       {
         fmt::print(log, "\nMax blocks ({}) reached. Stopping.\n", max_blocks);
@@ -1475,6 +1530,7 @@ void AotHarness::RunDiff()
                    "Divergences: {} | Skipped (exception): {}\n",
                    blocks_compared, blocks_skipped_unknown, blocks_skipped_mmio, divergence_count,
                    blocks_skipped_exception);
+        fmt::print(log, "Real-mode (MSR.IR=0) blocks compared: {}\n", blocks_compared_real);
         std::fflush(log);
         if (log != stdout)
           std::fclose(log);
@@ -1510,6 +1566,7 @@ void AotHarness::RunDiff()
              "Skipped (exception): {}\n",
              blocks_compared, blocks_skipped_unknown, blocks_skipped_mmio, divergence_count,
              blocks_skipped_exception);
+  fmt::print(log, "Real-mode (MSR.IR=0) blocks compared: {}\n", blocks_compared_real);
   std::fflush(log);
   if (log != stdout)
     std::fclose(log);

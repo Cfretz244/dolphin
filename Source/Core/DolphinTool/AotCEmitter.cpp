@@ -263,7 +263,7 @@ void AOTCEmitter::SbFinishSegment(std::string& out, size_t start)
   std::string prefix;
   if (seg.find("&aot_fm") != std::string::npos && !m_sb_fm_used)
   {
-    prefix += "aot_fm=aot_fast_mem; ";
+    prefix += fmt::format("aot_fm={}; ", FastMemSource());
     m_sb_fm_used = true;
   }
 
@@ -595,7 +595,8 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
     out.insert(out.find('\n') + 1, decl);
   }
   else if (out.find("&aot_fm") != std::string::npos)
-    out.insert(out.find('\n') + 1, "    const AotFastMem aot_fm=aot_fast_mem;\n");
+    out.insert(out.find('\n') + 1,
+               fmt::format("    const AotFastMem aot_fm={};\n", FastMemSource()));
 
   out += "}\n";
   return out;
@@ -1703,7 +1704,10 @@ void AOTCEmitter::EmitBranchTo(std::string& out, u32 target, u32 current_pc,
 
 void AOTCEmitter::EmitIndirectDispatch(std::string& out)
 {
-  if (m_guarded_images)
+  // Real-mode blocks: an indirect exit is almost always rfi back to virtual
+  // code, and this image's table is only valid while MSR.IR is clear, so let
+  // the shared dispatch (which tests MSR.IR) pick the slot.
+  if (m_guarded_images || m_real_mode)
   {
     out += fmt::format("    [[clang::musttail]] return {}_dispatch(s);\n", m_prefix);
     return;

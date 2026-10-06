@@ -139,6 +139,11 @@ int AotCommand(const std::vector<std::string>& args)
   parser.add_option("--images")
       .action("store")
       .help("For --dol-images CFGs: comma-separated base image ids to emit (default: all)");
+  parser.add_option("--real-mode-image")
+      .action("store")
+      .help("For --dol-images CFGs: comma-separated raw dumps of physical MEM1 [0, N<=0x3000) "
+            "(dolphin-tool diff with AOT_DIFF_DUMP_LOWMEM=<file>); translates the OS exception "
+            "vectors found there as real-mode images (MSR.IR=DR=0)");
 
   const optparse::Values options = parser.parse_args(args);
 
@@ -235,8 +240,25 @@ int AotCommand(const std::vector<std::string>& args)
         pos = comma + 1;
       }
     }
+    std::vector<std::string> real_mode_dumps;
+    if (options.is_set("real_mode_image"))
+    {
+      const std::string list = options["real_mode_image"];
+      size_t pos = 0;
+      while (pos <= list.size())
+      {
+        const size_t comma = list.find(',', pos);
+        const std::string item =
+            list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        if (!item.empty())
+          real_mode_dumps.push_back(item);
+        if (comma == std::string::npos)
+          break;
+        pos = comma + 1;
+      }
+    }
     return TranslateTrustedImages(*volume, cfg_path, output_dir, prefix, dol_sha256_hex,
-                                  selected) ?
+                                  selected, real_mode_dumps) ?
                EXIT_SUCCESS : EXIT_FAILURE;
   }
 

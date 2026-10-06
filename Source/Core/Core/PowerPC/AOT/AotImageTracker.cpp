@@ -15,6 +15,7 @@
 extern "C" {
 AotActiveImage aot_active_image = {0, 0, nullptr};
 AotActiveImage aot_active_image_aux = {0, 0, nullptr};
+AotActiveImage aot_active_image_real = {0, 0, nullptr};
 static uint64_t s_idle_generation = 0;
 const uint64_t* aot_images_generation = &s_idle_generation;
 uint64_t aot_images_seen = 0;
@@ -28,6 +29,7 @@ const AotImageDesc* s_images = nullptr;
 u32 s_image_count = 0;
 const AotImageDesc* s_active = nullptr;
 const AotImageDesc* s_active_aux = nullptr;
+const AotImageDesc* s_active_real = nullptr;
 u32 s_active_mask = 0;
 bool s_active_mask_valid = true;
 u64 s_forced_generation = 0;  // added to the cache counter by MarkDirty()
@@ -131,14 +133,26 @@ void Rescan()
 
   const AotImageDesc* selected = nullptr;
   const AotImageDesc* aux = nullptr;
+  const AotImageDesc* real = nullptr;
   for (u32 i = 0; i < s_image_count && ram; i++)
   {
-    const bool auxiliary = (s_images[i].flags & AOT_IMAGE_AUXILIARY) != 0;
-    if ((auxiliary ? aux : selected) != nullptr)
+    const AotImageDesc*& slot = (s_images[i].flags & AOT_IMAGE_REAL_MODE) ? real :
+                                (s_images[i].flags & AOT_IMAGE_AUXILIARY) ? aux :
+                                                                            selected;
+    if (slot != nullptr)
       continue;
     if (ImageMatches(s_images[i], ram, ram_size))
-      (auxiliary ? aux : selected) = &s_images[i];
+      slot = &s_images[i];
   }
+  if (real != s_active_real)
+  {
+    INFO_LOG_FMT(AOT, "AotImageTracker: real-mode image {}", real ? real->name : "none");
+    s_active_real = real;
+  }
+  if (real)
+    aot_active_image_real = {real->base, real->size, real->table};
+  else
+    aot_active_image_real = {0, 0, nullptr};
   if (aux != s_active_aux)
   {
     INFO_LOG_FMT(AOT, "AotImageTracker: auxiliary image {}", aux ? aux->name : "none");
@@ -187,10 +201,12 @@ void Init(const AotImageDesc* images, u32 count)
   s_image_count = count;
   s_active = nullptr;
   s_active_aux = nullptr;
+  s_active_real = nullptr;
   s_active_mask = 0;
   s_active_mask_valid = true;
   aot_active_image = {0, 0, nullptr};
   aot_active_image_aux = {0, 0, nullptr};
+  aot_active_image_real = {0, 0, nullptr};
   if (count == 0)
   {
     aot_images_generation = &s_idle_generation;
@@ -205,9 +221,12 @@ void Init(const AotImageDesc* images, u32 count)
   for (u32 i = 0; i < count; i++)
   {
     INFO_LOG_FMT(AOT, "  image {}: '{}' {:#010x}+{:#x} words, {} discriminators, {} patch sites, "
-                      "{} overrides",
+                      "{} overrides{}",
                  i, images[i].name, images[i].base, images[i].size * 4, images[i].word_count,
-                 images[i].patch_count, images[i].override_count);
+                 images[i].patch_count, images[i].override_count,
+                 (images[i].flags & AOT_IMAGE_REAL_MODE) ? " (real mode)" :
+                 (images[i].flags & AOT_IMAGE_AUXILIARY) ? " (auxiliary)" :
+                                                           "");
   }
 }
 
@@ -217,8 +236,10 @@ void Shutdown()
   s_image_count = 0;
   s_active = nullptr;
   s_active_aux = nullptr;
+  s_active_real = nullptr;
   aot_active_image = {0, 0, nullptr};
   aot_active_image_aux = {0, 0, nullptr};
+  aot_active_image_real = {0, 0, nullptr};
   aot_images_generation = &s_idle_generation;
   aot_images_seen = s_idle_generation;
 }
@@ -239,10 +260,23 @@ extern "C" void aot_images_rescan(void)
   AotImageTracker::Rescan();
 }
 
+// Real-mode images only serve instruction fetches with MSR.IR clear (their
+// table is indexed by physical pc); the generated dispatch makes the same test.
+static bool InstructionRelocationOff()
+{
+  return !Core::System::GetInstance().GetPPCState().msr.IR;
+}
+
 extern "C" AOTBlockFunc aot_images_lookup(uint32_t pc)
 {
   if (*aot_images_generation != aot_images_seen)
     aot_images_rescan();
+  if (aot_active_image_real.size && InstructionRelocationOff())
+  {
+    const u32 real_idx = (pc - aot_active_image_real.base) >> 2;
+    return real_idx < aot_active_image_real.size ? aot_active_image_real.table[real_idx] :
+                                                   nullptr;
+  }
   const u32 idx = (pc - aot_active_image.base) >> 2;
   if (idx < aot_active_image.size)
     return aot_active_image.table[idx];
@@ -258,7 +292,9 @@ extern "C" uint32_t aot_images_block_size(uint32_t pc)
   if (*aot_images_generation != aot_images_seen)
     aot_images_rescan();
   const AotImageDesc* image = s_active;
-  if (image && (pc - image->base) >> 2 >= image->size)
+  if (s_active_real && InstructionRelocationOff())
+    image = s_active_real;
+  else if (image && (pc - image->base) >> 2 >= image->size)
     image = s_active_aux;
   if (!image)
     return 0;
