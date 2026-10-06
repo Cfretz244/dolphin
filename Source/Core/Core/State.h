@@ -98,6 +98,11 @@ void Load(Core::System& system, int slot);
 void SaveAs(Core::System& system, std::string filename);
 void LoadAs(Core::System& system, std::string filename);
 
+// Synchronous load for tools (the AOT diff harness): must be called on the CPU thread, never
+// queues, and reports the outcome instead of only posting an OSD message. On failure the
+// pre-load state is restored and `error` (if non-null) names the reason.
+bool LoadAsAndReport(Core::System& system, const std::string& filename, std::string* error);
+
 void LoadLastSaved(Core::System& system, int i = 1);
 void SaveFirstSaved(Core::System& system);
 void UndoSaveState(Core::System& system);

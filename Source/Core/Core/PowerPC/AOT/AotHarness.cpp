@@ -903,11 +903,20 @@ void AotHarness::RunDiff()
   const GuestRam guest_ram = GetGuestRam(memory);
   const u32 shadow_size = guest_ram.Total();
 
+  if (m_diff_concluded)
+  {
+    // The diff already finished and queued Core::Stop; never reopen (truncate) the log.
+    cpu.Break();
+    return;
+  }
+  const bool reentered = m_diff_entered;
+  m_diff_entered = true;
+
   const std::string log_path = Config::Get(Config::MAIN_DEBUG_AOT_DIFF_LOG_PATH);
   FILE* log = stdout;
   if (!log_path.empty())
   {
-    log = std::fopen(log_path.c_str(), "w");
+    log = std::fopen(log_path.c_str(), reentered ? "a" : "w");
     if (!log)
     {
       ERROR_LOG_FMT(AOT, "AOTDiff: Cannot open log file: {}", log_path);
@@ -916,6 +925,9 @@ void AotHarness::RunDiff()
   }
 
   u32 blocks_compared = 0;
+  // Blocks run on both sides but NOT compared because either side raised an
+  // exception (they used to be counted as "compared").
+  u32 blocks_skipped_exception = 0;
   u32 blocks_skipped_unknown = 0;
   u32 blocks_skipped_mmio = 0;
   u32 divergence_count = 0;
@@ -923,6 +935,12 @@ void AotHarness::RunDiff()
   u32 last_status_visits = 0;
   constexpr u32 STATUS_INTERVAL = 5000;  // Print status every N block visits
 
+  if (reentered)
+  {
+    fmt::print(log, "\n=== RunDiff re-entered (CPU loop paused/resumed); counters restart, "
+                    "savestate NOT reloaded ===\n");
+    fmt::print(stderr, "AOTDiff: RunDiff re-entered (CPU loop paused/resumed)\n");
+  }
   fmt::print(log, "AOT Diff Harness — {} mode\n", self_diff ? "self-diff" : "AOT-vs-interpreter");
   fmt::print(log, "Block boundaries loaded: {}\n", m_block_sizes.size());
   if (m_image_block_size)
@@ -933,14 +951,50 @@ void AotHarness::RunDiff()
 
   // Load savestate if specified — allows comparing battle code, not just boot code
   const std::string savestate_path = Config::Get(Config::MAIN_DEBUG_AOT_DIFF_SAVESTATE_PATH);
-  if (!savestate_path.empty())
+  if (!savestate_path.empty() && !reentered)
   {
     fmt::print(log, "Loading savestate: {}\n", savestate_path);
     std::fflush(log);
-    // State::LoadAs auto-detects CPU thread and executes synchronously
-    State::LoadAs(m_system, savestate_path);
-    fmt::print(log, "Savestate loaded. PC = {:#010x}\n\n", m_ppc_state.pc);
+    const u64 ticks_before = core_timing.GetTicks();
+    const u32 pc_before = m_ppc_state.pc;
+    fmt::print(stderr,
+               "AOTDiff: pre-load  cpu_thread={} running={} cpu_state={} PC={:#010x} ticks={}\n",
+               Core::IsCPUThread(), Core::IsRunning(m_system), static_cast<int>(cpu.GetState()),
+               pc_before, ticks_before);
+    std::string load_error;
+    const bool loaded = State::LoadAsAndReport(m_system, savestate_path, &load_error);
+    const u64 ticks_after = core_timing.GetTicks();
+    // AOT blocks and the interpreter execute on the same PowerPCState (AOTState is a view
+    // of it), so one read covers both cores; print both views to make that visible.
+    const auto* ast = reinterpret_cast<const AOTState*>(&m_ppc_state);
+    fmt::print(log,
+               "Savestate {}. PC = {:#010x} MSR = {:#010x} r3 = {:#010x} LR = {:#010x} "
+               "ticks {} -> {}\n"
+               "  AOT view: PC = {:#010x} r3 = {:#010x}\n\n",
+               loaded ? "loaded" : "LOAD FAILED", m_ppc_state.pc, m_ppc_state.msr.Hex,
+               m_ppc_state.gpr[3], LR(m_ppc_state), ticks_before, ticks_after, ast->pc,
+               ast->gpr[3]);
     std::fflush(log);
+    fmt::print(stderr, "AOTDiff: savestate {} -- PC {:#010x} -> {:#010x}, ticks {} -> {}{}{}\n",
+               loaded ? "loaded" : "LOAD FAILED", pc_before, m_ppc_state.pc, ticks_before,
+               ticks_after, loaded ? "" : ": ", load_error);
+    // A savestate taken mid-game always carries a later timebase than a fresh boot; if the
+    // tick counter did not move forward the run would silently diff boot code instead.
+    if (!loaded || ticks_after <= ticks_before)
+    {
+      fmt::print(log, "\nSAVESTATE NOT APPLIED ({}). Refusing to diff from boot.\n",
+                 loaded ? "timebase did not advance" : load_error);
+      fmt::print(log, "\nEmulation stopped.\nBlocks compared: 0 | Skipped (unknown): 0 | "
+                      "Skipped (MMIO): 0 | Divergences: 0 | SAVESTATE_FAILED\n");
+      std::fflush(log);
+      if (log != stdout)
+        std::fclose(log);
+      fmt::print(stderr, "AOTDiff: SAVESTATE NOT APPLIED -- stopping.\n");
+      m_diff_concluded = true;
+      Core::QueueHostJob([](Core::System& sys) { Core::Stop(sys); });
+      cpu.Break();
+      return;
+    }
   }
 
   while (cpu.GetState() == CPU::State::Running && !s_shutdown_requested.load())
@@ -964,10 +1018,12 @@ void AotHarness::RunDiff()
         u32 fifo_wptr = m_system.GetProcessorInterface().m_fifo_cpu_write_pointer;
         u32 fifo_base = m_system.GetProcessorInterface().m_fifo_cpu_base;
         fmt::print(stderr,
-          "[{:>8}] cmp={} mmio={} unk={} skip={} div={} | "
+          "[{:>8}] cmp={} exc={} mmio={} unk={} skip={} div={} | "
           "XFB={:#010x}/{:#010x} FIFO base={:#010x} wptr={:#010x} dist={} PC={:#010x}\n",
-          total_block_visits, blocks_compared, blocks_skipped_mmio,
-          blocks_skipped_unknown, total_block_visits - blocks_compared - blocks_skipped_mmio - blocks_skipped_unknown,
+          total_block_visits, blocks_compared, blocks_skipped_exception, blocks_skipped_mmio,
+          blocks_skipped_unknown,
+          total_block_visits - blocks_compared - blocks_skipped_exception - blocks_skipped_mmio -
+              blocks_skipped_unknown,
           divergence_count,
           xfb_top, xfb_bot, fifo_base, fifo_wptr, fifo_dist, m_ppc_state.pc);
       }
@@ -1262,6 +1318,7 @@ void AotHarness::RunDiff()
           std::fflush(log);
           if (divergence_count >= max_divergences)
           {
+            m_diff_concluded = true;
             Core::QueueHostJob([](Core::System& sys) { Core::Stop(sys); });
             cpu.Break();
             return;
@@ -1325,7 +1382,7 @@ void AotHarness::RunDiff()
           m_ppc_state.npc = m_ppc_state.pc;
           power_pc.CheckExceptions();
         }
-        blocks_compared++;
+        blocks_skipped_exception++;
         continue;
       }
 
@@ -1374,6 +1431,7 @@ void AotHarness::RunDiff()
           std::fflush(log);
           if (log != stdout)
             std::fclose(log);
+          m_diff_concluded = true;
           Core::QueueHostJob([](Core::System& sys) { Core::Stop(sys); });
           cpu.Break();
           return;
@@ -1411,14 +1469,16 @@ void AotHarness::RunDiff()
         fmt::print(log, "\nMax blocks ({}) reached. Stopping.\n", max_blocks);
         fmt::print(log,
                    "Blocks compared: {} | Skipped (unknown): {} | Skipped (MMIO): {} | "
-                   "Divergences: {}\n",
-                   blocks_compared, blocks_skipped_unknown, blocks_skipped_mmio, divergence_count);
+                   "Divergences: {} | Skipped (exception): {}\n",
+                   blocks_compared, blocks_skipped_unknown, blocks_skipped_mmio, divergence_count,
+                   blocks_skipped_exception);
         std::fflush(log);
         if (log != stdout)
           std::fclose(log);
         // Same shutdown as the max-divergences path: without the queued
         // Core::Stop, Core stays Running and DiffCommand's wait loop spins
         // forever after "Stopping." is printed.
+        m_diff_concluded = true;
         Core::QueueHostJob([](Core::System& sys) { Core::Stop(sys); });
         cpu.Break();
         return;
@@ -1443,8 +1503,10 @@ void AotHarness::RunDiff()
 
   fmt::print(log, "\nEmulation stopped.\n");
   fmt::print(log,
-             "Blocks compared: {} | Skipped (unknown): {} | Skipped (MMIO): {} | Divergences: {}\n",
-             blocks_compared, blocks_skipped_unknown, blocks_skipped_mmio, divergence_count);
+             "Blocks compared: {} | Skipped (unknown): {} | Skipped (MMIO): {} | Divergences: {} | "
+             "Skipped (exception): {}\n",
+             blocks_compared, blocks_skipped_unknown, blocks_skipped_mmio, divergence_count,
+             blocks_skipped_exception);
   std::fflush(log);
   if (log != stdout)
     std::fclose(log);

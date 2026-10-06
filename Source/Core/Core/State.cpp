@@ -4,6 +4,7 @@
 #include "Core/State.h"
 
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <locale>
 #include <map>
@@ -885,6 +886,61 @@ void LoadAs(Core::System& system, std::string filename)
   Core::RunOnCPUThread(system, [&system, filename = std::move(filename)]() mutable {
     LoadAsFromCore(system, std::move(filename));
   });
+}
+
+bool LoadAsAndReport(Core::System& system, const std::string& filename, std::string* error)
+{
+  const auto fail = [error](std::string why) {
+    if (error)
+      *error = std::move(why);
+    return false;
+  };
+
+  if (!Core::IsCPUThread())
+    return fail("not called on the CPU thread");
+  if (!CheckIfStateLoadIsAllowed(system))
+    return fail("state loads are not allowed now (core not running/starting, netplay, or "
+                "hardcore mode)");
+
+  s_compress_and_dump_thread.WaitForCompletion();
+
+  {
+    File::IOFile f(filename, "rb");
+    if (!f.IsOpen())
+      return fail("cannot open the state file");
+    StateHeader header;
+    if (!ReadStateHeaderFromFile(header, f))
+      return fail("cannot read the state header");
+    const std::string running_id = SConfig::GetInstance().GetGameID();
+    const std::string state_id{header.legacy_header.game_id,
+                               strnlen(header.legacy_header.game_id,
+                                       std::size(header.legacy_header.game_id))};
+    if (running_id.compare(0, 6, state_id) != 0)
+      return fail(fmt::format("state belongs to game {} but {} is running", state_id, running_id));
+    if (header.version_header.version_cookie - COOKIE_BASE != STATE_VERSION)
+    {
+      return fail(fmt::format("state version {} ({}) != this build's {}",
+                              header.version_header.version_cookie - COOKIE_BASE,
+                              header.version_string, STATE_VERSION));
+    }
+  }
+
+  Common::UniqueBuffer<u8> buffer;
+  LoadFileStateData(filename, buffer);
+  if (buffer.empty())
+    return fail("state payload could not be read/decompressed (see log)");
+
+  SaveToBuffer(system, s_undo_load_buffer);
+  if (!LoadFromBuffer(system, buffer))
+  {
+    UndoLoadState(system);
+    return fail("DoState rejected the state (Wii/GC mode, memory size or section-marker "
+                "mismatch; the panic text is in the MASTER log) -- pre-load state restored");
+  }
+
+  if (s_on_after_load_callback)
+    s_on_after_load_callback();
+  return true;
 }
 
 void SetOnAfterLoadCallback(AfterLoadCallbackFunc callback)

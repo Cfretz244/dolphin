@@ -93,6 +93,19 @@ if(MSVC)
   target_link_libraries(dolphin-tool PRIVATE use_pch)
 endif()
 
+# macOS: a bare (non-bundle) dolphin-tool resolves Sys at <exe dir>/Contents/Resources/Sys
+# (GetBundleDirectory falls back to the executable's directory). Without it `diff --savestate`
+# silently fails to load any state that used DSP-HLE resampling coefficients (dsp_coef.bin
+# missing -> AX DoState aborts the load) and boots without Sys/GameSettings. Point that path
+# at the source tree's Data/Sys.
+if(APPLE AND NOT DOLPHIN_IOS_BUILD)
+  add_custom_command(TARGET dolphin-tool POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:dolphin-tool>/Contents/Resources"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "${CMAKE_SOURCE_DIR}/Data/Sys"
+            "$<TARGET_FILE_DIR:dolphin-tool>/Contents/Resources/Sys"
+    VERBATIM)
+endif()
+
 set(CPACK_PACKAGE_EXECUTABLES ${CPACK_PACKAGE_EXECUTABLES} dolphin-tool)
 install(TARGETS dolphin-tool RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 

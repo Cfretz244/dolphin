@@ -22,6 +22,7 @@
 #include <unordered_map>
 
 #include "Common/CommonTypes.h"
+#include "Common/FileUtil.h"
 #include "Common/ScopeGuard.h"
 #include "Common/WindowSystemInfo.h"
 #include "Core/Boot/Boot.h"
@@ -125,6 +126,16 @@ int DiffCommand(const std::vector<std::string>& args)
   // Initialize UICommon (config system, video backend)
   UICommon::SetUserDirectory(options.is_set("user") ? std::string(options["user"]) : "");
   UICommon::Init();
+
+  // Without the Sys data dir a savestate whose DSP-HLE state carries resampling
+  // coefficients cannot be loaded (dsp_coef.bin), and GameSettings are skipped.
+  if (!File::IsDirectory(File::GetSysDirectory()))
+  {
+    fmt::println(std::cerr, "Error: Sys directory not found at {} (rebuild dolphin-tool: its "
+                            "POST_BUILD step links it to Data/Sys)",
+                 File::GetSysDirectory());
+    return EXIT_FAILURE;
+  }
 
   // Headless WSI — no window, null video backend
   WindowSystemInfo wsi;

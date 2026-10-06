@@ -120,4 +120,10 @@ private:
 
   // Full emulator state buffer for diff mode (saves all HW registers too)
   std::vector<u8> m_state_buffer;
+
+  // RunDiff is re-entered whenever the CPU loop is paused and resumed (e.g. by
+  // Core::Stop's PauseAndLock after the diff finished). A re-entry must not
+  // truncate the log or re-load the savestate; once concluded it only breaks.
+  bool m_diff_entered = false;
+  bool m_diff_concluded = false;
 };
