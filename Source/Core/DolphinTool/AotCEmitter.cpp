@@ -4,6 +4,10 @@
 #include "DolphinTool/AotCEmitter.h"
 
 #include <bitset>
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
+#include <unordered_set>
 
 #include <fmt/format.h>
 
@@ -30,6 +34,7 @@ AOTCEmitter::AOTCEmitter(const PPCMemoryImage& memory, std::set<u32> known_block
                          std::string prefix)
     : m_memory(memory), m_known_blocks(std::move(known_blocks)), m_prefix(std::move(prefix))
 {
+  m_superblocks = std::getenv("AOT_NO_SUPERBLOCKS") == nullptr;
 }
 
 void AOTCEmitter::SetModuleMode(const ModuleMode* mode, std::set<u32> module_blocks)
@@ -112,6 +117,411 @@ void AOTCEmitter::SetInlineHints(std::unordered_map<u32, u32> block_sizes,
   m_inline_targets = std::move(inline_targets);
 }
 
+// ============================================================================
+// Superblock register cache (see AotCEmitter.h). Every instruction's text
+// starts at function-body scope and text order is dominance order (exits are
+// forward side exits; loops cross a musttail), so "registers defined in text
+// emitted so far" is a sound superset of the dirty set at any point, and a
+// load placed at the start of the first segment that names a register
+// dominates every later use. Writing back a clean local is harmless: locals
+// always hold the architectural value.
+// ============================================================================
+
+void AOTCEmitter::SbReset()
+{
+  m_sb_gpr_used.reset();
+  m_sb_gpr_dirty.reset();
+  m_sb_cr_used.reset();
+  m_sb_cr_dirty.reset();
+  m_sb_lr_used = m_sb_lr_dirty = false;
+  m_sb_ctr_used = m_sb_ctr_dirty = false;
+  m_sb_fm_used = false;
+}
+
+std::string AOTCEmitter::SbWriteBack() const
+{
+  std::string wb;
+  for (u32 r = 0; r < 32; r++)
+    if (m_sb_gpr_dirty[r])
+      wb += fmt::format("s->gpr[{0}]=_g{0}; ", r);
+  for (u32 f = 0; f < 8; f++)
+    if (m_sb_cr_dirty[f])
+      wb += fmt::format("s->cr_fields[{0}]=_c{0}; ", f);
+  if (m_sb_lr_dirty)
+    wb += "s->spr[8]=_lr; ";
+  if (m_sb_ctr_dirty)
+    wb += "s->spr[9]=_ctr; ";
+  return wb;
+}
+
+std::string AOTCEmitter::SbReloadUsed() const
+{
+  std::string rl;
+  for (u32 r = 0; r < 32; r++)
+    if (m_sb_gpr_used[r])
+      rl += fmt::format("_g{0}=s->gpr[{0}]; ", r);
+  for (u32 f = 0; f < 8; f++)
+    if (m_sb_cr_used[f])
+      rl += fmt::format("_c{0}=s->cr_fields[{0}]; ", f);
+  if (m_sb_lr_used)
+    rl += "_lr=s->spr[8]; ";
+  if (m_sb_ctr_used)
+    rl += "_ctr=s->spr[9]; ";
+  return rl;
+}
+
+namespace
+{
+enum class SbHelperKind
+{
+  Safe,       // touches no GPR/CR/LR/CTR through AOTState memory
+  ReadsRegs,  // reads them from memory (needs a write-back first)
+  Barrier,    // may write them in memory, or unknown: memory-form text + reload
+};
+
+bool StartsWith(const std::string& s, size_t pos, const char* lit)
+{
+  return s.compare(pos, std::strlen(lit), lit) == 0;
+}
+
+bool EndsWith(const std::string& s, const char* lit)
+{
+  const size_t n = std::strlen(lit);
+  return s.size() >= n && s.compare(s.size() - n, n, lit) == 0;
+}
+
+SbHelperKind ClassifyHelper(const std::string& name, bool psq_protocol_segment)
+{
+  static const std::unordered_set<std::string> safe = {
+      "aot_rotl", "aot_rotation_mask", "aot_fpu_available", "aot_mtmsr_fast",
+      "aot_mfspr_special", "aot_mtspr_special", "aot_sc", "aot_twi", "aot_rfi", "aot_dcbz",
+      "aot_dcbz_l", "aot_dcbt", "aot_icbi", "aot_idle", "aot_sr_updated", "aot_mftb",
+      "aot_convert_to_double_fast", "aot_convert_to_single_fast", "aot_cmp_signed_v",
+      "aot_cmp_unsigned_v", "aot_cr_bit_v", "aot_cr_field_v", "aot_mtfsf", "aot_mtfsfi"};
+  static const std::unordered_set<std::string> reads = {"aot_mfcr", "aot_psq_l_fast",
+                                                        "aot_psq_st_fast"};
+  // EmitPsqFast's register-cache form: the fast path touches no GPR, and the
+  // fallback is bracketed by explicit AOT_GPR_MEM write-back/reload of its base.
+  static const std::unordered_set<std::string> psq_protocol = {
+      "aot_psq_l_try", "aot_psq_st_try", "aot_psq_l", "aot_psq_st", "aot_psq_lu", "aot_psq_stu"};
+  static const std::unordered_set<std::string> barrier = {
+      "aot_fcmpu",    "aot_fcmpo",    "aot_ps_cmpu0", "aot_ps_cmpo0", "aot_ps_cmpu1",
+      "aot_ps_cmpo1", "aot_mcrfs",    "aot_mtcrf",    "aot_cr_logical"};
+  if (safe.contains(name) || (psq_protocol_segment && psq_protocol.contains(name)))
+    return SbHelperKind::Safe;
+  if (reads.contains(name))
+    return SbHelperKind::ReadsRegs;
+  if (barrier.contains(name) || name.starts_with("aot_psq"))
+    return SbHelperKind::Barrier;
+  // Memory helpers take values; FP/PS helpers only touch ps[]/fpscr (their
+  // interpreter instructions are built with Rc=0, so no CR1 update).
+  if (EndsWith(name, "_fm") || name.starts_with("aot_f") || name.starts_with("aot_ps_"))
+    return SbHelperKind::Safe;
+  return SbHelperKind::Barrier;
+}
+
+bool IsIdentChar(char c)
+{
+  return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+}  // namespace
+
+void AOTCEmitter::SbFinishSegment(std::string& out, size_t start)
+{
+  if (!m_superblocks || start >= out.size())
+    return;
+  const std::string seg = out.substr(start);
+
+  // Classify the helpers this instruction calls.
+  SbHelperKind kind = SbHelperKind::Safe;
+  const bool psq_protocol_segment = seg.find("_try(s,&aot_fm,") != std::string::npos;
+  for (size_t pos = seg.find("aot_"); pos != std::string::npos; pos = seg.find("aot_", pos + 1))
+  {
+    if (pos > 0 && IsIdentChar(seg[pos - 1]))
+      continue;
+    size_t end = pos;
+    while (end < seg.size() && IsIdentChar(seg[end]))
+      end++;
+    if (end >= seg.size() || seg[end] != '(')
+      continue;  // aot_fm, aot_fast_mem, aot_single_block_mode, ...
+    const std::string name = seg.substr(pos, end - pos);
+    if (name == "aot_cmp_signed" || name == "aot_cmp_unsigned" || name == "aot_cr_get_bit" ||
+        name == "aot_cr_set_field")
+      continue;  // rewritten to value forms below
+    const SbHelperKind k = ClassifyHelper(name, psq_protocol_segment);
+    if (static_cast<int>(k) > static_cast<int>(kind))
+      kind = k;
+  }
+  // lmw/stmw index s->gpr[] with a loop variable: keep them in memory form.
+  for (size_t pos = seg.find("s->gpr["); pos != std::string::npos;
+       pos = seg.find("s->gpr[", pos + 1))
+  {
+    if (!std::isdigit(static_cast<unsigned char>(seg[pos + 7])))
+      kind = SbHelperKind::Barrier;
+  }
+
+  std::string prefix;
+  if (seg.find("&aot_fm") != std::string::npos && !m_sb_fm_used)
+  {
+    prefix += "aot_fm=aot_fast_mem; ";
+    m_sb_fm_used = true;
+  }
+
+  // Barrier form: the text keeps addressing AOTState memory. Make memory
+  // current, run it, then refresh every local named so far.
+  const auto emit_barrier = [&] {
+    const std::string wb = SbWriteBack();
+    m_sb_gpr_dirty.reset();
+    m_sb_cr_dirty.reset();
+    m_sb_lr_dirty = m_sb_ctr_dirty = false;
+    const std::string rl = SbReloadUsed();
+    out.resize(start);
+    if (!prefix.empty() || !wb.empty())
+      out += "    " + prefix + wb + "\n";
+    out += seg;
+    if (!rl.empty())
+      out += "    " + rl + "\n";
+  };
+  if (kind == SbHelperKind::Barrier)
+  {
+    emit_barrier();
+    return;
+  }
+
+  // Rewrite register references to locals.
+  std::string r;
+  r.reserve(seg.size() + 64);
+  std::bitset<32> gpr_ref;
+  std::bitset<8> cr_ref;
+  bool lr_ref = false, ctr_ref = false;
+  auto read_num = [&](size_t pos, size_t* end) {
+    u32 v = 0;
+    size_t e = pos;
+    while (e < seg.size() && std::isdigit(static_cast<unsigned char>(seg[e])))
+      v = v * 10 + u32(seg[e++] - '0');
+    *end = e;
+    return v;
+  };
+  for (size_t i = 0; i < seg.size();)
+  {
+    size_t e;
+    if (StartsWith(seg, i, "s->gpr["))
+    {
+      const u32 n = read_num(i + 7, &e);
+      r += fmt::format("_g{}", n);
+      gpr_ref[n] = true;
+      i = e + 1;  // skip ']'
+    }
+    else if (StartsWith(seg, i, "s->spr[8]"))
+    {
+      r += "_lr";
+      lr_ref = true;
+      i += 9;
+    }
+    else if (StartsWith(seg, i, "s->spr[9]"))
+    {
+      r += "_ctr";
+      ctr_ref = true;
+      i += 9;
+    }
+    else if (StartsWith(seg, i, "s->cr_fields["))
+    {
+      const u32 f = read_num(i + 13, &e);
+      r += fmt::format("_c{}", f);
+      cr_ref[f] = true;
+      i = e + 1;
+    }
+    else if (StartsWith(seg, i, "aot_cmp_signed(s,") || StartsWith(seg, i, "aot_cmp_unsigned(s,"))
+    {
+      const bool sign = StartsWith(seg, i, "aot_cmp_signed(s,");
+      const size_t num = i + (sign ? 17 : 19);
+      const u32 f = read_num(num, &e);
+      r += fmt::format("_c{}=aot_cmp_{}_v(s,", f, sign ? "signed" : "unsigned");
+      cr_ref[f] = true;
+      i = e + 1;  // skip ','
+    }
+    else if (StartsWith(seg, i, "aot_cr_get_bit(s,"))
+    {
+      const u32 b = read_num(i + 17, &e);
+      r += fmt::format("aot_cr_bit_v(_c{},{})", b >> 2, b);
+      cr_ref[b >> 2] = true;
+      i = e + 1;  // skip ')'
+    }
+    else if (StartsWith(seg, i, "aot_cr_set_field(s,"))
+    {
+      const u32 f = read_num(i + 19, &e);
+      r += fmt::format("_c{}=aot_cr_field_v(", f);
+      cr_ref[f] = true;
+      i = e + 1;
+    }
+    else
+    {
+      r += seg[i++];
+    }
+  }
+
+  // Definitions: a local followed by an assignment / ++ / -- operator.
+  std::bitset<32> gpr_def;
+  std::bitset<8> cr_def;
+  bool lr_def = false, ctr_def = false;
+  size_t first_def_pos = std::string::npos;
+  for (size_t i = 0; i < r.size(); i++)
+  {
+    if (r[i] != '_' || (i > 0 && IsIdentChar(r[i - 1])))
+      continue;
+    size_t e = i + 1;
+    while (e < r.size() && IsIdentChar(r[e]))
+      e++;
+    const std::string tok = r.substr(i, e - i);
+    int which = -1;  // 0 gpr, 1 cr, 2 lr, 3 ctr
+    u32 n = 0;
+    if (tok.size() >= 3 && tok[1] == 'g' && std::isdigit(static_cast<unsigned char>(tok[2])))
+    {
+      which = 0;
+      n = u32(std::stoul(tok.substr(2)));
+    }
+    else if (tok.size() == 3 && tok[1] == 'c' && std::isdigit(static_cast<unsigned char>(tok[2])))
+    {
+      which = 1;
+      n = u32(tok[2] - '0');
+    }
+    else if (tok == "_lr")
+      which = 2;
+    else if (tok == "_ctr")
+      which = 3;
+    if (which < 0)
+      continue;
+    size_t k = e;
+    while (k < r.size() && r[k] == ' ')
+      k++;
+    bool def = false;
+    if (k < r.size())
+    {
+      if (r[k] == '=' && (k + 1 >= r.size() || r[k + 1] != '='))
+        def = true;
+      else if (k + 1 < r.size() && ((r[k] == '+' && r[k + 1] == '+') || (r[k] == '-' && r[k + 1] == '-')))
+        def = true;
+      else if (k + 1 < r.size() && std::strchr("+-*/&|^", r[k]) && r[k + 1] == '=')
+        def = true;
+    }
+    if (!def)
+      continue;
+    if (first_def_pos == std::string::npos)
+      first_def_pos = i;
+    if (which == 0)
+      gpr_def[n] = true;
+    else if (which == 1)
+      cr_def[n] = true;
+    else if (which == 2)
+      lr_def = true;
+    else
+      ctr_def = true;
+  }
+
+  // A register-reading helper with a local definition in the same
+  // instruction (mfcr's destination) takes the barrier form: simpler than
+  // ordering the write-back against the definition.
+  if (kind == SbHelperKind::ReadsRegs && first_def_pos != std::string::npos)
+  {
+    emit_barrier();
+    return;
+  }
+
+  // First-use loads (these dominate all later text).
+  for (u32 n = 0; n < 32; n++)
+    if (gpr_ref[n] && !m_sb_gpr_used[n])
+    {
+      prefix += fmt::format("_g{0}=s->gpr[{0}]; ", n);
+      m_sb_gpr_used[n] = true;
+    }
+  for (u32 f = 0; f < 8; f++)
+    if (cr_ref[f] && !m_sb_cr_used[f])
+    {
+      prefix += fmt::format("_c{0}=s->cr_fields[{0}]; ", f);
+      m_sb_cr_used[f] = true;
+    }
+  if (lr_ref && !m_sb_lr_used)
+  {
+    prefix += "_lr=s->spr[8]; ";
+    m_sb_lr_used = true;
+  }
+  if (ctr_ref && !m_sb_ctr_used)
+  {
+    prefix += "_ctr=s->spr[9]; ";
+    m_sb_ctr_used = true;
+  }
+
+  if (kind == SbHelperKind::ReadsRegs)
+  {
+    prefix += SbWriteBack();
+    m_sb_gpr_dirty.reset();
+    m_sb_cr_dirty.reset();
+    m_sb_lr_dirty = m_sb_ctr_dirty = false;
+  }
+
+  m_sb_gpr_dirty |= gpr_def;
+  m_sb_cr_dirty |= cr_def;
+  m_sb_lr_dirty |= lr_def;
+  m_sb_ctr_dirty |= ctr_def;
+
+  // Every exit writes back the locals defined so far.
+  const std::string wb = SbWriteBack();
+  std::string body;
+  if (wb.empty())
+  {
+    body = std::move(r);
+  }
+  else
+  {
+    body.reserve(r.size() + 128);
+    for (size_t i = 0; i < r.size();)
+    {
+      size_t stmt = std::string::npos;
+      if (StartsWith(r, i, "[[clang::musttail]]"))
+        stmt = i;
+      else if (StartsWith(r, i, "return") && (i == 0 || !IsIdentChar(r[i - 1])) &&
+               (i + 6 >= r.size() || !IsIdentChar(r[i + 6])))
+        stmt = i;
+      if (stmt == std::string::npos)
+      {
+        body += r[i++];
+        continue;
+      }
+      const size_t semi = r.find(';', i);
+      // `{ s->pc=X; return; }`: put the write-back before the pc store so the
+      // stop exit and the following musttail exit of an edge start with the
+      // same stores, which clang hoists above the edge test.
+      size_t pc_stmt = body.rfind("s->pc=");
+      if (pc_stmt != std::string::npos)
+      {
+        const size_t pc_semi = body.find(';', pc_stmt);
+        size_t prev = pc_stmt;
+        while (prev > 0 && body[prev - 1] == ' ')
+          prev--;
+        const bool pc_is_last = pc_semi != std::string::npos &&
+                                body.find_first_not_of(' ', pc_semi + 1) == std::string::npos;
+        if (!pc_is_last || prev == 0 || !std::strchr("{;}", body[prev - 1]))
+          pc_stmt = std::string::npos;
+      }
+      if (pc_stmt != std::string::npos)
+      {
+        body.insert(pc_stmt, "{ " + wb);
+        body += r.substr(i, semi + 1 - i) + " }";
+      }
+      else
+      {
+        body += "{ " + wb + r.substr(i, semi + 1 - i) + " }";
+      }
+      i = semi + 1;
+    }
+  }
+
+  out.resize(start);
+  if (!prefix.empty())
+    out += "    " + prefix + "\n";
+  out += body;
+}
+
 std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bool from_trace,
                                         u32 guard_instructions, const std::string& own_symbol)
 {
@@ -127,6 +537,7 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
                      section, own_symbol.empty() ? BlockFn(block_addr, false) : own_symbol);
 
   m_guarded_inline_end = 0;
+  SbReset();
   if (m_guarded_images)
   {
     const bool chain = guard_instructions > num_instructions;
@@ -145,12 +556,45 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
       (!m_module && !m_guarded_images && IsBusyWaitLoop(block_addr, num_instructions)) ?
           block_addr : 0;
   EmitBlockBody(out, block_addr, num_instructions);
+  if (m_superblocks)
+  {
+    // A body whose fall-through leaves the function (unknown next block) ends
+    // by falling off the end: write the cache back there too.
+    const std::string wb = SbWriteBack();
+    if (!wb.empty())
+      out += "    " + wb + "\n";
+  }
 
   // Memory ops go through the `_fm` helpers, which read the RAM descriptor
   // from a per-function local copy (see aot_runtime.h): clang then keeps
   // ram/size in registers across guest stores instead of reloading the
   // global after each one. aot_fast_mem never changes while a block runs.
-  if (out.find("&aot_fm") != std::string::npos)
+  if (m_superblocks)
+  {
+    // Locals of the register cache; each is assigned at its first-use segment
+    // (SbFinishSegment), and the aot_fm copy likewise at the first memory op,
+    // so early exits pay for neither.
+    std::string decl;
+    for (u32 r = 0; r < 32; r++)
+      if (m_sb_gpr_used[r])
+        decl += fmt::format("{}_g{}", decl.empty() ? "    uint32_t " : ",", r);
+    if (m_sb_lr_used)
+      decl += decl.empty() ? "    uint32_t _lr" : ",_lr";
+    if (m_sb_ctr_used)
+      decl += decl.empty() ? "    uint32_t _ctr" : ",_ctr";
+    if (!decl.empty())
+      decl += ";\n";
+    std::string cdecl;
+    for (u32 f = 0; f < 8; f++)
+      if (m_sb_cr_used[f])
+        cdecl += fmt::format("{}_c{}", cdecl.empty() ? "    uint64_t " : ",", f);
+    if (!cdecl.empty())
+      decl += cdecl + ";\n";
+    if (m_sb_fm_used)
+      decl += "    AotFastMem aot_fm;\n";
+    out.insert(out.find('\n') + 1, decl);
+  }
+  else if (out.find("&aot_fm") != std::string::npos)
     out.insert(out.find('\n') + 1, "    const AotFastMem aot_fm=aot_fast_mem;\n");
 
   out += "}\n";
@@ -236,8 +680,19 @@ void AOTCEmitter::EmitBlockBody(std::string& out, u32 block_addr, u32 num_instru
   m_block_cycle_count = 0;
   m_fpu_checked = false;
 
+  // Each instruction's text is one superblock segment (finished at the end of
+  // the iteration, including the `continue` paths).
+  struct SegmentGuard
+  {
+    AOTCEmitter* self;
+    std::string& out;
+    size_t start;
+    ~SegmentGuard() { self->SbFinishSegment(out, start); }
+  };
+
   for (u32 i = 0; i < num_instructions; i++)
   {
+    SegmentGuard segment{this, out, out.size()};
     u32 pc = block_addr + i * 4;
     auto inst_word = m_memory.ReadInstruction(pc);
     if (!inst_word)
@@ -309,6 +764,7 @@ void AOTCEmitter::EmitBlockBody(std::string& out, u32 block_addr, u32 num_instru
   // This handles: blocks without branches, conditional branches not taken,
   // and any other case where execution falls through.
   {
+    const size_t trailer_start = out.size();
     u32 next_pc = block_addr + num_instructions * 4;
     out += fmt::format("    s->downcount -= {};\n", m_block_cycle_count);
 
@@ -345,6 +801,7 @@ void AOTCEmitter::EmitBlockBody(std::string& out, u32 block_addr, u32 num_instru
               fmt::format("    if(aot_single_block_mode){{ s->pc={}; return; }}\n", PcStr(next_pc));
           out += "#endif\n";
         }
+        SbFinishSegment(out, trailer_start);
         m_inline_depth++;
         m_inline_insts += size_it->second;
         EmitBlockBody(out, next_pc, size_it->second);
@@ -374,6 +831,7 @@ void AOTCEmitter::EmitBlockBody(std::string& out, u32 block_addr, u32 num_instru
     {
       out += fmt::format("    s->pc = {};\n", PcStr(next_pc));
     }
+    SbFinishSegment(out, trailer_start);
   }
 }
 
@@ -1429,6 +1887,24 @@ void AOTCEmitter::EmitPsqFast(std::string& out, UGeckoInstruction inst, bool sto
   }
   const std::string ea = ra ? fmt::format("s->gpr[{}]+(uint32_t)({})", ra, offset) :
                               fmt::format("(uint32_t)({})", offset);
+  if (m_superblocks)
+  {
+    // Register-cache form: the fast path uses the cached base register; only
+    // the fallback helper (which recomputes EA from AOTState and, for the
+    // update forms, writes gpr[ra] there) sees memory, so write the base back
+    // and reload it on that cold path alone. AOT_GPR_MEM is the spelling the
+    // superblock rewriter leaves as a real AOTState access.
+    const char* tryfn = store ? "aot_psq_st_try" : "aot_psq_l_try";
+    const char* slow = store ? (update ? "stu" : "st") : (update ? "lu" : "l");
+    const std::string wb = ra ? fmt::format("AOT_GPR_MEM(s,{0})=s->gpr[{0}]; ", ra) : "";
+    out += fmt::format("    {{ uint32_t _ea={}; if({}(s,&aot_fm,{},_ea,{},{})) {{ {}}} else {{ {}"
+                       "aot_psq_{}(s,{},{},{}u); {}}} }}\n",
+                       ea, tryfn, rd, I(inst.I), I(inst.W),
+                       update ? fmt::format("s->gpr[{}]=_ea; ", ra) : "", wb, slow, rd, ra,
+                       inst.hex,
+                       update ? fmt::format("s->gpr[{0}]=AOT_GPR_MEM(s,{0}); ", ra) : "");
+    return;
+  }
   out += fmt::format("    aot_psq_{}_fast(s,&aot_fm,{},{},{},{},{},{}u);\n",
                      store ? (update ? "stu" : "st") : (update ? "lu" : "l"), rd, ra, ea,
                      I(inst.I), I(inst.W), inst.hex);

@@ -363,14 +363,14 @@ void aot_shutdown()
 // The locked L1 cache is checked here rather than in the inlined header fast
 // path: LC traffic is bursty (video decode, LC-DMA staging) so one call's
 // overhead is fine, and it keeps the generated-code ABI unchanged.
-uint32_t aot_read_u8_slow(AOTState* s, uint32_t addr)
+AOT_SLOWPATH_CC uint32_t aot_read_u8_slow(AOTState* s, uint32_t addr)
 {
   if (const u8* p = FastMemHostPtr(addr))
     return *p;
   return PowerPC::ReadFromJit<u8>(GetMMU(), addr);
 }
 
-uint32_t aot_read_u16_slow(AOTState* s, uint32_t addr)
+AOT_SLOWPATH_CC uint32_t aot_read_u16_slow(AOTState* s, uint32_t addr)
 {
   if (const u8* p = FastMemHostPtr(addr))
   {
@@ -381,7 +381,7 @@ uint32_t aot_read_u16_slow(AOTState* s, uint32_t addr)
   return PowerPC::ReadFromJit<u16>(GetMMU(), addr);
 }
 
-uint32_t aot_read_u32_slow(AOTState* s, uint32_t addr)
+AOT_SLOWPATH_CC uint32_t aot_read_u32_slow(AOTState* s, uint32_t addr)
 {
   if (const u8* p = FastMemHostPtr(addr))
   {
@@ -392,7 +392,7 @@ uint32_t aot_read_u32_slow(AOTState* s, uint32_t addr)
   return PowerPC::ReadFromJit<u32>(GetMMU(), addr);
 }
 
-uint64_t aot_read_u64_slow(AOTState* s, uint32_t addr)
+AOT_SLOWPATH_CC uint64_t aot_read_u64_slow(AOTState* s, uint32_t addr)
 {
   if (const u8* p = FastMemHostPtr(addr))
   {
@@ -470,7 +470,7 @@ static inline bool TryGatherPipeWrite(AOTState* s, uint32_t addr, uint32_t val, 
 // Fill-level check for the inline gather-pipe path in aot_runtime.h (called only
 // when the pipe holds >= GATHER_PIPE_SIZE bytes). CheckGatherPipe, not
 // FastCheckGatherPipe: identical to what GPFifo::Write32 does after each element.
-void aot_gp_flush(AOTState* s)
+AOT_SLOWPATH_CC void aot_gp_flush(AOTState* s)
 {
   (void)s;
   GetSystem().GetGPFifo().CheckGatherPipe();
@@ -491,7 +491,7 @@ void aot_gp_capture(uint32_t physical, uint32_t val, uint32_t size)
 #endif
 }
 
-void aot_write_u8_slow(AOTState* s, uint32_t val, uint32_t addr)
+AOT_SLOWPATH_CC void aot_write_u8_slow(AOTState* s, uint32_t val, uint32_t addr)
 {
   if (TryGatherPipeWrite(s, addr, val, 1))
     return;
@@ -503,7 +503,7 @@ void aot_write_u8_slow(AOTState* s, uint32_t val, uint32_t addr)
   PowerPC::WriteFromJit<u8>(GetMMU(), static_cast<u8>(val), addr);
 }
 
-void aot_write_u16_slow(AOTState* s, uint32_t val, uint32_t addr)
+AOT_SLOWPATH_CC void aot_write_u16_slow(AOTState* s, uint32_t val, uint32_t addr)
 {  if (TryGatherPipeWrite(s, addr, val, 2))
     return;
   if (u8* p = FastMemHostPtr(addr))
@@ -515,7 +515,7 @@ void aot_write_u16_slow(AOTState* s, uint32_t val, uint32_t addr)
   PowerPC::WriteFromJit<u16>(GetMMU(), static_cast<u16>(val), addr);
 }
 
-void aot_write_u16_br_slow(AOTState* s, uint32_t val, uint32_t addr)
+AOT_SLOWPATH_CC void aot_write_u16_br_slow(AOTState* s, uint32_t val, uint32_t addr)
 {
   if (u8* p = FastMemHostPtr(addr))
   {
@@ -526,7 +526,7 @@ void aot_write_u16_br_slow(AOTState* s, uint32_t val, uint32_t addr)
   GetMMU().Write_U16_Swap(val, addr);
 }
 
-void aot_write_u32_slow(AOTState* s, uint32_t val, uint32_t addr)
+AOT_SLOWPATH_CC void aot_write_u32_slow(AOTState* s, uint32_t val, uint32_t addr)
 {  if (TryGatherPipeWrite(s, addr, val, 4))
     return;
   if (u8* p = FastMemHostPtr(addr))
@@ -538,7 +538,7 @@ void aot_write_u32_slow(AOTState* s, uint32_t val, uint32_t addr)
   PowerPC::WriteFromJit<u32>(GetMMU(), val, addr);
 }
 
-void aot_write_u64_slow(AOTState* s, uint64_t val, uint32_t addr)
+AOT_SLOWPATH_CC void aot_write_u64_slow(AOTState* s, uint64_t val, uint32_t addr)
 {
   if (u8* p = FastMemHostPtr(addr))
   {

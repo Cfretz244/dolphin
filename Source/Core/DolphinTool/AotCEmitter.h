@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <bitset>
 #include <map>
 #include <set>
 #include <string>
@@ -253,6 +254,24 @@ private:
   u32 m_idle_loop_start = 0;
   bool IsBusyWaitLoop(u32 block_addr, u32 num_instructions) const;
   u32 m_inline_insts = 0;   // total instructions emitted into the current function
+
+  // Superblock register cache (2026-10-06, codegen-superblocks): within one
+  // emitted C function (block + chain-inlined bodies) guest GPRs, CR fields, LR
+  // and CTR live in C locals (_gN, _cN, _lr, _ctr). Each instruction's text is
+  // post-processed by SbFinishSegment: first use loads the local, every exit
+  // (return / musttail) writes back the locals defined so far, and helpers that
+  // read or write those registers through AOTState memory get a write-back
+  // before and a reload after. AOT_NO_SUPERBLOCKS=1 at translate time disables.
+  bool m_superblocks = true;
+  std::bitset<32> m_sb_gpr_used, m_sb_gpr_dirty;
+  std::bitset<8> m_sb_cr_used, m_sb_cr_dirty;
+  bool m_sb_lr_used = false, m_sb_lr_dirty = false;
+  bool m_sb_ctr_used = false, m_sb_ctr_dirty = false;
+  bool m_sb_fm_used = false;  // lazy per-function aot_fm copy emitted
+  void SbReset();
+  void SbFinishSegment(std::string& out, size_t start);
+  std::string SbWriteBack() const;
+  std::string SbReloadUsed() const;
 
   const ModuleMode* m_module = nullptr;
   const ModuleImmReloc* m_cur_imm = nullptr;          // reloc on the current instruction

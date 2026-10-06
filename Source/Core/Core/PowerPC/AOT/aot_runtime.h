@@ -111,15 +111,21 @@ typedef struct {
 } AotFastMem;
 extern AotFastMem aot_fast_mem;  // filled by aot_init_fast_mem() before any block runs
 
-extern uint32_t aot_read_u8_slow(AOTState* s, uint32_t addr);
-extern uint32_t aot_read_u16_slow(AOTState* s, uint32_t addr);
-extern uint32_t aot_read_u32_slow(AOTState* s, uint32_t addr);
-extern uint64_t aot_read_u64_slow(AOTState* s, uint32_t addr);
-extern void aot_write_u8_slow(AOTState* s, uint32_t val, uint32_t addr);
-extern void aot_write_u16_slow(AOTState* s, uint32_t val, uint32_t addr);
-extern void aot_write_u16_br_slow(AOTState* s, uint32_t val, uint32_t addr);
-extern void aot_write_u32_slow(AOTState* s, uint32_t val, uint32_t addr);
-extern void aot_write_u64_slow(AOTState* s, uint64_t val, uint32_t addr);
+// The out-of-line slow paths use the preserve_most calling convention: the
+// callee saves x9-x15 (and the usual callee-saved set), so a block keeping
+// guest registers in host registers (superblock register cache) does not
+// spill them around every inline fast-path miss. Callers built for the plain
+// C convention remain compatible (they assume less is preserved).
+#define AOT_SLOWPATH_CC __attribute__((preserve_most))
+extern AOT_SLOWPATH_CC uint32_t aot_read_u8_slow(AOTState* s, uint32_t addr);
+extern AOT_SLOWPATH_CC uint32_t aot_read_u16_slow(AOTState* s, uint32_t addr);
+extern AOT_SLOWPATH_CC uint32_t aot_read_u32_slow(AOTState* s, uint32_t addr);
+extern AOT_SLOWPATH_CC uint64_t aot_read_u64_slow(AOTState* s, uint32_t addr);
+extern AOT_SLOWPATH_CC void aot_write_u8_slow(AOTState* s, uint32_t val, uint32_t addr);
+extern AOT_SLOWPATH_CC void aot_write_u16_slow(AOTState* s, uint32_t val, uint32_t addr);
+extern AOT_SLOWPATH_CC void aot_write_u16_br_slow(AOTState* s, uint32_t val, uint32_t addr);
+extern AOT_SLOWPATH_CC void aot_write_u32_slow(AOTState* s, uint32_t val, uint32_t addr);
+extern AOT_SLOWPATH_CC void aot_write_u64_slow(AOTState* s, uint64_t val, uint32_t addr);
 
 // Resolve an effective address to a host pointer: MEM1 first (identical cost
 // to the pre-v3 single-region check), then MEM2. NULL = slow path. Low-memory
@@ -360,7 +366,7 @@ static inline __attribute__((always_inline)) uint64_t aot_read_u64_fm(AOTState* 
 // Harness builds record each element twice, like MMU::WriteToHardware's
 // generic MMIO record plus its gather-pipe record.
 // ----------------------------------------------------------------------------
-extern void aot_gp_flush(AOTState* s);
+extern AOT_SLOWPATH_CC void aot_gp_flush(AOTState* s);
 #if defined(AOT_HARNESS) && AOT_HARNESS
 extern void aot_gp_capture(uint32_t physical, uint32_t val, uint32_t size);
 #define AOT_GP_CAPTURE(p, v, n) aot_gp_capture((p), (v), (n))
@@ -435,7 +441,7 @@ static inline __attribute__((always_inline)) void aot_gp_store_pair_u32(AOTState
 // `static inline` + noinline: one private copy per block file (a few hundred
 // bytes), no unused-function warnings.
 // ----------------------------------------------------------------------------
-#define AOT_GP_NOINLINE __attribute__((noinline))
+#define AOT_GP_NOINLINE __attribute__((noinline)) AOT_SLOWPATH_CC
 static inline AOT_GP_NOINLINE void aot_write_u8_gp(AOTState* s, uint32_t val, uint32_t addr) {
     uint32_t phys = aot_gp_physical(s, &aot_fast_mem, addr, 1u);
     if (phys) { aot_gp_store_n(s, phys, val, 1u); return; }
@@ -1171,6 +1177,39 @@ static inline void aot_cmp_unsigned(AOTState* s, int crfd, uint32_t a, uint32_t 
     else cr_field = 2;
     if (s->xer_so_ov >> 1) cr_field |= 1;
     aot_cr_set_field(s, crfd, cr_field);
+}
+
+// Memory form of a GPR for superblock code: the emitter's register-cache
+// rewriter turns every literal `s->gpr[N]` into a local; this spelling stays a
+// real AOTState access (write-back before / reload after a slow-path helper).
+#define AOT_GPR_MEM(s, n) ((s)->gpr[n])
+
+// Value forms for the superblock register cache (emitter >= 2026-10-06): the
+// generated code keeps CR fields in locals, so compares return the field and
+// branches test a field value instead of going through s->cr_fields[].
+static inline uint64_t aot_cr_field_v(uint32_t value) {
+    return aot_cr_table[value & 0xF];
+}
+
+static inline uint32_t aot_cr_bit_v(uint64_t cr, int bit) {
+    int bit_in_field = 3 - (bit & 3);
+    uint32_t ppc_cr = 0;
+    ppc_cr |= (cr >> 59) & 0x9;
+    ppc_cr |= ((cr & 0xFFFFFFFF) == 0) << 1;
+    ppc_cr |= ((int64_t)cr > 0) << 2;
+    return (ppc_cr >> bit_in_field) & 1;
+}
+
+static inline uint64_t aot_cmp_signed_v(const AOTState* s, int32_t a, int32_t b) {
+    uint32_t cr_field = a < b ? 8 : a > b ? 4 : 2;
+    if (s->xer_so_ov >> 1) cr_field |= 1;
+    return aot_cr_table[cr_field];
+}
+
+static inline uint64_t aot_cmp_unsigned_v(const AOTState* s, uint32_t a, uint32_t b) {
+    uint32_t cr_field = a < b ? 8 : a > b ? 4 : 2;
+    if (s->xer_so_ov >> 1) cr_field |= 1;
+    return aot_cr_table[cr_field];
 }
 
 // ----------------------------------------------------------------------------
