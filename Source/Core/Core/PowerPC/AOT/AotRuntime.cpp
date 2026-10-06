@@ -224,6 +224,9 @@ extern "C" uint64_t aot_stat_exception_bits[16] = {};  // pending bit histogram 
 extern "C" uint64_t aot_stat_exception_masked = 0;   // ... with MSR.EE clear
 // s_stat_gp_psq counts only helper-path pipe psq_st: the inline float path in
 // aot_runtime.h (aot_psq_st_fast) bypasses it, like the other _fast paths.
+// Likewise s_stat_gp_store counts only integer/float pipe stores that reach
+// TryGatherPipeWrite: generated code handles the SDK 0xCC008000 mapping in
+// aot_runtime.h's aot_write_*_gp before calling the _slow helpers.
 static u64 s_stat_rfi = 0, s_stat_idle = 0, s_stat_mtmsr = 0, s_stat_gp_store = 0,
            s_stat_gp_psq = 0;
 

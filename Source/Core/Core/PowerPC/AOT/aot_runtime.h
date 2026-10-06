@@ -334,6 +334,129 @@ static inline __attribute__((always_inline)) uint64_t aot_read_u64_fm(AOTState* 
     }
     return aot_read_u64_slow(s, addr);
 }
+// ----------------------------------------------------------------------------
+// Write-gather pipe (moved here from the psq section so the integer stores can
+// use it too).
+// ----------------------------------------------------------------------------
+// Write-gather pipe constants (static_asserted against PowerPC::/GPFifo:: in
+// AotRuntime.cpp).
+#define AOT_BAT_INDEX_SHIFT 17
+#define AOT_BAT_MAPPED_BIT  1u
+#define AOT_BAT_RESULT_MASK (~7u)
+#define AOT_MSR_DR          0x10u
+#define AOT_GP_EA_PAGE      0xCC008000u
+#define AOT_GP_PHYS_PAGE    0x0C008000u
+#define AOT_GP_SIZE         32u
+
+// ----------------------------------------------------------------------------
+// Inline write-gather pipe path for psq_st (float GQR) and the integer/float
+// `_fm` stores (aot_write_*_gp below). Mirrors AotRuntime.cpp
+// GatherPipePhysical + GatherPipeElement (= MMU::WriteToHardware's pipe branch
+// -> GPFifo::Write32): the big-endian element is stored through
+// s->gather_pipe_ptr and the fill level is checked afterwards; aot_gp_flush is
+// GPFifo::CheckGatherPipe. A ps0,ps1 pair is one 8-byte store and ONE check,
+// which is state-equivalent to the interpreter's store/check/store/check
+// (UpdateGatherPipe drains every full 32-byte chunk and keeps the spill).
+// Harness builds record each element twice, like MMU::WriteToHardware's
+// generic MMIO record plus its gather-pipe record.
+// ----------------------------------------------------------------------------
+extern void aot_gp_flush(AOTState* s);
+#if defined(AOT_HARNESS) && AOT_HARNESS
+extern void aot_gp_capture(uint32_t physical, uint32_t val, uint32_t size);
+#define AOT_GP_CAPTURE(p, v, n) aot_gp_capture((p), (v), (n))
+#else
+#define AOT_GP_CAPTURE(p, v, n) ((void)0)
+#endif
+
+/* Physical pipe address for a size-byte store at ea, or 0. Exact mirror of
+   AotRuntime.cpp GatherPipePhysical, preceded by a cheap effective-page filter:
+   anything not at the SDK's 0xCC008000 mapping (DR off, remapped BATs, EFB,
+   MMIO, locked L1) returns 0 and goes to the helper, which handles it. */
+static inline __attribute__((always_inline)) uint32_t aot_gp_physical(const AOTState* s, const AotFastMem* fm, uint32_t ea, uint32_t size) {
+    if ((ea & 0xFFFFF000u) != AOT_GP_EA_PAGE) return 0;
+    if (!(s->msr & AOT_MSR_DR)) return 0;
+    uint32_t bat = fm->dbat[ea >> AOT_BAT_INDEX_SHIFT];
+    if (!(bat & AOT_BAT_MAPPED_BIT)) return 0;
+    uint32_t phys = (bat & AOT_BAT_RESULT_MASK) | (ea & ((1u << AOT_BAT_INDEX_SHIFT) - 1u));
+    if ((phys & 0xFFFFF000u) != AOT_GP_PHYS_PAGE) return 0;
+    if ((ea & 0xFFFu) + size > 0x1000u) return 0;
+    return phys;
+}
+/* One big-endian n-byte element (n = 1, 2 or 4, a compile-time constant at
+   every call) = GPFifo::Write8/16/32 (FastWriteN, then CheckGatherPipe). The
+   harness records (physical, val, n) twice with the value as passed, exactly
+   like MMU::WriteToHardware via the runtime's GatherPipeElement. */
+static inline __attribute__((always_inline)) void aot_gp_store_n(AOTState* s, uint32_t phys, uint32_t val, uint32_t n) {
+    AOT_GP_CAPTURE(phys, val, n); AOT_GP_CAPTURE(phys, val, n);
+    uint8_t* gp = (uint8_t*)s->gather_pipe_ptr;
+    AOT_ASSUME_SEPARATE(gp, s);
+    if (n == 1) {
+        *gp = (uint8_t)val;
+    } else if (n == 2) {
+        uint16_t v = __builtin_bswap16((uint16_t)val); __builtin_memcpy(gp, &v, 2);
+    } else {
+        uint32_t v = __builtin_bswap32(val); __builtin_memcpy(gp, &v, 4);
+    }
+    s->gather_pipe_ptr = gp + n;
+    if (__builtin_expect((uintptr_t)(gp + n) - (uintptr_t)s->gather_pipe_base_ptr >= AOT_GP_SIZE, 0)) aot_gp_flush(s);
+}
+static inline __attribute__((always_inline)) void aot_gp_store_u32(AOTState* s, uint32_t phys, uint32_t val) {
+    aot_gp_store_n(s, phys, val, 4);
+}
+static inline __attribute__((always_inline)) void aot_gp_store_pair_u32(AOTState* s, uint32_t phys, uint32_t v0, uint32_t v1) {
+    AOT_GP_CAPTURE(phys, v0, 4); AOT_GP_CAPTURE(phys, v0, 4);
+    AOT_GP_CAPTURE(phys + 4, v1, 4); AOT_GP_CAPTURE(phys + 4, v1, 4);
+    uint8_t* gp = (uint8_t*)s->gather_pipe_ptr;
+    AOT_ASSUME_SEPARATE(gp, s);
+    uint64_t v = __builtin_bswap64(((uint64_t)v0 << 32) | v1); __builtin_memcpy(gp, &v, 8);
+    s->gather_pipe_ptr = gp + 8;
+    if (__builtin_expect((uintptr_t)(gp + 8) - (uintptr_t)s->gather_pipe_base_ptr >= AOT_GP_SIZE, 0)) aot_gp_flush(s);
+}
+
+// ----------------------------------------------------------------------------
+// Write-gather pipe arm of the integer/float `_fm` stores (stb/sth/stw and
+// their update/indexed forms, stmw, stfs/stfsx/stfiwx = u32, stfd = u64 bit
+// pattern), called only after the MEM1/MEM2/L1 verdicts of aot_fm_resolve
+// failed. NOINLINE and with the SAME signature as the aot_write_*_slow helper
+// it replaces at the call site, so each store site is byte-for-byte the same
+// size (measured on R3ME01_blocks_d1_8036.c, -Os, no harness: __aot_hot
+// +0.0%; the full test inlined at every site: +25%; adding `cold`: +1.3%,
+// clang re-lays-out the callers' slow tails -- so no `cold`). The pipe test
+// is aot_gp_physical (exact mirror of the runtime's GatherPipePhysical;
+// reads the live DBAT table through aot_fast_mem.dbat, a stable pointer);
+// a pipe store goes through s->gather_pipe_ptr as
+// GPFifo::WriteN does; everything else (MMIO, EFB, DR off, remapped BATs,
+// page-crossing) tail-calls the unchanged slow helper. A u64 to the pipe is the
+// interpreter's MMU::Write<u64> = two 4-byte WriteToHardware (hi then lo, each
+// recorded twice by the harness) = aot_gp_store_pair_u32 (one 8-byte store,
+// one fill check: state-equivalent, see above). sthbrx (u16_br) has no pipe
+// path in the runtime either and is left alone. AOTSTAT `gp` (s_stat_gp_store)
+// now counts only stores that still reach the runtime's TryGatherPipeWrite.
+// `static inline` + noinline: one private copy per block file (a few hundred
+// bytes), no unused-function warnings.
+// ----------------------------------------------------------------------------
+#define AOT_GP_NOINLINE __attribute__((noinline))
+static inline AOT_GP_NOINLINE void aot_write_u8_gp(AOTState* s, uint32_t val, uint32_t addr) {
+    uint32_t phys = aot_gp_physical(s, &aot_fast_mem, addr, 1u);
+    if (phys) { aot_gp_store_n(s, phys, val, 1u); return; }
+    aot_write_u8_slow(s, val, addr);
+}
+static inline AOT_GP_NOINLINE void aot_write_u16_gp(AOTState* s, uint32_t val, uint32_t addr) {
+    uint32_t phys = aot_gp_physical(s, &aot_fast_mem, addr, 2u);
+    if (phys) { aot_gp_store_n(s, phys, val, 2u); return; }
+    aot_write_u16_slow(s, val, addr);
+}
+static inline AOT_GP_NOINLINE void aot_write_u32_gp(AOTState* s, uint32_t val, uint32_t addr) {
+    uint32_t phys = aot_gp_physical(s, &aot_fast_mem, addr, 4u);
+    if (phys) { aot_gp_store_n(s, phys, val, 4u); return; }
+    aot_write_u32_slow(s, val, addr);
+}
+static inline AOT_GP_NOINLINE void aot_write_u64_gp(AOTState* s, uint64_t val, uint32_t addr) {
+    uint32_t phys = aot_gp_physical(s, &aot_fast_mem, addr, 8u);
+    if (phys) { aot_gp_store_pair_u32(s, phys, (uint32_t)(val >> 32), (uint32_t)val); return; }
+    aot_write_u64_slow(s, val, addr);
+}
+
 static inline __attribute__((always_inline)) void aot_write_u8_fm(AOTState* s, const AotFastMem* fm, uint32_t val, uint32_t addr) {
     uint8_t* p;
     if (__builtin_expect(aot_fm_resolve(fm, addr, &p), 1)) {
@@ -341,7 +464,7 @@ static inline __attribute__((always_inline)) void aot_write_u8_fm(AOTState* s, c
         *p = (uint8_t)val;
         return;
     }
-    aot_write_u8_slow(s, val, addr);
+    aot_write_u8_gp(s, val, addr);
 }
 static inline __attribute__((always_inline)) void aot_write_u16_fm(AOTState* s, const AotFastMem* fm, uint32_t val, uint32_t addr) {
     uint8_t* p;
@@ -351,7 +474,7 @@ static inline __attribute__((always_inline)) void aot_write_u16_fm(AOTState* s, 
         __builtin_memcpy(p, &v, 2);
         return;
     }
-    aot_write_u16_slow(s, val, addr);
+    aot_write_u16_gp(s, val, addr);
 }
 static inline __attribute__((always_inline)) void aot_write_u16_br_fm(AOTState* s, const AotFastMem* fm, uint32_t val, uint32_t addr) {
     uint8_t* p;
@@ -371,7 +494,7 @@ static inline __attribute__((always_inline)) void aot_write_u32_fm(AOTState* s, 
         __builtin_memcpy(p, &v, 4);
         return;
     }
-    aot_write_u32_slow(s, val, addr);
+    aot_write_u32_gp(s, val, addr);
 }
 static inline __attribute__((always_inline)) void aot_write_u64_fm(AOTState* s, const AotFastMem* fm, uint64_t val, uint32_t addr) {
     uint8_t* p;
@@ -381,7 +504,7 @@ static inline __attribute__((always_inline)) void aot_write_u64_fm(AOTState* s, 
         __builtin_memcpy(p, &v, 8);
         return;
     }
-    aot_write_u64_slow(s, val, addr);
+    aot_write_u64_gp(s, val, addr);
 }
 
 // ============================================================================
@@ -916,67 +1039,9 @@ static inline uint32_t aot_convert_to_single_ftz_fast(uint64_t x) {
 #define AOT_SPR_HID2  920
 #define AOT_HID2_LSQE (1u << 31)
 
-// Write-gather pipe constants (static_asserted against PowerPC::/GPFifo:: in
-// AotRuntime.cpp).
-#define AOT_BAT_INDEX_SHIFT 17
-#define AOT_BAT_MAPPED_BIT  1u
-#define AOT_BAT_RESULT_MASK (~7u)
-#define AOT_MSR_DR          0x10u
-#define AOT_GP_EA_PAGE      0xCC008000u
-#define AOT_GP_PHYS_PAGE    0x0C008000u
-#define AOT_GP_SIZE         32u
-
-// ----------------------------------------------------------------------------
-// Inline write-gather pipe path for psq_st (float GQR). Mirrors AotRuntime.cpp
-// GatherPipePhysical + GatherPipeElement (= MMU::WriteToHardware's pipe branch
-// -> GPFifo::Write32): the big-endian element is stored through
-// s->gather_pipe_ptr and the fill level is checked afterwards; aot_gp_flush is
-// GPFifo::CheckGatherPipe. A ps0,ps1 pair is one 8-byte store and ONE check,
-// which is state-equivalent to the interpreter's store/check/store/check
-// (UpdateGatherPipe drains every full 32-byte chunk and keeps the spill).
-// Harness builds record each element twice, like MMU::WriteToHardware's
-// generic MMIO record plus its gather-pipe record.
-// ----------------------------------------------------------------------------
-extern void aot_gp_flush(AOTState* s);
-#if defined(AOT_HARNESS) && AOT_HARNESS
-extern void aot_gp_capture(uint32_t physical, uint32_t val, uint32_t size);
-#define AOT_GP_CAPTURE(p, v, n) aot_gp_capture((p), (v), (n))
-#else
-#define AOT_GP_CAPTURE(p, v, n) ((void)0)
-#endif
-
-/* Physical pipe address for a size-byte store at ea, or 0. Exact mirror of
-   AotRuntime.cpp GatherPipePhysical, preceded by a cheap effective-page filter:
-   anything not at the SDK's 0xCC008000 mapping (DR off, remapped BATs, EFB,
-   MMIO, locked L1) returns 0 and goes to the helper, which handles it. */
-static inline __attribute__((always_inline)) uint32_t aot_gp_physical(const AOTState* s, const AotFastMem* fm, uint32_t ea, uint32_t size) {
-    if ((ea & 0xFFFFF000u) != AOT_GP_EA_PAGE) return 0;
-    if (!(s->msr & AOT_MSR_DR)) return 0;
-    uint32_t bat = fm->dbat[ea >> AOT_BAT_INDEX_SHIFT];
-    if (!(bat & AOT_BAT_MAPPED_BIT)) return 0;
-    uint32_t phys = (bat & AOT_BAT_RESULT_MASK) | (ea & ((1u << AOT_BAT_INDEX_SHIFT) - 1u));
-    if ((phys & 0xFFFFF000u) != AOT_GP_PHYS_PAGE) return 0;
-    if ((ea & 0xFFFu) + size > 0x1000u) return 0;
-    return phys;
-}
-/* One big-endian u32 (or a ps0,ps1 pair) into the pipe, then the fill check. */
-static inline __attribute__((always_inline)) void aot_gp_store_u32(AOTState* s, uint32_t phys, uint32_t val) {
-    AOT_GP_CAPTURE(phys, val, 4); AOT_GP_CAPTURE(phys, val, 4);
-    uint8_t* gp = (uint8_t*)s->gather_pipe_ptr;
-    AOT_ASSUME_SEPARATE(gp, s);
-    uint32_t v = __builtin_bswap32(val); __builtin_memcpy(gp, &v, 4);
-    s->gather_pipe_ptr = gp + 4;
-    if (__builtin_expect((uintptr_t)(gp + 4) - (uintptr_t)s->gather_pipe_base_ptr >= AOT_GP_SIZE, 0)) aot_gp_flush(s);
-}
-static inline __attribute__((always_inline)) void aot_gp_store_pair_u32(AOTState* s, uint32_t phys, uint32_t v0, uint32_t v1) {
-    AOT_GP_CAPTURE(phys, v0, 4); AOT_GP_CAPTURE(phys, v0, 4);
-    AOT_GP_CAPTURE(phys + 4, v1, 4); AOT_GP_CAPTURE(phys + 4, v1, 4);
-    uint8_t* gp = (uint8_t*)s->gather_pipe_ptr;
-    AOT_ASSUME_SEPARATE(gp, s);
-    uint64_t v = __builtin_bswap64(((uint64_t)v0 << 32) | v1); __builtin_memcpy(gp, &v, 8);
-    s->gather_pipe_ptr = gp + 8;
-    if (__builtin_expect((uintptr_t)(gp + 8) - (uintptr_t)s->gather_pipe_base_ptr >= AOT_GP_SIZE, 0)) aot_gp_flush(s);
-}
+// Write-gather pipe constants and the inline pipe store primitives
+// (aot_gp_physical / aot_gp_store_*) are defined above, next to the `_fm`
+// integer store helpers that also use them.
 
 /* Fast-path cores for psq_l/psq_st (and their update forms): return 1 when the
    access was fully handled inline, 0 when the caller must fall back to the

@@ -871,6 +871,81 @@ TEST(AotFpPsqTest, GatherPipeFloatPath)
   dbat[0xCC00'8000u >> 17] = saved;
 }
 
+// Integer/float `_fm` stores (stb/sth/stw/stfs = u8/u16/u32, stfd = u64) to the
+// write-gather pipe at the SDK's 0xCC008000 mapping: after the RAM/L1 verdicts
+// fail they reach aot_write_*_gp, which stores big-endian through
+// gather_pipe_ptr exactly like GPFifo::Write8/16/32 (u64 = hi word then lo
+// word, MMU::Write<u64>). The _gp helpers read the DBAT table through the
+// GLOBAL aot_fast_mem (same signature as the _slow helpers), so the test swaps
+// it. Total stays below 32 bytes: aot_gp_flush (and every non-pipe fallback)
+// needs a booted System.
+TEST(AotFpFastMemTest, GatherPipeIntegerStores)
+{
+  alignas(8) static u8 ram[0x1000];
+  static u32 dbat[1u << 15]{};
+  std::memset(dbat, 0, sizeof(dbat));
+  dbat[0xCC00'8000u >> 17] = 0x0C00'0000u | 1u;  // SDK DBAT1: 0xC0000000 -> 0
+  const AotFastMem fm{ram, sizeof(ram), nullptr, 0, dbat};
+  const AotFastMem saved_mem = aot_fast_mem;
+  aot_fast_mem = fm;
+  Common::ScopeGuard restore{[&] { aot_fast_mem = saved_mem; }};
+
+  AOTState s{};
+  s.msr = 0x10;  // MSR.DR
+  alignas(32) static u8 pipe[64];
+  s.gather_pipe_base_ptr = pipe;
+  std::memset(ram, 0x5A, sizeof(ram));
+
+  std::mt19937_64 rng(0x6A7E'0000'1234'5678ULL);
+  for (int round = 0; round < 2000; ++round)
+  {
+    std::memset(pipe, 0xA5, sizeof(pipe));
+    s.gather_pipe_ptr = pipe;
+    std::vector<u8> want;
+    // A random sequence of u8/u16/u32/u64 stores totalling <= 31 bytes,
+    // through every effective address the 0xCC008000 page accepts in practice.
+    while (true)
+    {
+      const u64 r = rng();
+      const int kind = static_cast<int>(r % 4);
+      const u32 n = kind == 3 ? 8u : (1u << kind);
+      if (want.size() + n > 31)
+        break;
+      const u32 ea = 0xCC00'8000u + static_cast<u32>((r >> 8) % 0xFF0u);  // page interior
+      const u64 val = rng();
+      u8* const before = static_cast<u8*>(s.gather_pipe_ptr);
+      switch (kind)
+      {
+      case 0:
+        aot_write_u8_fm(&s, &fm, static_cast<u32>(val), ea);
+        want.push_back(static_cast<u8>(val));
+        break;
+      case 1:
+        aot_write_u16_fm(&s, &fm, static_cast<u32>(val), ea);
+        want.push_back(static_cast<u8>(val >> 8));
+        want.push_back(static_cast<u8>(val));
+        break;
+      case 2:
+        aot_write_u32_fm(&s, &fm, static_cast<u32>(val), ea);
+        for (int b = 3; b >= 0; --b)
+          want.push_back(static_cast<u8>(val >> (8 * b)));
+        break;
+      default:
+        aot_write_u64_fm(&s, &fm, val, ea);
+        for (int b = 7; b >= 0; --b)
+          want.push_back(static_cast<u8>(val >> (8 * b)));
+        break;
+      }
+      ASSERT_EQ(static_cast<u32>(static_cast<u8*>(s.gather_pipe_ptr) - before), n)
+          << "kind " << kind << " ea " << std::hex << ea;
+    }
+    ASSERT_EQ(0, std::memcmp(pipe, want.data(), want.size())) << "round " << round;
+    ASSERT_EQ(pipe[want.size()], 0xA5) << "wrote past the end, round " << round;
+  }
+  for (const u8 b : ram)
+    ASSERT_EQ(b, 0x5A) << "pipe stores touched RAM";
+}
+
 // The `_fm` memory helpers (descriptor passed by pointer, what generated
 // blocks call; they branch on aot_fm_resolve's verdict) must resolve every
 // address exactly like the global-descriptor helpers, and their fast paths

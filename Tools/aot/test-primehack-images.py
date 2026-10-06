@@ -100,6 +100,8 @@ int aot_check_fpu(AOTState* s, uint32_t pc) { return 1; }
 void aot_fmulsx(AOTState* s,int d,int a,int c) { abort(); }
 uint32_t aot_convert_to_single(uint64_t v) { abort(); }
 void aot_write_u32_slow(AOTState* s,uint32_t v,uint32_t a) { abort(); }
+void aot_gp_flush(AOTState* s) { abort(); }
+void aot_gp_capture(uint32_t p,uint32_t v,uint32_t n) { abort(); }
 static unsigned execute(AOTBlockFunc fn) {
   AOTState s={0}; s.pc=0x8018b8d4; s.downcount=100; s.spr[8]=0x80500000;
   fallbacks=0; fn(&s); assert(fallbacks==1); return s.gpr[3];
