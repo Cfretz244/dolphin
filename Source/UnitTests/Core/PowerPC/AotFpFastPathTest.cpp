@@ -954,4 +954,158 @@ TEST(AotFpFastMemTest, FmHelpersMatchGlobalHelpers)
   std::printf("AotFpFastMemTest: %zu addresses\n", addrs.size());
   EXPECT_EQ(bad, 0);
 }
+
+// Locked-L1 arm of aot_fm_resolve (every integer/float `_fm` load and store):
+// its verdict and pointer must equal aot_psq_host_ptr_fm, the literal mirror of
+// AotRuntime.cpp FastMemHostPtr (MEM1, MEM2, then L1 with the +8 guard), for
+// every address -- including the edges around 0xE0000000/0xF0000000 that the
+// compact `(addr ^ 0xE0000000) < l1_lim` form must get right. Then every
+// `_fm` access size lands big-endian at l1 + (ea & 0x0FFFFFFF), RAM untouched.
+TEST(AotFpFastMemTest, FmResolveLockedL1)
+{
+  alignas(8) static u8 mem1[0x2000];
+  alignas(8) static u8 mem2[0x1000];
+  alignas(8) static u8 l1[0x4000];  // as Memory::GetL1CacheSize()
+  // l1_lim as aot_init_fast_mem sets it (l1_size - 7).
+  AotFastMem fm{mem1, sizeof(mem1), mem2, sizeof(mem2), nullptr, l1, sizeof(l1), sizeof(l1) - 7};
+
+  std::mt19937_64 rng(0x5EED'AD07'F00D'0006ULL);
+  std::vector<u32> addrs;
+  for (const u32 base : {0x8000'0000u, 0xC000'0000u, 0x9000'0000u, 0xD000'0000u, 0xE000'0000u,
+                         0xA000'0000u, 0xF000'0000u, 0x6000'0000u})
+    for (const u32 d : {0u, 1u, 7u, 8u, 0xFF8u, 0xFFFu, 0x1000u, 0x1FF8u, 0x1FFFu, 0x2000u,
+                        0x3FF0u, 0x3FF7u, 0x3FF8u, 0x3FF9u, 0x3FFCu, 0x3FFFu, 0x4000u,
+                        0x0FFF'FFF8u, 0x0FFF'FFFFu, 0xFFFF'FFF8u, 0xFFFF'FFF9u, 0xFFFF'FFFFu})
+      addrs.push_back(base + d);
+  for (int i = 0; i < 200000; ++i)
+  {
+    const u64 r = rng();
+    const u32 a = static_cast<u32>(r);
+    // Half anywhere, half biased into the L1 window and its neighbours.
+    addrs.push_back((r >> 63) ? a : ((a & 0x1000'7FFFu) | 0xD000'0000u) + ((r >> 62) & 1u) * 0x1000'0000u);
+  }
+
+  AOTState s{};
+  int bad = 0;
+  int l1_hits = 0;
+  for (const u32 a : addrs)
+  {
+    u8* rp = nullptr;
+    const int ok = aot_fm_resolve(&fm, a, &rp);
+    u8* const want = aot_psq_host_ptr_fm(&fm, a);
+    if ((ok != (want != nullptr) || (ok && rp != want)) && bad++ < 5)
+      ADD_FAILURE() << fmt::format("resolve {:08x}: ok {} p {} want {}", a, ok, fmt::ptr(rp),
+                                   fmt::ptr(want));
+    if (!ok || rp < l1 || rp >= l1 + sizeof(l1))
+      continue;
+    ++l1_hits;
+    // Every L1 hit has 8 bytes of room (the +8 guard): check all access sizes.
+    const u32 off = a & 0x0FFF'FFFFu;
+    if (rp != l1 + off && bad++ < 5)
+      ADD_FAILURE() << fmt::format("L1 pointer {:08x}", a);
+    const u64 v = rng();
+    u8 be[8];
+    for (int k = 0; k < 8; ++k)
+      be[k] = static_cast<u8>(v >> (56 - 8 * k));
+    std::memset(rp, 0x5A, 8);
+    aot_write_u64_fm(&s, &fm, v, a);
+    if (std::memcmp(rp, be, 8) != 0 && bad++ < 5)
+      ADD_FAILURE() << fmt::format("w64 {:08x}", a);
+    if ((aot_read_u64_fm(&s, &fm, a) != v || aot_read_u32_fm(&s, &fm, a) != static_cast<u32>(v >> 32) ||
+         aot_read_u16_fm(&s, &fm, a) != static_cast<u32>(v >> 48) ||
+         aot_read_u16_se_fm(&s, &fm, a) != static_cast<u32>(static_cast<s32>(static_cast<s16>(v >> 48))) ||
+         aot_read_u8_fm(&s, &fm, a) != static_cast<u32>(v >> 56)) &&
+        bad++ < 5)
+      ADD_FAILURE() << fmt::format("read {:08x} {:016x}", a, v);
+    // The sub-word stores below hit a+4 and a+6, which must also resolve inline
+    // (+8 guard): skip the last 16 bytes of the buffer for them.
+    if (off + 16 > sizeof(l1))
+      continue;
+    std::memset(rp, 0x5A, 8);
+    aot_write_u32_fm(&s, &fm, static_cast<u32>(v), a);
+    aot_write_u16_fm(&s, &fm, static_cast<u32>(v >> 32), a + 4);
+    aot_write_u8_fm(&s, &fm, static_cast<u32>(v >> 48), a + 6);
+    aot_write_u16_br_fm(&s, &fm, 0xA1B2u, a);  // byte-reversed: low byte first
+    const u8 want_bytes[8] = {0xB2, 0xA1, be[6], be[7], be[2], be[3], be[1], 0x5A};
+    if (std::memcmp(rp, want_bytes, 8) != 0 && bad++ < 5)
+      ADD_FAILURE() << fmt::format("w32/w16/w8/w16br {:08x}", a);
+  }
+  for (const u8 b : mem1)
+    if (b != 0)
+    {
+      ADD_FAILURE() << "L1 accesses touched MEM1";
+      break;
+    }
+  std::printf("AotFpFastMemTest.FmResolveLockedL1: %zu addresses, %d L1 hits\n", addrs.size(),
+              l1_hits);
+  EXPECT_GT(l1_hits, 1000);
+  EXPECT_EQ(bad, 0);
+
+  // Exact edges (FastMemHostPtr: addr + 8 <= 0xE0000000 + size).
+  u8* p = nullptr;
+  EXPECT_EQ(aot_fm_resolve(&fm, 0xE000'0000u, &p), 1);
+  EXPECT_EQ(p, l1);
+  EXPECT_EQ(aot_fm_resolve(&fm, 0xE000'3FF8u, &p), 1);
+  EXPECT_EQ(p, l1 + 0x3FF8);
+  EXPECT_EQ(aot_fm_resolve(&fm, 0xE000'3FF9u, &p), 0);
+  EXPECT_EQ(aot_fm_resolve(&fm, 0xE000'4000u, &p), 0);
+  EXPECT_EQ(aot_fm_resolve(&fm, 0xDFFF'FFF8u, &p), 0);
+  EXPECT_EQ(aot_fm_resolve(&fm, 0xDFFF'FFFFu, &p), 0);
+  EXPECT_EQ(aot_fm_resolve(&fm, 0xFFFF'FFFFu, &p), 0);
+  // No L1 buffer: no 0xE address resolves (the runtime's s_l1_ptr null test;
+  // aot_init_fast_mem then sets l1_lim = 0).
+  fm.l1 = nullptr;
+  fm.l1_size = 0;
+  fm.l1_lim = 0;
+  for (const u32 a : {0xE000'0000u, 0xE000'0100u, 0xE000'3FF8u, 0xDFFF'FFF8u, 0xEFFF'FFF8u})
+    EXPECT_EQ(aot_fm_resolve(&fm, a, &p), 0) << fmt::format("{:08x}", a);
+}
+
+// Inline mtmsr fast path (aot_mtmsr_fast) vs PowerPCManager::MSRUpdatedInternal:
+// with no exception pending and no (DR && pagetable_update_pending), the fast
+// path must leave msr and feature_flags exactly as the interpreter path does,
+// return 0 and call nothing. Also aot_fpu_available's MSR.FP-set fast path.
+TEST_F(AotFpFastPathTest, MtmsrFastPathMatchesMSRUpdated)
+{
+  auto& state = system.GetPPCState();
+  const u32 saved_flags = state.feature_flags;
+  const bool saved_pending = state.pagetable_update_pending;
+  Common::ScopeGuard restore{[&] {
+    state.feature_flags = static_cast<CPUEmuFeatureFlags>(saved_flags);
+    state.pagetable_update_pending = saved_pending;
+  }};
+  std::mt19937_64 rng(0x5EED'AD07'F00D'0007ULL);
+  int bad = 0;
+  for (int i = 0; i < 100000; ++i)
+  {
+    const u64 r = rng();
+    const u32 val = static_cast<u32>(r);
+    const u32 old_msr = static_cast<u32>(r >> 32);
+    const u32 old_flags = static_cast<u32>((r >> 40) & 7u);  // DR/IR/PERFMON in any mix
+    const bool pending = ((r >> 44) & 1u) && !(val & 0x10u);  // pending only when DR=0
+
+    // Reference: what aot_mtmsr_check does on this path.
+    state.Exceptions = 0;
+    state.pagetable_update_pending = pending;
+    state.msr.Hex = val;
+    state.feature_flags = static_cast<CPUEmuFeatureFlags>(old_flags);
+    system.GetPowerPC().MSRUpdatedInternal();
+    const u32 want_flags = state.feature_flags;
+
+    AOTState s{};
+    s.msr = old_msr;
+    s.feature_flags = old_flags;
+    s.pagetable_update_pending = pending;
+    s.exceptions = 0;
+    const int ret = aot_mtmsr_fast(&s, val);
+    if ((ret != 0 || s.msr != val || s.feature_flags != want_flags) && bad++ < 5)
+      ADD_FAILURE() << fmt::format("mtmsr {:08x} flags {} pending {}: ret {} msr {:08x} flags {} "
+                                   "want {}",
+                                   val, old_flags, pending, ret, s.msr, s.feature_flags,
+                                   want_flags);
+    if ((val & 0x2000u) && aot_fpu_available(&s, 0x8000'0000u) != 1 && bad++ < 5)
+      ADD_FAILURE() << fmt::format("fpu_available {:08x}", val);
+  }
+  EXPECT_EQ(bad, 0);
+}
 #endif  // DOLPHIN_HAS_AOT

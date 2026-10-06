@@ -99,10 +99,15 @@ typedef struct {
        the first four fields by offset. */
     const uint32_t* dbat;
     /* Locked L1 data cache (0xE0000000) host buffer and size, as in the
-       runtime's FastMemHostPtr. Used only by the psq fast paths
+       runtime's FastMemHostPtr. Used by the psq fast paths
        (aot_psq_host_ptr_fm). */
     uint8_t* l1;
     uint32_t l1_size;
+    /* l1 ? l1_size - 7 : 0 -- the L1 arm of aot_fm_resolve accepts
+       (addr ^ 0xE0000000) < l1_lim, i.e. FastMemHostPtr's
+       `(addr >> 28) == 0xE && addr + 8 <= 0xE0000000 + l1_size`, in one
+       compare (0 = no L1 buffer: never). Set by aot_init_fast_mem. */
+    uint32_t l1_lim;
 } AotFastMem;
 extern AotFastMem aot_fast_mem;  // filled by aot_init_fast_mem() before any block runs
 
@@ -261,13 +266,31 @@ static inline __attribute__((always_inline)) uint8_t* aot_host_ptr_fm(const AotF
 // aot_fm_resolve: the range verdict and the host pointer, returned separately.
 // The `_fm` load/store helpers branch on the verdict, not on `p != 0`: a
 // pointer test costs a `cbz` per guest memory op, because clang cannot prove
-// fm->ram + off is non-NULL. Returns 1 exactly when aot_host_ptr_fm() would
-// return non-NULL, with *out set to that same pointer.
+// fm->ram + off is non-NULL. For MEM1/MEM2 it returns 1 exactly when
+// aot_host_ptr_fm() would return non-NULL, with *out set to that same pointer.
+//
+// After the MEM1/MEM2 verdicts it also accepts the locked L1 data cache at its
+// conventional 0xE0000000 mapping, exactly as AotRuntime.cpp FastMemHostPtr
+// (which every aot_*_slow helper consults right after its gather-pipe test):
+// `(addr >> 28) == 0xE && addr + 8 <= 0xE0000000 + l1_size` -> l1 + (addr &
+// 0x0FFFFFFF), the +8 guard for every access size, as in the runtime (the last
+// few L1 bytes stay on the helper). Written as `(addr ^ 0xE0000000) < l1_lim`
+// with l1_lim = l1_size - 7 (0 when there is no L1 buffer): the XOR is
+// addr - 0xE0000000 for a 0xE address and >= 0x10000000 > l1_lim for any
+// other, so it is the same predicate, at one eor + cmp per site (the
+// literal form cost ~2x the code size over 981k R3ME01 sites). L1 is plain
+// memory (MMU::WriteToHardware's L1 branch is a memcpy, no MMIO record), and a
+// 0xE effective address is not the gather pipe under the SDK's identity DBAT
+// that the MEM1/MEM2 arms already assume. Metroid Prime streams vertex data
+// from locked L1, so without this arm every integer/float access there paid a
+// slow-helper call.
 static inline __attribute__((always_inline)) int aot_fm_resolve(const AotFastMem* fm, uint32_t addr, uint8_t** out) {
     uint32_t off1 = (addr & ~AOT_MEM_UNCACHED_BIT) - AOT_MEM_CACHED_BASE;
     if (__builtin_expect(off1 < fm->size, 1)) { *out = fm->ram + off1; return 1; }
     uint32_t off2 = off1 - AOT_MEM2_FOLDED_OFFSET;
     if (off2 < fm->exram_size) { *out = fm->exram + off2; return 1; }
+    uint32_t off3 = addr ^ 0xE0000000u;
+    if (off3 < fm->l1_lim) { *out = fm->l1 + off3; return 1; }
     return 0;
 }
 static inline __attribute__((always_inline)) int aot_is_ram_fm(const AotFastMem* fm, uint32_t addr) {
@@ -1083,6 +1106,41 @@ static inline void aot_cmp_unsigned(AOTState* s, int crfd, uint32_t a, uint32_t 
     else cr_field = 2;
     if (s->xer_so_ov >> 1) cr_field |= 1;
     aot_cr_set_field(s, crfd, cr_field);
+}
+
+// ----------------------------------------------------------------------------
+// mtmsr / FP-available inline fast paths (emitter >= 2026-10-05 "helpers1").
+// Wii OS code toggles MSR.EE ~1M times a second (OSDisable/RestoreInterrupts),
+// and every FP-using block entry tests MSR.FP; both used to be a helper call.
+//
+// aot_mtmsr_fast mirrors AotRuntime.cpp aot_mtmsr_check exactly: msr = val,
+// then MSRUpdatedInternal's feature_flags = (feature_flags & PERFMON) |
+// ((msr >> 4) & 3) (DR -> bit 0, IR -> bit 1; static_asserted in
+// AotRuntime.cpp), and nothing else unless msr.DR && pagetable_update_pending
+// (MMU::PageTableUpdated) or an exception is pending (CheckExceptions) -- those
+// two cases call the unchanged helper, which redoes the (idempotent) msr write.
+// Returns what aot_mtmsr_check returns: 1 when an exception moved pc. The fast
+// path does not bump the runtime's mtmsr statistics counter (AOTSTAT "mtmsr"
+// now counts only the slow-path calls).
+// ----------------------------------------------------------------------------
+#define AOT_MSR_FP                0x2000u  /* UReg_MSR::FP, bit 13 */
+#define AOT_MSR_DR_BIT            0x10u    /* UReg_MSR::DR, bit 4 (= AOT_MSR_DR) */
+#define AOT_FEATURE_FLAG_PERFMON  4u       /* FEATURE_FLAG_PERFMON */
+extern int aot_mtmsr_check(AOTState* s, uint32_t val);
+static inline __attribute__((always_inline)) int aot_mtmsr_fast(AOTState* s, uint32_t val) {
+    if (__builtin_expect(s->exceptions != 0 ||
+                         ((val & AOT_MSR_DR_BIT) != 0 && s->pagetable_update_pending != 0), 0))
+        return aot_mtmsr_check(s, val);
+    s->msr = val;
+    s->feature_flags = (s->feature_flags & AOT_FEATURE_FLAG_PERFMON) | ((val >> 4) & 3u);
+    return 0;
+}
+/* aot_check_fpu returns 1 without side effects when MSR.FP is set; only the
+   FP-unavailable path (exception delivery) needs the helper. */
+static inline __attribute__((always_inline)) int aot_fpu_available(AOTState* s, uint32_t pc) {
+    if (__builtin_expect((s->msr & AOT_MSR_FP) != 0, 1))
+        return 1;
+    return aot_check_fpu(s, pc);
 }
 
 static inline uint32_t aot_rotl(uint32_t val, uint32_t shift) {

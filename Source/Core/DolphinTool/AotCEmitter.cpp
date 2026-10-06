@@ -89,7 +89,9 @@ void AOTCEmitter::EmitFpuCheck(std::string& out, u32 pc)
 {
   if (m_fpu_checked)
     return;
-  out += fmt::format("    if(!aot_check_fpu(s,{})) {{ s->downcount-={}; return; }}\n",
+  // aot_fpu_available tests MSR.FP inline; aot_check_fpu runs only on the
+  // FP-unavailable (exception) path.
+  out += fmt::format("    if(!aot_fpu_available(s,{})) {{ s->downcount-={}; return; }}\n",
                      PcStr(pc), m_block_cycle_count);
   m_fpu_checked = true;
 }
@@ -786,7 +788,16 @@ bool AOTCEmitter::EmitTable31(std::string& out, UGeckoInstruction inst, u32 pc)
   case 83:  EmitMfmsr(out, inst); return true;
   case 146: EmitMtmsr(out, inst, pc); return true;
   // Timebase
-  case 371: out += fmt::format("    s->gpr[{}]=aot_mftb(s,{});\n", I(inst.RD), I(inst.SPR)); return true;
+  case 371:  // mftb: decode TBR at translate time (aot_mftb's decode) and call
+             // aot_mfspr_special directly for TBL/TBU.
+  {
+    const u32 tbr = ((I(inst.SPR) & 0x1F) << 5) | ((I(inst.SPR) >> 5) & 0x1F);
+    if (tbr == 268 || tbr == 269)
+      out += fmt::format("    s->gpr[{}]=aot_mfspr_special(s,{});\n", I(inst.RD), tbr);
+    else
+      out += fmt::format("    s->gpr[{}]=aot_mftb(s,{});\n", I(inst.RD), I(inst.SPR));
+    return true;
+  }
   // stfiwx — like all X-form load/stores, RA=0 means literal zero, not r0.
   // Uses an FPR → needs the MSR.FP check like the other FP load/stores.
   case 983:
@@ -1514,8 +1525,20 @@ void AOTCEmitter::EmitMfspr(std::string& out, UGeckoInstruction inst)
     // OSSaveContext reads all seven upper GQRs on every thread switch.
     out += fmt::format("    s->gpr[{}]=s->spr[{}];\n", rd, spr);
     break;
-  default:
+  case 22:   // DEC: refresh from the fake decrementer while counting
+  case 268:  // TBL \ timebase: WriteFullTimeBaseValue(GetFakeTimeBase())
+  case 269:  // TBU /
+  case 921:  // WPAR: BNE bit from the gather pipe
+  case 937: case 938: case 941: case 942:  // UPMC1-4 (interpreter copies PMCn)
+  case 1010:  // IABR (interpreter masks TE on read)
+    // Read side effects (or interpreter-specific quirks) live in the runtime;
+    // keep them in one place.
     out += fmt::format("    s->gpr[{}]=aot_mfspr_special(s,{});\n", rd, spr);
+    break;
+  default:
+    // Every other SPR is a plain register read: exactly aot_mfspr_special's
+    // default case (HID2 alone has ~94 read sites in R3ME01).
+    out += fmt::format("    s->gpr[{}]=s->spr[{}];\n", rd, spr);
     break;
   }
 }
@@ -1579,10 +1602,11 @@ void AOTCEmitter::EmitMtmsr(std::string& out, UGeckoInstruction inst, u32 pc)
   // around every mutex), and returning to the Run loop for each one cost more
   // than the instruction. Cycles so far are charged here; the remainder of the
   // block accounts from zero. MSR.FP may have changed, so re-check before the
-  // next FP instruction.
+  // next FP instruction. aot_mtmsr_fast (aot_runtime.h) does the msr write and
+  // the feature_flags update inline and calls aot_mtmsr_check only when an
+  // exception is pending or msr.DR && pagetable_update_pending.
   out += fmt::format("    s->downcount-={}; s->pc={}; s->npc=s->pc; "
-                     "{{ extern int aot_mtmsr_check(AOTState*,uint32_t); "
-                     "if(aot_mtmsr_check(s,s->gpr[{}])) return; }}\n",
+                     "if(aot_mtmsr_fast(s,s->gpr[{}])) return;\n",
                      m_block_cycle_count, PcStr(pc + 4), I(inst.RS));
   m_block_cycle_count = 0;
   m_fpu_checked = false;

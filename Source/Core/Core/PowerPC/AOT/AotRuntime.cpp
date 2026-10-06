@@ -92,6 +92,16 @@ static_assert(decltype(UReg_MSR::DR)::NumBits() == 1 &&
               "AOT_MSR_DR must be exactly MSR.DR");
 static_assert(std::is_same_v<PowerPC::BatTable::value_type, uint32_t>,
               "AotFastMem::dbat reads the DBAT table as uint32_t");
+// Constants behind the inline mtmsr / FP-available paths in aot_runtime.h
+// (aot_mtmsr_fast, aot_fpu_available) and MsrUpdatedFast below.
+static_assert(decltype(UReg_MSR::FP)::NumBits() == 1 &&
+                  (1u << decltype(UReg_MSR::FP)::StartBit()) == AOT_MSR_FP,
+              "AOT_MSR_FP must be exactly MSR.FP");
+static_assert(AOT_MSR_DR_BIT == AOT_MSR_DR);
+static_assert(decltype(UReg_MSR::IR)::StartBit() == 5 && decltype(UReg_MSR::DR)::StartBit() == 4);
+static_assert(FEATURE_FLAG_MSR_DR == 1u << 0 && FEATURE_FLAG_MSR_IR == 1u << 1);
+static_assert(AOT_FEATURE_FLAG_PERFMON == FEATURE_FLAG_PERFMON);
+static_assert(sizeof(CPUEmuFeatureFlags) == sizeof(uint32_t));
 
 // Single-block mode flag for diff harness: when set, dispatch returns
 // immediately without calling any block. Declared in aot_runtime.h; defined
@@ -262,7 +272,7 @@ extern "C"
 // RAM fast-path descriptor exported to generated code: aot_runtime.h inlines
 // the RAM fast path into every block and calls the aot_*_slow functions below
 // for everything else. AotFastMem itself is defined in aot_runtime.h.
-AotFastMem aot_fast_mem = {nullptr, 0, nullptr, 0, nullptr, nullptr, 0};
+AotFastMem aot_fast_mem = {nullptr, 0, nullptr, 0, nullptr, nullptr, 0, 0};
 
 void aot_init_fast_mem()
 {
@@ -304,6 +314,9 @@ void aot_init_fast_mem()
   aot_fast_mem.dbat = s_mmu->GetDBATTable().data();
   aot_fast_mem.l1 = s_l1_ptr;
   aot_fast_mem.l1_size = s_l1_size;
+  // aot_fm_resolve's L1 arm: (addr ^ 0xE0000000) < l1_lim == FastMemHostPtr's
+  // L1 test (+8 guard); 0 disables it, like a null s_l1_ptr.
+  aot_fast_mem.l1_lim = (s_l1_ptr != nullptr && s_l1_size >= 8) ? s_l1_size - 7 : 0;
 }
 
 // Counterpart to aot_init_fast_mem, called from AOTCore::Shutdown. The RAM/L1
@@ -331,6 +344,7 @@ void aot_shutdown()
   aot_fast_mem.dbat = nullptr;
   aot_fast_mem.l1 = nullptr;
   aot_fast_mem.l1_size = 0;
+  aot_fast_mem.l1_lim = 0;
   s_track_fallbacks = false;
   aot_stats_enabled = s_track_fallbacks ? 1 : 0;
   s_fallback_counts.clear();
@@ -714,11 +728,26 @@ int aot_check_fpu(AOTState* s, uint32_t pc)
   return 0;
 }
 
+// PowerPCManager::MSRUpdatedInternal, inlined: the feature_flags update is two
+// ALU ops, and the rare msr.DR && pagetable_update_pending case calls the real
+// function (which recomputes the same flags, then MMU::PageTableUpdated). Same
+// computation as aot_mtmsr_fast in aot_runtime.h.
+static inline void MsrUpdatedFast(PowerPC::PowerPCState& ppc_state)
+{
+  if (ppc_state.msr.DR && ppc_state.pagetable_update_pending) [[unlikely]]
+  {
+    GetSystem().GetPowerPC().MSRUpdatedInternal();
+    return;
+  }
+  ppc_state.feature_flags = static_cast<CPUEmuFeatureFlags>(
+      (ppc_state.feature_flags & FEATURE_FLAG_PERFMON) | ((ppc_state.msr.Hex >> 4) & 0x3));
+}
+
 void aot_msr_updated(AOTState* s)
 {
   // MSRUpdated minus JitInterface::UpdateMembase() — the AOT runtime accesses
   // RAM through aot_fast_mem, not the JIT's fastmem base.
-  GetSystem().GetPowerPC().MSRUpdatedInternal();
+  MsrUpdatedFast(GetPPCState(s));
 }
 
 void aot_rfi(AOTState* s)
@@ -731,7 +760,7 @@ void aot_rfi(AOTState* s)
   ppc_state.msr.Hex = ((ppc_state.msr.Hex & ~mask) | (SRR1(ppc_state) & mask)) & clearMSR13;
   ppc_state.pc = SRR0(ppc_state);
   ppc_state.npc = ppc_state.pc;
-  aot_msr_updated(s);
+  MsrUpdatedFast(ppc_state);
   // Generated code dispatches straight to pc (no Run-loop bounce), so deliver
   // anything the restored MSR.EE now permits here, as the Run loop would.
   if (ppc_state.Exceptions != 0)
@@ -747,7 +776,7 @@ int aot_mtmsr_check(AOTState* s, uint32_t val)
     ++s_stat_mtmsr;
   auto& ppc_state = GetPPCState(s);
   ppc_state.msr.Hex = val;
-  aot_msr_updated(s);  // Lightweight -- no BAT remapping
+  MsrUpdatedFast(ppc_state);  // Lightweight -- no BAT remapping
   if (ppc_state.Exceptions == 0)
     return 0;
   const u32 pc = ppc_state.pc;
@@ -761,7 +790,7 @@ void aot_mtmsr(AOTState* s, uint32_t val)
     ++s_stat_mtmsr;
   auto& ppc_state = GetPPCState(s);
   ppc_state.msr.Hex = val;
-  aot_msr_updated(s);  // Lightweight — no BAT remapping
+  MsrUpdatedFast(ppc_state);  // Lightweight — no BAT remapping
   GetSystem().GetPowerPC().CheckExceptions();
 }
 
