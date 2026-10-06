@@ -1390,7 +1390,10 @@ void AotHarness::RunDiff()
 
       // Compare RAM: AOT result is in m_ram_shadow_aot, interpreter result is in current RAM
       bool ram_diverged = false;
-      if (m_ram_shadow_aot)
+      // Vectorized memcmp first; the word-by-word report loop (22M iterations
+      // over 88 MB of Wii RAM, ~90% of a --compare-ram gate's time) only runs
+      // when something actually differs.
+      if (m_ram_shadow_aot && !GuestRamEquals(guest_ram, m_ram_shadow_aot))
       {
         int ram_diff_printed = 0;
         for (u32 i = 0; i < shadow_size && ram_diff_printed < 10; i += 4)
