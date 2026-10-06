@@ -14,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
@@ -699,6 +700,33 @@ void aot_dump_fallback_stats()
   }
   if (sorted.size() > limit)
     fmt::print(stderr, "  ... and {} more unique PCs\n", sorted.size() - limit);
+
+  // Totals per RSO module over ALL pcs: the top-50 list above hides long tails, and module
+  // selection (games.conf RSO_MODULES_<ID>) needs each module's share of the residual.
+  // Membership is decided at dump time, so code that ran earlier in memory since reused
+  // (e.g. boot-time code before a savestate load) is attributed to whatever is there now.
+  std::unordered_map<std::string, std::pair<u64, size_t>> by_module;
+  for (const auto& [pc, count] : sorted)
+  {
+    const std::string desc = AotImageTracker::DescribeRsoPc(pc);
+    std::string key;
+    if (desc.empty())
+      key = pc >= 0x90000000u ? "(no module, MEM2)" : "(no module, MEM1)";
+    else
+      key = desc.substr(0, desc.find(' ')) + (desc.ends_with(" [AOT]") ? " [AOT]" : "");
+    auto& entry = by_module[key];
+    entry.first += count;
+    entry.second++;
+  }
+  std::vector<std::pair<std::string, std::pair<u64, size_t>>> modules(by_module.begin(),
+                                                                       by_module.end());
+  std::sort(modules.begin(), modules.end(),
+            [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+  fmt::print(stderr, "Fallbacks by module (all {} PCs):\n", sorted.size());
+  for (const auto& [name, stat] : modules)
+    fmt::print(stderr, "  {:>12} hits {:>6.2f}%  {:>6} pcs  {}\n", stat.first,
+               total ? 100.0 * static_cast<double>(stat.first) / static_cast<double>(total) : 0.0,
+               stat.second, name);
   fmt::print(stderr, "======================================\n\n");
 
   s_fallback_counts.clear();
