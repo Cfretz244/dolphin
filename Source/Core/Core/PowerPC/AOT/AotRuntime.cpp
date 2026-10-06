@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "Common/CommonTypes.h"
+#include "Common/Logging/Log.h"
 #include "Common/Swap.h"
 #include "Core/CoreTiming.h"
 #include "Core/HW/GPFifo.h"
@@ -197,6 +198,10 @@ struct TrustedCodeMemo
 };
 static std::array<TrustedCodeMemo, 131072> s_trusted_code_memos{};
 static bool s_trust_code = false;
+// Frontend override for trust-code mode (aot_set_trust_code): -1 = not set
+// (AOT_TRUST_CODE env decides), 0 = force off, 1 = force on. iOS cannot set
+// env vars, so the bridge sets this before boot. Survives aot_shutdown.
+static int s_trust_code_request = -1;
 static u64 s_guard_checks = 0;
 static u64 s_guard_reuses = 0;
 
@@ -265,10 +270,22 @@ void aot_init_fast_mem()
   s_trusted_code_memos.fill({});
   s_guard_checks = s_guard_reuses = 0;
   const char* trust = std::getenv("AOT_TRUST_CODE");
-  s_trust_code = trust && std::strcmp(trust, "1") == 0;
+  const bool env_trust = trust && std::strcmp(trust, "1") == 0;
+  s_trust_code = s_trust_code_request == -1 ? env_trust : s_trust_code_request == 1;
   if (s_trust_code)
+  {
     std::fprintf(stderr, "AOT: experimental trust-code mode ON; validated code is reused until "
                          "explicit invalidation (cache fill/eviction and PLRU checks omitted).\n");
+    NOTICE_LOG_FMT(CORE, "AOT: experimental trust-code mode ON (env={} request={}); validated "
+                         "code is reused until explicit invalidation (cache fill/eviction and "
+                         "PLRU checks omitted).",
+                   env_trust, s_trust_code_request);
+  }
+  else
+  {
+    NOTICE_LOG_FMT(CORE, "AOT: strict guard mode (trust-code OFF; env={} request={})", env_trust,
+                   s_trust_code_request);
+  }
   s_system = &Core::System::GetInstance();
   s_interpreter = &s_system->GetInterpreter();
   s_mmu = &s_system->GetMMU();
@@ -524,6 +541,74 @@ void aot_enable_fallback_tracking()
   s_track_fallbacks = true;
   aot_stats_enabled = 1;
   s_fallback_counts.clear();
+}
+
+// Frontend switch for trust-code mode; takes effect at the next aot_init_fast_mem
+// (i.e. call before boot). 1 = on, 0 = off (overrides AOT_TRUST_CODE=1).
+void aot_set_trust_code(int enabled)
+{
+  s_trust_code_request = enabled ? 1 : 0;
+}
+
+// Periodic, NON-destructive variant of aot_dump_fallback_stats for frontends
+// without a visible stderr (iOS): logs through NOTICE_LOG(CORE), keeps the map
+// and tracking enabled, and reports deltas since the previous call. Must run
+// on the CPU thread (owner of s_fallback_counts).
+void aot_log_fallback_stats(int top_n)
+{
+  if (!s_track_fallbacks)
+    return;
+
+  static u64 last_total = 0, last_guard = 0, last_reuse = 0, last_excchk = 0, last_rfi = 0,
+             last_mtmsr = 0, last_idle = 0, last_gp = 0;
+
+  std::vector<std::pair<u32, u64>> sorted(s_fallback_counts.begin(), s_fallback_counts.end());
+  std::sort(sorted.begin(), sorted.end(),
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+  u64 total = 0;
+  for (const auto& [pc, count] : sorted)
+    total += count;
+
+  // Counters can be reset under us (new session); never report a negative delta.
+  const auto delta = [](u64 now, u64& last) {
+    const u64 d = now >= last ? now - last : now;
+    last = now;
+    return d;
+  };
+  const u64 gp = s_stat_gp_store + s_stat_gp_psq;
+  const u64 dfb = delta(total, last_total);
+  const u64 dguard = delta(s_guard_checks, last_guard);
+  const u64 dreuse = delta(s_guard_reuses, last_reuse);
+  const u64 dexc = delta(aot_stat_exception_checks, last_excchk);
+  const u64 drfi = delta(s_stat_rfi, last_rfi);
+  const u64 dmtmsr = delta(s_stat_mtmsr, last_mtmsr);
+  const u64 didle = delta(s_stat_idle, last_idle);
+  const u64 dgp = delta(gp, last_gp);
+  NOTICE_LOG_FMT(CORE,
+                 "AOTSTAT total_fb={} dfb={} uniq={} guard={} dguard={} reuse={} dreuse={} "
+                 "trust={} excchk={} dexcchk={} rfi={} drfi={} mtmsr={} dmtmsr={} idle={} "
+                 "didle={} gp={} dgp={}",
+                 total, dfb, sorted.size(), s_guard_checks, dguard, s_guard_reuses, dreuse,
+                 s_trust_code ? 1 : 0, aot_stat_exception_checks, dexc, s_stat_rfi, drfi,
+                 s_stat_mtmsr, dmtmsr, s_stat_idle, didle, gp, dgp);
+
+  const size_t limit = std::min<size_t>(sorted.size(), top_n > 0 ? size_t(top_n) : 0);
+  for (size_t i = 0; i < limit; i++)
+  {
+    const u32 pc = sorted[i].first;
+    std::string opname = "???";
+    if (const u8* code = FastMemHostPtr(pc))
+    {
+      u32 inst_word;
+      std::memcpy(&inst_word, code, sizeof(u32));
+      inst_word = Common::swap32(inst_word);
+      UGeckoInstruction inst(inst_word);
+      const GekkoOPInfo* info = PPCTables::GetOpInfo(inst, pc);
+      if (info)
+        opname = info->opname;
+    }
+    NOTICE_LOG_FMT(CORE, "AOTSTAT fb {:>10} pc={:#010x} {}", sorted[i].second, pc, opname);
+  }
 }
 
 void aot_dump_fallback_stats()
