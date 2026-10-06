@@ -6,7 +6,9 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <OptionParser.h>
@@ -14,7 +16,9 @@
 #include <fmt/ostream.h>
 #include <sqlite3.h>
 
+#include "Common/CommonTypes.h"
 #include "Common/FileUtil.h"
+#include "Common/IOFile.h"
 #include "DolphinTool/VertexLoaderCEmitter.h"
 
 namespace DolphinTool
@@ -151,67 +155,175 @@ static std::string EmitVertexDecl(const VertexLoaderCEmitter::VertexDecl& d)
   return out;
 }
 
+// Reads only the vertex-format records of a .dpht trace file. Layout mirrors
+// CfgCommand.cpp ReadTraceFile: header = magic, version, block_count, edge_count,
+// smc_count (v2), + vtx_format_count (v3+), + snapshot_section_offset (v4+); then
+// blocks (8 B each: addr, size), edges (12 B each: from, to, type, 3 pad), SMC
+// records (16 B each: addr, length, u64 counter), then the vertex formats (20 B each:
+// vtx_desc_low, vtx_desc_high, vat_g0, vat_g1, vat_g2). v2 traces carry no formats.
+static bool ReadTraceVertexFormats(const std::string& path,
+                                   std::vector<VertexLoaderCEmitter::FormatConfig>& out)
+{
+  File::IOFile file(path, "rb");
+  if (!file.IsOpen())
+  {
+    fmt::println(std::cerr, "Error: Cannot open trace file: {}", path);
+    return false;
+  }
+
+  u32 magic, version, block_count, edge_count, smc_count;
+  if (!file.ReadBytes(&magic, 4) || !file.ReadBytes(&version, 4) ||
+      !file.ReadBytes(&block_count, 4) || !file.ReadBytes(&edge_count, 4) ||
+      !file.ReadBytes(&smc_count, 4))
+  {
+    fmt::println(std::cerr, "Error: Truncated trace header: {}", path);
+    return false;
+  }
+
+  if (magic != 0x54485044 || version < 2 || version > 4)
+  {
+    fmt::println(std::cerr, "Error: Invalid trace file {} (magic={:#x}, version={})", path, magic,
+                 version);
+    return false;
+  }
+
+  u32 vtx_format_count = 0;
+  if (version >= 3 && !file.ReadBytes(&vtx_format_count, 4))
+    return false;
+  u64 header_size = 20;
+  if (version >= 3)
+    header_size += 4;
+  if (version >= 4)
+    header_size += 4;  // snapshot_section_offset (unused here)
+
+  const u64 formats_offset = header_size + u64(block_count) * 8 + u64(edge_count) * 12 +
+                             u64(smc_count) * 16;
+  if (formats_offset + u64(vtx_format_count) * 20 > file.GetSize() ||
+      !file.Seek(static_cast<s64>(formats_offset), File::SeekOrigin::Begin))
+  {
+    fmt::println(std::cerr, "Error: Trace file {} too short for its vertex-format section", path);
+    return false;
+  }
+
+  for (u32 i = 0; i < vtx_format_count; i++)
+  {
+    VertexLoaderCEmitter::FormatConfig cfg;
+    u32 v[5];
+    if (!file.ReadBytes(v, sizeof(v)))
+      return false;
+    cfg.vtx_desc_low = v[0];
+    cfg.vtx_desc_high = v[1];
+    cfg.vat_g0 = v[2];
+    cfg.vat_g1 = v[3];
+    cfg.vat_g2 = v[4];
+    out.push_back(cfg);
+  }
+  return true;
+}
+
 int VtxAotCommand(const std::vector<std::string>& args)
 {
   optparse::OptionParser parser;
   parser.usage("usage: dolphin-tool vtxaot [options]");
 
   parser.add_option("-c", "--cfg").action("store").help("Path to CFG SQLite database");
+  parser.add_option("-t", "--trace")
+      .action("append")
+      .help("Trace file (.dpht, v3+) whose recorded vertex formats are added (repeatable)");
   parser.add_option("-o", "--output").action("store").help("Path to output directory");
   parser.add_option("-p", "--prefix").action("store").help("Game ID prefix (e.g. GALE01)");
 
   const optparse::Values options = parser.parse_args(args);
 
-  if (!options.is_set("cfg") || !options.is_set("output") || !options.is_set("prefix"))
+  const std::vector<std::string> trace_paths =
+      options.is_set("trace") ? std::vector<std::string>(options.all("trace").begin(),
+                                                         options.all("trace").end()) :
+                                std::vector<std::string>{};
+
+  if ((!options.is_set("cfg") && trace_paths.empty()) || !options.is_set("output") ||
+      !options.is_set("prefix"))
   {
     parser.print_help();
     return EXIT_FAILURE;
   }
 
-  const std::string cfg_path = options["cfg"];
+  const std::string cfg_path = options.is_set("cfg") ? options["cfg"] : std::string{};
   const std::string output_dir = options["output"];
   const std::string prefix = options["prefix"];
 
-  // Open CFG database
-  sqlite3* db = nullptr;
-  if (sqlite3_open_v2(cfg_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK)
-  {
-    fmt::println(std::cerr, "Error: Cannot open database: {}", cfg_path);
-    return EXIT_FAILURE;
-  }
-
-  // Read vertex formats
+  // Formats = union of the CFG vertex_formats table (if present) and every trace's
+  // vertex-format records, in first-seen order.
   std::vector<VertexLoaderCEmitter::FormatConfig> formats;
+  std::set<std::tuple<u32, u32, u32, u32, u32>> seen;
+  const auto add_formats = [&](const std::vector<VertexLoaderCEmitter::FormatConfig>& src) {
+    for (const auto& f : src)
+    {
+      if (seen.emplace(f.vtx_desc_low, f.vtx_desc_high, f.vat_g0, f.vat_g1, f.vat_g2).second)
+        formats.push_back(f);
+    }
+  };
+
+  if (!cfg_path.empty())
   {
+    sqlite3* db = nullptr;
+    if (sqlite3_open_v2(cfg_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK)
+    {
+      fmt::println(std::cerr, "Error: Cannot open database: {}", cfg_path);
+      sqlite3_close(db);
+      return EXIT_FAILURE;
+    }
+
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "SELECT vtx_desc_low, vtx_desc_high, vat_g0, vat_g1, vat_g2 "
                       "FROM vertex_formats";
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
     {
-      fmt::println(std::cerr, "Error: vertex_formats table not found in {}", cfg_path);
       sqlite3_close(db);
-      return EXIT_FAILURE;
+      if (trace_paths.empty())
+      {
+        fmt::println(std::cerr, "Error: vertex_formats table not found in {}", cfg_path);
+        return EXIT_FAILURE;
+      }
+      // Multi-image CFG dbs (cfg --dol-images) carry no vertex_formats table; the
+      // traces passed with --trace are then the only source.
+      fmt::println(std::cerr,
+                   "Warning: vertex_formats table not found in {} — using --trace files only",
+                   cfg_path);
     }
-
-    while (sqlite3_step(stmt) == SQLITE_ROW)
+    else
     {
-      VertexLoaderCEmitter::FormatConfig cfg;
-      cfg.vtx_desc_low = static_cast<uint32_t>(sqlite3_column_int64(stmt, 0));
-      cfg.vtx_desc_high = static_cast<uint32_t>(sqlite3_column_int64(stmt, 1));
-      cfg.vat_g0 = static_cast<uint32_t>(sqlite3_column_int64(stmt, 2));
-      cfg.vat_g1 = static_cast<uint32_t>(sqlite3_column_int64(stmt, 3));
-      cfg.vat_g2 = static_cast<uint32_t>(sqlite3_column_int64(stmt, 4));
-      formats.push_back(cfg);
+      std::vector<VertexLoaderCEmitter::FormatConfig> cfg_formats;
+      while (sqlite3_step(stmt) == SQLITE_ROW)
+      {
+        VertexLoaderCEmitter::FormatConfig cfg;
+        cfg.vtx_desc_low = static_cast<uint32_t>(sqlite3_column_int64(stmt, 0));
+        cfg.vtx_desc_high = static_cast<uint32_t>(sqlite3_column_int64(stmt, 1));
+        cfg.vat_g0 = static_cast<uint32_t>(sqlite3_column_int64(stmt, 2));
+        cfg.vat_g1 = static_cast<uint32_t>(sqlite3_column_int64(stmt, 3));
+        cfg.vat_g2 = static_cast<uint32_t>(sqlite3_column_int64(stmt, 4));
+        cfg_formats.push_back(cfg);
+      }
+      sqlite3_finalize(stmt);
+      sqlite3_close(db);
+      fmt::println(std::cerr, "  cfg {}: {} vertex formats", cfg_path, cfg_formats.size());
+      add_formats(cfg_formats);
     }
-    sqlite3_finalize(stmt);
   }
-  sqlite3_close(db);
+
+  for (const std::string& trace_path : trace_paths)
+  {
+    std::vector<VertexLoaderCEmitter::FormatConfig> trace_formats;
+    if (!ReadTraceVertexFormats(trace_path, trace_formats))
+      return EXIT_FAILURE;
+    fmt::println(std::cerr, "  trace {}: {} vertex formats", trace_path, trace_formats.size());
+    add_formats(trace_formats);
+  }
+  fmt::println(std::cerr, "  union: {} vertex formats", formats.size());
 
   if (formats.empty())
   {
-    fmt::println(std::cerr, "No vertex formats found in {}. "
-                 "Ensure trace collection recorded vertex formats (requires trace format v3+).",
-                 cfg_path);
+    fmt::println(std::cerr, "No vertex formats found. "
+                 "Ensure trace collection recorded vertex formats (requires trace format v3+).");
     return EXIT_SUCCESS;
   }
 
