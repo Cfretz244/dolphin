@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 #include <unordered_map>
@@ -36,6 +37,7 @@
 #include "DiscIO/Volume.h"
 #include "DolphinTool/AotCEmitter.h"
 #include "DolphinTool/CfgCommand.h"
+#include "DolphinTool/RelFile.h"
 
 extern const char s_aot_runtime_header[];
 extern const char s_aot_images_header[];
@@ -1036,6 +1038,179 @@ void AddRealModeImages(std::vector<Image>& images, const std::vector<std::string
   }
 }
 
+// ---------------------------------------------------------------------------
+// Wii-SDK RSO modules (Metroid Prime 2/3 and the Trilogy launcher; design notes:
+// research/aot-rso-design.md in aot-dolphin-helper). The game loads each .rso
+// whole into a heap buffer and locates it in place at a base that moves, so
+// module blocks are emitted base-relative and found at runtime by the
+// AotImageTracker (miss-triggered header identification).
+// ---------------------------------------------------------------------------
+std::vector<u8> ReadDiscFile(const DiscIO::Volume& volume, const std::string& path)
+{
+  const auto partition = volume.GetGamePartition();
+  const auto* fs = volume.GetFileSystem(partition);
+  if (!fs || !fs->IsValid())
+    throw std::runtime_error("Cannot read disc filesystem");
+  const auto info = fs->FindFileInfo(path);
+  if (!info || info->IsDirectory())
+    throw std::runtime_error("No such disc file: " + path);
+  std::vector<u8> bytes(info->GetSize());
+  if (DiscIO::ReadFile(volume, partition, info.get(), bytes.data(), bytes.size()) != bytes.size())
+    throw std::runtime_error("Cannot read disc file: " + path);
+  return bytes;
+}
+
+u32 Be32(const std::vector<u8>& d, u32 off)
+{
+  if (off > d.size() || d.size() - off < 4)
+    throw std::runtime_error("RSO: truncated file");
+  return (u32(d[off]) << 24) | (u32(d[off + 1]) << 16) | (u32(d[off + 2]) << 8) | d[off + 3];
+}
+
+std::string CStr(const std::vector<u8>& d, u32 off)
+{
+  std::string out;
+  while (off < d.size() && d[off])
+    out += static_cast<char>(d[off++]);
+  return out;
+}
+
+struct RsoReloc
+{
+  u32 offset;  // file offset of the patched field
+  u32 index;   // internals: target section; externals: import index
+  u8 type;
+  u32 addend;
+};
+
+struct RsoExport
+{
+  std::string name;
+  u32 offset;   // in its section
+  u32 section;  // section index (the static module's own sections for selfile.sel)
+};
+
+struct RsoFile
+{
+  std::string name;  // basename of the build path, e.g. RSO_FishCloud.plf
+  std::vector<u8> data;
+  std::vector<std::pair<u32, u32>> sections;  // (file offset, size)
+  std::vector<RsoReloc> internals, externals;
+  std::vector<std::string> imports;
+  std::vector<RsoExport> exports;
+};
+
+RsoFile ParseRso(std::vector<u8> d)
+{
+  RsoFile f;
+  const u32 nsec = Be32(d, 8), sec_off = Be32(d, 12), name_off = Be32(d, 16);
+  // The runtime identifies a located module by 10 <= numSections <= 40 and
+  // the section table directly after the 0x58-byte header.
+  if (nsec < 10 || nsec > 40 || sec_off != 0x58)
+    throw std::runtime_error(fmt::format("RSO: unsupported header (numSections {}, section table "
+                                         "at {:#x})",
+                                         nsec, sec_off));
+  for (u32 i = 0; i < nsec; i++)
+  {
+    const u32 off = Be32(d, sec_off + i * 8) & ~1u, size = Be32(d, sec_off + i * 8 + 4);
+    // Offset 0 = no bytes in the file (bss, empty sections).
+    if (off && (off > d.size() || d.size() - off < size))
+      throw std::runtime_error(fmt::format("RSO: section {} outside the file", i));
+    f.sections.emplace_back(off, size);
+  }
+  const std::string path = CStr(d, name_off);
+  f.name = path.substr(path.find_last_of("\\/") == std::string::npos ? 0 :
+                                                                     path.find_last_of("\\/") + 1);
+  auto relocs = [&](u32 off, u32 size, std::vector<RsoReloc>& out) {
+    for (u32 i = 0; i + 12 <= size; i += 12)
+    {
+      const u32 info = Be32(d, off + i + 4);
+      out.push_back({Be32(d, off + i), info >> 8, static_cast<u8>(info & 0xFF), Be32(d, off + i + 8)});
+    }
+  };
+  relocs(Be32(d, 0x30), Be32(d, 0x34), f.internals);
+  relocs(Be32(d, 0x38), Be32(d, 0x3C), f.externals);
+  const u32 imp_off = Be32(d, 0x4C), imp_size = Be32(d, 0x50), imp_names = Be32(d, 0x54);
+  for (u32 i = 0; i + 12 <= imp_size; i += 12)
+    f.imports.push_back(CStr(d, imp_names + Be32(d, imp_off + i)));
+  const u32 exp_off = Be32(d, 0x40), exp_size = Be32(d, 0x44), exp_names = Be32(d, 0x48);
+  for (u32 i = 0; i + 16 <= exp_size; i += 16)
+    f.exports.push_back({CStr(d, exp_names + Be32(d, exp_off + i)), Be32(d, exp_off + i + 4),
+                         Be32(d, exp_off + i + 8)});
+  f.data = std::move(d);
+  return f;
+}
+
+// --rso-module IMAGE:DISC_PATH:STATIC_BASES  (selfile.sel = same directory)
+struct RsoSpec
+{
+  size_t image;
+  std::string path;
+  std::string static_bases;
+};
+
+std::vector<RsoSpec> ParseRsoSpecs(const std::vector<std::string>& specs)
+{
+  std::vector<RsoSpec> out;
+  for (const auto& spec : specs)
+  {
+    const size_t a = spec.find(':'), b = spec.find(':', a + 1);
+    if (a == std::string::npos || b == std::string::npos)
+      throw std::runtime_error("--rso-module wants IMAGE:DISC_PATH:STATIC_BASES, got " + spec);
+    size_t image = 0;
+    try
+    {
+      image = std::stoul(spec.substr(0, a));
+    }
+    catch (const std::exception&)
+    {
+      throw std::runtime_error("--rso-module: bad image id in " + spec);
+    }
+    RsoSpec parsed{image, spec.substr(a + 1, b - a - 1), spec.substr(b + 1)};
+    if (std::any_of(out.begin(), out.end(), [&](const RsoSpec& o) { return o.path == parsed.path; }))
+      throw std::runtime_error("--rso-module: duplicate module " + parsed.path);
+    out.push_back(std::move(parsed));
+  }
+  return out;
+}
+
+// Static-module (selfile.sel) section bases: "SECTION 0xADDRESS" per line, '#'
+// comments. Taken from a RAM dump of the located static module (its section
+// table); every base must lie inside the owning DOL's text, data or bss.
+std::map<u32, u32> ReadStaticBases(const std::string& path, const DolReader& dol)
+{
+  std::ifstream in(path);
+  if (!in)
+    throw std::runtime_error("--rso-module: cannot open static bases file " + path);
+  std::map<u32, u32> bases;
+  std::string line;
+  while (std::getline(in, line))
+  {
+    line = line.substr(0, line.find('#'));
+    std::istringstream fields(line);
+    u32 sect = 0;
+    std::string addr;
+    if (!(fields >> sect))
+      continue;
+    if (!(fields >> addr))
+      throw std::runtime_error("--rso-module: bad line in " + path + ": " + line);
+    const u32 value = static_cast<u32>(std::stoul(addr, nullptr, 16));
+    bool inside = value - dol.GetBssAddress() < dol.GetBssSize();
+    for (int i = 0; i < dol.GetNumTextSections(); ++i)
+      inside |= value - dol.GetTextSectionAddress(i) < dol.GetTextSectionSize(i);
+    for (int i = 0; i < dol.GetNumDataSections(); ++i)
+      inside |= value - dol.GetDataSectionAddress(i) < dol.GetDataSectionSize(i);
+    if (!inside)
+      throw std::runtime_error(fmt::format("--rso-module: static section {} base {:#010x} ({}) is "
+                                           "not inside the owning DOL",
+                                           sect, value, path));
+    bases[sect] = value;
+  }
+  if (bases.empty())
+    throw std::runtime_error("--rso-module: empty static bases file " + path);
+  return bases;
+}
+
 u32 ParseVariantMask(const std::string& name)
 {
   const auto pos = name.rfind("#primehack-");
@@ -1048,7 +1223,8 @@ u32 ParseVariantMask(const std::string& name)
 bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg,
                             const std::string& output, const std::string& prefix,
                             const std::string& boot_hash, const std::set<size_t>& selected,
-                            const std::vector<std::string>& real_mode_dumps)
+                            const std::vector<std::string>& real_mode_dumps,
+                            const std::vector<std::string>& rso_module_specs)
 {
   try
   {
@@ -1322,6 +1498,297 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
       outs.push_back(std::move(out));
     }
 
+    // RSO modules (--rso-module): base-relative module blocks bound to the
+    // owning DOL image's blocks for external calls; descriptors for the tracker.
+    struct RsoOut
+    {
+      std::string sym;
+      std::string name;
+      u32 num_sections = 0, text_section = 1, text_size = 0;
+      std::vector<u32> section_sizes;
+      size_t blocks = 0, word_count = 0;
+    };
+    std::vector<RsoOut> rso_outs;
+    for (const auto& spec : ParseRsoSpecs(rso_module_specs))
+    {
+      const auto owner = std::find_if(outs.begin(), outs.end(),
+                                      [&](const BaseOut& o) { return o.image == spec.image; });
+      if (owner == outs.end())
+        throw std::runtime_error("--rso-module: image not emitted: " + std::to_string(spec.image));
+      RsoFile rso = ParseRso(ReadDiscFile(volume, spec.path));
+      const std::string dir = spec.path.substr(0, spec.path.find_last_of('/') + 1);
+      RsoFile sel = ParseRso(ReadDiscFile(volume, dir + "selfile.sel"));
+      std::unordered_map<std::string, u32> sel_exports;  // name -> export record index
+      for (u32 k = 0; k < sel.exports.size(); ++k)
+        sel_exports[sel.exports[k].name] = k;
+      if (!images[spec.image].dol)
+        throw std::runtime_error("--rso-module: image " + std::to_string(spec.image) +
+                                 " is not a DOL");
+      const std::map<u32, u32> static_bases =
+          ReadStaticBases(spec.static_bases, *images[spec.image].dol);
+      RsoOut ro;
+      ro.sym = fmt::format("{}_rso{}", prefix, rso_outs.size());
+      ro.name = rso.name;
+      ro.num_sections = static_cast<u32>(rso.sections.size());
+      // The code section is the one the module's _prolog lives in (section 1
+      // in every Trilogy module; the file carries no executable flag).
+      ro.text_section = 1;
+      for (const auto& e : rso.exports)
+        if (e.name == "_prolog")
+          ro.text_section = e.section;
+      if (ro.text_section == 0 || ro.text_section >= rso.sections.size())
+        throw std::runtime_error("RSO: bad code section index in " + spec.path);
+      const auto [text_off, text_size] = rso.sections.at(ro.text_section);
+      ro.text_size = text_size;
+      if (!text_off || !text_size || (text_off & 3) || (text_size & 3) ||
+          text_off + text_size > rso.data.size())
+        throw std::runtime_error("RSO: bad text section in " + spec.path);
+      if (std::any_of(rso_outs.begin(), rso_outs.end(), [&](const RsoOut& o) {
+            return o.name == ro.name && o.num_sections == ro.num_sections &&
+                   o.section_sizes == [&] {
+                     std::vector<u32> v;
+                     for (const auto& sec : rso.sections)
+                       v.push_back(sec.second);
+                     return v;
+                   }();
+          }))
+        throw std::runtime_error("RSO: two modules named " + ro.name +
+                                 " with identical section sizes cannot be told apart");
+      for (const auto& sec : rso.sections)
+        ro.section_sizes.push_back(sec.second);
+      const u32 text_sect = ro.text_section;
+      auto in_text = [&](u32 off) { return off >= text_off && off < text_off + text_size; };
+      auto synth = [&](u32 file_off) { return (text_sect << 24) | (file_off - text_off); };
+
+      std::vector<u8> text(rso.data.begin() + text_off, rso.data.begin() + text_off + text_size);
+      ModuleMode mode;
+      mode.fn_prefix = ro.sym;
+      mode.base_array = ro.sym + "_base";
+      std::set<u32> dol_known(std::views::keys(rows[spec.image]).begin(),
+                              std::views::keys(rows[spec.image]).end());
+      mode.dol_blocks = &dol_known;
+      for (const auto& [off, size] : rso.sections)
+        mode.section_sizes.push_back(size);
+      std::set<u32> leaders = {text_sect << 24};
+      std::vector<AotRsoWord> words;
+      auto field16 = [](u8 type, u32 t) -> u16 {
+        return type == R_PPC_ADDR16_LO ? static_cast<u16>(t) :
+               type == R_PPC_ADDR16_HI ? static_cast<u16>(t >> 16) :
+                                         static_cast<u16>((t + 0x8000) >> 16);
+      };
+      std::set<u32> reloc_words;  // file offsets of words touched by any relocation
+      for (const auto* list : {&rso.internals, &rso.externals})
+        for (const auto& r : *list)
+          reloc_words.insert(r.offset & ~3u);
+      for (const auto& r : rso.internals)
+      {
+        // Code addresses taken anywhere (vtables, function pointers, branches)
+        // become block leaders.
+        if (r.index == text_sect && r.addend < text_size)
+          leaders.insert((text_sect << 24) | (r.addend & ~3u));
+        if (!in_text(r.offset))
+          continue;
+        const u32 site = synth(r.offset & ~3u);
+        if (r.type == R_PPC_ADDR16_LO || r.type == R_PPC_ADDR16_HI || r.type == R_PPC_ADDR16_HA)
+          mode.imm_relocs[site] =
+              ModuleImmReloc{r.type, fmt::format("({}_base[{}]+{:#x}u)", ro.sym, r.index, r.addend)};
+        else if (r.type == R_PPC_REL24 && r.index == text_sect)
+          mode.branch_overrides[site] = {ModuleBranchOverride::Local, (text_sect << 24) | r.addend};
+        else
+          mode.force_fallback.insert(site);
+      }
+      // Located external HA/LO words are base-independent: identity checks that
+      // the module was linked against this DOL with these static bases. Keep
+      // candidates per static section so every section used is checked.
+      std::map<u32, std::vector<AotRsoWord>> ext_words;
+      size_t cross_module = 0;
+      for (const auto& r : rso.externals)
+      {
+        if (!in_text(r.offset))
+          continue;
+        const u32 site = synth(r.offset & ~3u);
+        const auto exp = r.index < rso.imports.size() ? sel_exports.find(rso.imports[r.index]) :
+                                                        sel_exports.end();
+        const auto sect_base =
+            exp == sel_exports.end() ? static_bases.end() :
+                                       static_bases.find(sel.exports[exp->second].section);
+        if (sect_base == static_bases.end())
+        {
+          // Cross-RSO import (not exported by the static module): single-step
+          // the relocated in-RAM word.
+          if (exp == sel_exports.end())
+            ++cross_module;
+          else
+            throw std::runtime_error(fmt::format("RSO {}: static section {} has no base in {}",
+                                                 ro.name, sel.exports[exp->second].section,
+                                                 spec.static_bases));
+          mode.force_fallback.insert(site);
+          continue;
+        }
+        const u32 target = sect_base->second + sel.exports[exp->second].offset + r.addend;
+        const u32 at = r.offset - text_off;
+        if (r.type == R_PPC_REL24)
+        {
+          mode.branch_overrides[site] = {ModuleBranchOverride::Absolute, target};
+        }
+        else if (r.type == R_PPC_ADDR16_LO || r.type == R_PPC_ADDR16_HI ||
+                 r.type == R_PPC_ADDR16_HA)
+        {
+          const u16 f = field16(r.type, target);
+          text[at] = static_cast<u8>(f >> 8);
+          text[at + 1] = static_cast<u8>(f);
+          if ((r.offset & 3) == 2)
+            ext_words[sect_base->first].push_back(
+                {r.offset & ~3u, (u32(text[at - 2]) << 24) | (u32(text[at - 1]) << 16) |
+                                     (u32(text[at]) << 8) | text[at + 1]});
+        }
+        else if (r.type == R_PPC_ADDR32 && (r.offset & 3) == 0)
+        {
+          for (int b = 0; b < 4; ++b)
+            text[at + b] = static_cast<u8>(target >> (24 - 8 * b));
+          mode.force_fallback.insert(site);  // data word in text: never executed as code
+        }
+        else
+        {
+          mode.force_fallback.insert(site);
+        }
+      }
+      // Up to 12 external checks, round-robin over the static sections used.
+      for (size_t round = 0, added = 1; added && words.size() < 12; ++round)
+      {
+        added = 0;
+        for (const auto& [sect, list] : ext_words)
+        {
+          if (round < list.size() && words.size() < 12)
+          {
+            // Spread the picks over the module rather than its first function.
+            words.push_back(list[(round * 7919) % list.size()]);
+            ++added;
+          }
+        }
+      }
+      for (const auto& e : rso.exports)
+        if (e.section == text_sect && e.offset < text_size)
+          leaders.insert((text_sect << 24) | (e.offset & ~3u));
+      // Unrelocated text words: must equal the disc bytes in RAM.
+      for (u32 k = 0, step = std::max(4u, (text_size / 16) & ~3u); k < text_size && words.size() < 24;
+           k += step)
+      {
+        u32 at = k;
+        while (at < text_size && reloc_words.contains(text_off + at))
+          at += 4;
+        if (at < text_size)
+          words.push_back({text_off + at, Be32(rso.data, text_off + at)});
+      }
+      // Distinct offsets only (a short module can land twice on one word).
+      std::sort(words.begin(), words.end(),
+                [](const AotRsoWord& a, const AotRsoWord& b) { return a.offset < b.offset; });
+      words.erase(std::unique(words.begin(), words.end(),
+                              [](const AotRsoWord& a, const AotRsoWord& b) {
+                                return a.offset == b.offset;
+                              }),
+                  words.end());
+
+      PPCMemoryImage mem;
+      mem.AddSection(text_sect << 24, text.data(), text_size);
+      // Linear sweep: every valid word belongs to a block; leaders at the
+      // section start, after every block-ending instruction, at every branch
+      // target and at every relocation target / export in .text.
+      auto inst_at = [&](u32 pc) -> std::optional<UGeckoInstruction> {
+        const auto w = mem.ReadInstruction(pc);
+        if (!w || *w == 0 || !PPCTables::IsValidInstruction(UGeckoInstruction(*w), pc))
+          return std::nullopt;
+        return UGeckoInstruction(*w);
+      };
+      const u32 end = (text_sect << 24) + text_size;
+      for (u32 pc = text_sect << 24; pc < end; pc += 4)
+      {
+        const auto inst = inst_at(pc);
+        if (!inst)
+        {
+          leaders.insert(pc + 4);
+          continue;
+        }
+        if (!(PPCTables::GetOpInfo(*inst, pc)->flags & FL_ENDBLOCK))
+          continue;
+        leaders.insert(pc + 4);
+        if (auto ov = mode.branch_overrides.find(pc); ov != mode.branch_overrides.end())
+        {
+          if (ov->second.kind == ModuleBranchOverride::Local)
+            leaders.insert(ov->second.target);
+        }
+        else if (inst->OPCD == 18 && !inst->AA)
+          leaders.insert(pc + u32(SignExt26(inst->LI << 2)));
+        else if (inst->OPCD == 16 && !inst->AA)
+          leaders.insert(pc + u32(SignExt16(s16(inst->BD << 2))));
+      }
+      std::map<u32, u32> mblocks;
+      for (auto it = leaders.begin(); it != leaders.end(); ++it)
+      {
+        if (*it < (text_sect << 24) || *it >= end)
+          continue;
+        const auto next = std::next(it);
+        u32 count = 0;
+        for (u32 pc = *it; pc < end; pc += 4)
+        {
+          if (next != leaders.end() && pc == *next && pc != *it)
+            break;
+          const auto inst = inst_at(pc);
+          if (!inst)
+            break;
+          ++count;
+          if (PPCTables::GetOpInfo(*inst, pc)->flags & FL_ENDBLOCK)
+            break;
+        }
+        if (count)
+          mblocks.emplace(*it, count);
+      }
+      std::set<u32> mblock_set(std::views::keys(mblocks).begin(), std::views::keys(mblocks).end());
+      AOTCEmitter emitter(mem, {}, owner->sym);
+      emitter.SetModuleMode(&mode, mblock_set);
+      auto file = Output(fmt::format("{}/{}_blocks_rso{}.c", output, prefix, rso_outs.size()));
+      file << fmt::format("#include \"{}_forward_decls.h\"\n\n", owner->sym);
+      file << fmt::format("uint32_t {}_base[{}];\n\n", ro.sym, ro.num_sections);
+      for (const auto& [pc, count] : mblocks)
+        file << fmt::format("__attribute__((noinline)) void {}_s{}_{:x}(AOTState* s);\n", ro.sym,
+                            pc >> 24, pc & 0x00FFFFFF);
+      for (const auto& [pc, count] : mblocks)
+        file << emitter.TranslateBlock(pc, count, true) << "\n";
+      file << fmt::format("const AOTBlockFunc {}_table[{}] = {{\n", ro.sym, text_size / 4);
+      for (u32 e = 0; e < text_size / 4; ++e)
+      {
+        const u32 pc = (text_sect << 24) | (e << 2);
+        file << (mblocks.contains(pc) ? fmt::format("    {}_s{}_{:x},\n", ro.sym, text_sect, e << 2) :
+                                        std::string("    0,\n"));
+      }
+      file << "};\n";
+      file << fmt::format("const uint32_t {}_section_sizes[] = {{", ro.sym);
+      for (const auto& [off, size] : rso.sections)
+        file << fmt::format("{:#x}u,", size);
+      file << "};\n";
+      file << fmt::format("const AotRsoWord {}_words[] = {{\n", ro.sym);
+      for (const auto& w : words)
+        file << fmt::format("    {{{:#x}u,{:#010x}u}},\n", w.offset, w.word);
+      file << "};\n";
+      ro.word_count = words.size();
+      file << "#if AOT_HARNESS\n";
+      file << fmt::format("const AotImageBlockSize {}_block_sizes[] = {{\n", ro.sym);
+      for (const auto& [pc, count] : mblocks)
+        file << fmt::format("    {{{:#x}u,{}u}},\n", pc & 0x00FFFFFF, count);
+      file << "};\n#endif\n";
+      ro.blocks = mblocks.size();
+      for (const auto& [name, n] : emitter.GetUnhandledOpcodes())
+        fmt::println(std::cerr, "    rso {} fallback [{}]: {}", ro.name, name, n);
+      fmt::println(std::cerr,
+                   "RSO module {} ({}, {}): {} blocks over {} bytes of text (section {}), {} imm "
+                   "relocs, {} branch overrides, {} forced fallbacks ({} cross-module import "
+                   "sites), {} identity words, bound to image {}",
+                   ro.sym, ro.name, spec.path, ro.blocks, text_size, text_sect,
+                   mode.imm_relocs.size(), mode.branch_overrides.size(),
+                   mode.force_fallback.size(), cross_module, words.size(), spec.image);
+      rso_outs.push_back(std::move(ro));
+    }
+
     // Shared dispatch: tables, descriptors, tracker-driven dispatch, registration.
     {
       auto file = Output(fmt::format("{}/{}_dispatch.c", output, prefix));
@@ -1437,7 +1904,31 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
         file << "            AOTBlockFunc fn = aot_active_image_real.table[idx];\n";
         file << "            if (fn) { [[clang::musttail]] return fn(s); }\n        }\n    }\n";
       }
-      file << "    [[clang::musttail]] return aot_interpreter_single_step(s);\n}\n\n";
+      file << fmt::format("    [[clang::musttail]] return {}(s);\n}}\n\n",
+                          rso_outs.empty() ? "aot_interpreter_single_step" : "aot_rso_dispatch");
+      if (!rso_outs.empty())
+      {
+        for (const auto& ro : rso_outs)
+        {
+          file << fmt::format("extern uint32_t {0}_base[]; extern const AOTBlockFunc {0}_table[];\n"
+                              "extern const uint32_t {0}_section_sizes[]; extern const AotRsoWord "
+                              "{0}_words[];\n",
+                              ro.sym);
+          file << fmt::format("#if AOT_HARNESS\nextern const AotImageBlockSize {}_block_sizes[];\n#endif\n",
+                              ro.sym);
+        }
+        file << fmt::format("static const AotRsoModuleDesc {}_rso_modules[] = {{\n", prefix);
+        for (const auto& ro : rso_outs)
+        {
+          file << fmt::format("    {{\"{1}\",{2}u,{0}_section_sizes,{3}u,{4}u,{0}_table,{0}_base,"
+                              "{0}_words,{5}u,\n",
+                              ro.sym, ro.name, ro.num_sections, ro.text_section, ro.text_size,
+                              ro.word_count);
+          file << fmt::format("#if AOT_HARNESS\n     {0}_block_sizes,{1}u}},\n#else\n     0,0u}},\n#endif\n",
+                              ro.sym, ro.blocks);
+        }
+        file << "};\n";
+      }
       file << fmt::format("AOTBlockFunc {}_lookup_block(uint32_t pc) {{ return "
                           "aot_images_lookup(pc); }}\n",
                           prefix);
@@ -1456,6 +1947,10 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
       file << fmt::format(
           "    aot_register_game_images(\"{}\", {}_images, {}u, AOT_IMAGES_VERSION);\n", prefix,
           prefix, outs.size());
+      if (!rso_outs.empty())
+        file << fmt::format("    aot_register_game_rso_modules(\"{}\", {}_rso_modules, {}u, "
+                            "AOT_IMAGES_VERSION);\n",
+                            prefix, prefix, rso_outs.size());
       file << "#if AOT_HARNESS\n";
       file << fmt::format("    aot_register_image_block_sizes(\"{}\", {}_image_block_size);\n",
                           prefix, prefix);

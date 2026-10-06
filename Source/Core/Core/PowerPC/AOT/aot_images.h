@@ -26,8 +26,10 @@
 extern "C" {
 #endif
 
-/* 2: AOT_IMAGE_REAL_MODE images + the aot_active_image_real dispatch slot. */
-#define AOT_IMAGES_VERSION 2
+/* 2: AOT_IMAGE_REAL_MODE images + the aot_active_image_real dispatch slot.
+ * 3: Wii-SDK RSO modules (AotRsoModuleDesc, aot_register_game_rso_modules,
+ *    aot_rso_dispatch as the dispatch's last resort). */
+#define AOT_IMAGES_VERSION 3
 
 /* One expected instruction word at a fixed address. */
 typedef struct AotImageWord {
@@ -108,6 +110,43 @@ extern AotActiveImage aot_active_image_real;
  * rescans when it differs from aot_images_seen. */
 extern const uint64_t* aot_images_generation;
 extern uint64_t aot_images_seen;
+
+/* ------------------------------------------------------------------------
+ * Wii-SDK RSO modules (Prime 2/3 / launcher): position-independent code that
+ * the game loads into heap buffers and locates in place at bases that move.
+ * Blocks are emitted base-relative (pc expressions read <sym>_base[sect]) and
+ * found at runtime by "miss-triggered identification": when dispatch misses a
+ * MEM1/MEM2 pc with MSR.IR set, the tracker scans backwards for a located RSO
+ * header (word[3] == base + 0x58, 10 <= numSections <= 40), matches the build
+ * path basename the header's name pointer names, and verifies section sizes
+ * plus `words` (offsets from the module base: unrelocated text words and
+ * relocation sites whose value is base-independent) before activating the
+ * module's table. Active modules are re-verified after every
+ * instruction-cache invalidation event.
+ * ------------------------------------------------------------------------ */
+typedef struct AotRsoWord {
+    uint32_t offset;  /* from the module base (= RSO file offset) */
+    uint32_t word;
+} AotRsoWord;
+
+typedef struct AotRsoModuleDesc {
+    const char* name;               /* e.g. "RSO_FishCloud.plf" */
+    uint32_t num_sections;
+    const uint32_t* section_sizes;  /* [num_sections], as in the file */
+    uint32_t text_section;          /* index of the code section */
+    uint32_t text_size;             /* = section_sizes[text_section] */
+    const AOTBlockFunc* table;      /* [text_size / 4], by text offset >> 2 */
+    uint32_t* base_slots;           /* [num_sections], written by the tracker */
+    const AotRsoWord* words;
+    uint32_t word_count;
+    const AotImageBlockSize* block_sizes;  /* harness only; addr = text offset */
+    uint32_t block_size_count;
+} AotRsoModuleDesc;
+
+/* Last resort of the generated dispatch when the library has RSO modules. */
+extern void aot_rso_dispatch(AOTState* s);
+extern void aot_register_game_rso_modules(const char* game_id, const AotRsoModuleDesc* modules,
+                                          uint32_t count, uint32_t images_version);
 
 extern void aot_images_rescan(void);
 extern AOTBlockFunc aot_images_lookup(uint32_t pc);

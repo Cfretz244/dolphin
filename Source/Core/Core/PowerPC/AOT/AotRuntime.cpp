@@ -30,6 +30,7 @@
 #include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/Interpreter/ExceptionUtils.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
+#include "Core/PowerPC/AOT/AotImageTracker.h"
 #include "Core/PowerPC/AOT/AotModuleTracker.h"
 #ifdef DOLPHIN_AOT_HARNESS
 #include "Core/PowerPC/AOT/AotMmioCapture.h"
@@ -617,6 +618,8 @@ void aot_log_fallback_stats(int top_n)
                  total, dfb, sorted.size(), s_guard_checks, dguard, s_guard_reuses, dreuse,
                  s_trust_code ? 1 : 0, aot_stat_exception_checks, dexc, s_stat_rfi, drfi,
                  s_stat_mtmsr, dmtmsr, s_stat_idle, didle, gp, dgp);
+  if (const std::string rso = AotImageTracker::RsoStatsLine(); !rso.empty())
+    NOTICE_LOG_FMT(CORE, "AOTSTAT {}", rso);
 
   const size_t limit = std::min<size_t>(sorted.size(), top_n > 0 ? size_t(top_n) : 0);
   for (size_t i = 0; i < limit; i++)
@@ -633,7 +636,10 @@ void aot_log_fallback_stats(int top_n)
       if (info)
         opname = info->opname;
     }
-    NOTICE_LOG_FMT(CORE, "AOTSTAT fb {:>10} pc={:#010x} {}", sorted[i].second, pc, opname);
+    // Name the RSO module of the hottest few pcs (a bounded RAM scan each).
+    const std::string module = i < 10 ? AotImageTracker::DescribeRsoPc(pc) : std::string();
+    NOTICE_LOG_FMT(CORE, "AOTSTAT fb {:>10} pc={:#010x} {}{}{}", sorted[i].second, pc, opname,
+                   module.empty() ? "" : "  ", module);
   }
 }
 
@@ -666,7 +672,10 @@ void aot_dump_fallback_stats()
     if (aot_stat_exception_bits[b])
       fmt::print(stderr, " {}={}", kBitNames[b], aot_stat_exception_bits[b]);
   fmt::print(stderr, "\n");
-  fmt::print(stderr, "Unique PCs: {}\n\n", sorted.size());
+  fmt::print(stderr, "Unique PCs: {}\n", sorted.size());
+  if (const std::string rso = AotImageTracker::RsoStatsLine(); !rso.empty())
+    fmt::print(stderr, "{}\n", rso);
+  fmt::print(stderr, "\n");
 
   const size_t limit = std::min<size_t>(sorted.size(), 50);
   for (size_t i = 0; i < limit; i++)
@@ -684,7 +693,9 @@ void aot_dump_fallback_stats()
       if (info)
         opname = info->opname;
     }
-    fmt::print(stderr, "  {:>12} hits  PC={:#010x}  {}\n", count, pc, opname);
+    const std::string module = AotImageTracker::DescribeRsoPc(pc);
+    fmt::print(stderr, "  {:>12} hits  PC={:#010x}  {}{}{}\n", count, pc, opname,
+               module.empty() ? "" : "  ", module);
   }
   if (sorted.size() > limit)
     fmt::print(stderr, "  ... and {} more unique PCs\n", sorted.size() - limit);

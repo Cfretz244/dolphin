@@ -139,6 +139,12 @@ int AotCommand(const std::vector<std::string>& args)
   parser.add_option("--images")
       .action("store")
       .help("For --dol-images CFGs: comma-separated base image ids to emit (default: all)");
+  parser.add_option("--rso-module")
+      .action("append")
+      .help("For --dol-images CFGs: IMAGE:DISC_PATH:STATIC_BASES -- translate a Wii-SDK RSO "
+            "module (e.g. MP2/RSO/Production/RSO_FishCloud.rso; selfile.sel from the same disc "
+            "directory) base-relative, bound to DOL image IMAGE; STATIC_BASES = text file of "
+            "'SECTION 0xADDRESS' lines (the located static module's section table). Repeatable");
   parser.add_option("--real-mode-image")
       .action("store")
       .help("For --dol-images CFGs: comma-separated raw dumps of physical MEM1 [0, N<=0x3000) "
@@ -257,8 +263,12 @@ int AotCommand(const std::vector<std::string>& args)
         pos = comma + 1;
       }
     }
+    std::vector<std::string> rso_specs;
+    if (options.is_set("rso_module"))
+      for (const auto& v : options.all("rso_module"))
+        rso_specs.push_back(v);
     return TranslateTrustedImages(*volume, cfg_path, output_dir, prefix, dol_sha256_hex,
-                                  selected, real_mode_dumps) ?
+                                  selected, real_mode_dumps, rso_specs) ?
                EXIT_SUCCESS : EXIT_FAILURE;
   }
 

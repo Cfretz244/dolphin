@@ -36,5 +36,6 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
 bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg,
                             const std::string& output, const std::string& prefix,
                             const std::string& boot_hash, const std::set<size_t>& selected,
-                            const std::vector<std::string>& real_mode_dumps = {});
+                            const std::vector<std::string>& real_mode_dumps = {},
+                            const std::vector<std::string>& rso_module_specs = {});
 } // namespace DolphinTool

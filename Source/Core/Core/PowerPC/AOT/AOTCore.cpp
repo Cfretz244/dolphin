@@ -73,7 +73,8 @@ void AOTCore::Init()
     m_image_checked = false;
     m_image_blocked = false;
     AotModuleTracker::Init(entry->modules, entry->module_count);
-    AotImageTracker::Init(entry->images, entry->image_count);
+    AotImageTracker::Init(entry->images, entry->image_count, entry->rso_modules,
+                          entry->rso_module_count);
     INFO_LOG_FMT(AOT, "AOTCore: Found AOT library for game {} ({} REL modules{})", game_id,
                  entry->module_count,
                  m_expected_dol_sha256.empty() ? ", NO image hash -- pre-v24 library" : "");

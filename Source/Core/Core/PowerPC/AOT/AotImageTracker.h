@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <string>
+
 #include "Common/CommonTypes.h"
 #include "Core/PowerPC/AOT/aot_images.h"
 
@@ -20,8 +22,16 @@
 // and as every single-image game in the stack.
 namespace AotImageTracker
 {
-void Init(const AotImageDesc* images, u32 count);
+void Init(const AotImageDesc* images, u32 count, const AotRsoModuleDesc* rso_modules = nullptr,
+          u32 rso_count = 0);
 void Shutdown();
 // Force a rescan at the next dispatch (savestate load, core reset).
 void MarkDirty();
+// One-line RSO module tracker summary for stats dumps (empty when the library
+// registers no RSO modules).
+std::string RsoStatsLine();
+// "RSO_X.plf s1+0x1234 [AOT]" when pc lies in a section of any located RSO
+// module in guest RAM (named by its header; translated or not), else empty.
+// Scans RAM backwards: stats dumps only, never on a hot path.
+std::string DescribeRsoPc(u32 pc);
 }  // namespace AotImageTracker

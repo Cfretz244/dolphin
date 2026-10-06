@@ -40,6 +40,9 @@ struct AotGameEntry
   // Trusted multi-image descriptors (aot_images.h); empty for other libraries.
   const AotImageDesc* images = nullptr;
   uint32_t image_count = 0;
+  // RSO modules of a multi-image library (aot_images.h, v3+).
+  const AotRsoModuleDesc* rso_modules = nullptr;
+  uint32_t rso_module_count = 0;
 };
 
 // Multi-game registry, populated before main() by each linked AOT library's
@@ -59,6 +62,8 @@ public:
   void RegisterImages(const std::string& game_id, const AotImageDesc* images, uint32_t count,
                       uint32_t images_version);
   void RegisterImageHash(const std::string& game_id, const char* dol_sha256_hex);
+  void RegisterRsoModules(const std::string& game_id, const AotRsoModuleDesc* modules,
+                          uint32_t count, uint32_t images_version);
   std::optional<AotGameEntry> Find(const std::string& game_id) const;
   std::vector<std::string> GetRegisteredGameIDs() const;
 

@@ -32,6 +32,11 @@ public:
   u32 GetTextSectionAddress(int index) const { return m_dolheader.textAddress[index]; }
   u32 GetTextSectionSize(int index) const { return m_dolheader.textSize[index]; }
   const std::vector<u8>& GetTextSection(int index) const { return m_text_sections[index]; }
+  int GetNumDataSections() const { return DOL_NUM_DATA; }
+  u32 GetDataSectionAddress(int index) const { return m_dolheader.dataAddress[index]; }
+  u32 GetDataSectionSize(int index) const { return m_dolheader.dataSize[index]; }
+  u32 GetBssAddress() const { return m_dolheader.bssAddress; }
+  u32 GetBssSize() const { return m_dolheader.bssSize; }
   bool LoadIntoMemory(Core::System& system, bool only_in_mem1 = false) const override;
   bool LoadSymbols(const Core::CPUThreadGuard& guard, PPCSymbolDB& ppc_symbol_db,
                    const std::string& filename) const override

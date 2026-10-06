@@ -160,3 +160,24 @@ extern "C" void aot_register_game_images(const char* game_id, const AotImageDesc
 {
   AotRegistry::Instance().RegisterImages(game_id, images, count, images_version);
 }
+
+void AotRegistry::RegisterRsoModules(const std::string& game_id, const AotRsoModuleDesc* modules,
+                                     uint32_t count, uint32_t images_version)
+{
+  // The version gate lives in RegisterImages (called first by the generated
+  // constructor); a rejected library never reaches here with a live entry.
+  if (IsRejected(game_id) || images_version != AOT_IMAGES_VERSION)
+    return;
+  auto& entry = m_games[game_id];
+  if (entry.game_id.empty())
+    entry.game_id = game_id;
+  entry.rso_modules = modules;
+  entry.rso_module_count = count;
+}
+
+extern "C" void aot_register_game_rso_modules(const char* game_id,
+                                              const AotRsoModuleDesc* modules, uint32_t count,
+                                              uint32_t images_version)
+{
+  AotRegistry::Instance().RegisterRsoModules(game_id, modules, count, images_version);
+}
