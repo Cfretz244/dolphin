@@ -499,6 +499,21 @@ size_t aot_fastmem_probe_summary(char* out, size_t out_len)
   return n;
 }
 
+// #19 diag (iOS bridge save/load watchdog, GCEmulatorBridge.mm): one-line
+// snapshot of the guest CPU for a hang report. The bridge cannot include
+// PowerPC.h (MachineContext.h has no iOS case), hence this C entry point.
+// Racy by design: read without locks from a non-CPU thread while the CPU
+// thread may be running or wedged — diagnostic only. Returns snprintf's count.
+size_t aot_debug_guest_state(char* out, size_t out_len)
+{
+  const auto& ppc = Core::System::GetInstance().GetPPCState();
+  const int n = std::snprintf(out, out_len,
+                              "pc=%08x npc=%08x lr=%08x msr=%08x downcount=%d exceptions=%08x",
+                              ppc.pc, ppc.npc, ppc.spr[SPR_LR], ppc.msr.Hex, ppc.downcount,
+                              ppc.Exceptions);
+  return n < 0 ? 0 : static_cast<size_t>(n);
+}
+
 // Counterpart to aot_init_fast_mem, called from AOTCore::Shutdown. The RAM/L1
 // buffers are reallocated on the next boot, so the cached pointers must not
 // survive into a second game's session.
