@@ -1090,31 +1090,31 @@ static Interpreter& GetInterpreter()
 }
 
 #define FP_IMPL_3(name, interp_method) \
-void name(AOTState* s, int fd, int fa, int fb) { \
+AOT_SLOWPATH_CC void name(AOTState* s, int fd, int fa, int fb) { \
   UGeckoInstruction inst = MakeFPInst(fd, fa, fb); \
   Interpreter::interp_method(GetInterpreter(), inst); \
 }
 
 #define FP_IMPL_3C(name, interp_method) \
-void name(AOTState* s, int fd, int fa, int fc) { \
+AOT_SLOWPATH_CC void name(AOTState* s, int fd, int fa, int fc) { \
   UGeckoInstruction inst = MakeFPInst(fd, fa, 0, fc); \
   Interpreter::interp_method(GetInterpreter(), inst); \
 }
 
 #define FP_IMPL_4(name, interp_method) \
-void name(AOTState* s, int fd, int fa, int fc, int fb) { \
+AOT_SLOWPATH_CC void name(AOTState* s, int fd, int fa, int fc, int fb) { \
   UGeckoInstruction inst = MakeFPInst(fd, fa, fb, fc); \
   Interpreter::interp_method(GetInterpreter(), inst); \
 }
 
 #define FP_IMPL_2(name, interp_method) \
-void name(AOTState* s, int fd, int fb) { \
+AOT_SLOWPATH_CC void name(AOTState* s, int fd, int fb) { \
   UGeckoInstruction inst = MakeFPInst(fd, 0, fb); \
   Interpreter::interp_method(GetInterpreter(), inst); \
 }
 
 #define FP_CMP(name, interp_method) \
-void name(AOTState* s, int crfd, int fa, int fb) { \
+AOT_SLOWPATH_CC void name(AOTState* s, int crfd, int fa, int fb) { \
   UGeckoInstruction inst = MakeCRInst(crfd, fa, fb); \
   Interpreter::interp_method(GetInterpreter(), inst); \
 }
@@ -1150,14 +1150,14 @@ FP_IMPL_2(aot_fctiwzx, fctiwzx)
 FP_IMPL_2(aot_fresx, fresx)
 FP_IMPL_2(aot_frsqrtex, frsqrtex)
 
-void aot_fselx(AOTState* s, int fd, int fa, int fc, int fb)
+AOT_SLOWPATH_CC void aot_fselx(AOTState* s, int fd, int fa, int fc, int fb)
 {
   auto& ppc_state = GetPPCState(s);
   double a_val = ppc_state.ps[fa].PS0AsDouble();
   ppc_state.ps[fd].SetPS0(a_val >= -0.0 ? ppc_state.ps[fc].PS0AsU64() : ppc_state.ps[fb].PS0AsU64());
 }
 
-void aot_mtfsf(AOTState* s, int fm, int fb)
+AOT_SLOWPATH_CC void aot_mtfsf(AOTState* s, int fm, int fb)
 {
   UGeckoInstruction inst{};
   inst.FM = fm;
@@ -1165,7 +1165,7 @@ void aot_mtfsf(AOTState* s, int fm, int fb)
   Interpreter::mtfsfx(GetInterpreter(), inst);
 }
 
-void aot_mtfsfi(AOTState* s, int crfd, int imm)
+AOT_SLOWPATH_CC void aot_mtfsfi(AOTState* s, int crfd, int imm)
 {
   UGeckoInstruction inst{};
   inst.CRFD = crfd;
@@ -1173,7 +1173,7 @@ void aot_mtfsfi(AOTState* s, int crfd, int imm)
   Interpreter::mtfsfix(GetInterpreter(), inst);
 }
 
-void aot_mcrfs(AOTState* s, int crfd, int crfs)
+AOT_SLOWPATH_CC void aot_mcrfs(AOTState* s, int crfd, int crfs)
 {
   UGeckoInstruction inst{};
   inst.CRFD = crfd;
@@ -1190,74 +1190,74 @@ void aot_mcrfs(AOTState* s, int crfd, int crfs)
 // (UpdateCR1) branch is omitted because the emitter always passes Rc=0.
 // div/res/rsqrte stay delegated to the interpreter methods — they're rare and
 // their exception logic is more involved.
-void aot_ps_add(AOTState* s, int fd, int fa, int fb)
+AOT_SLOWPATH_CC void aot_ps_add(AOTState* s, int fd, int fa, int fb)
 {
   PS_Add(GetPPCState(s), fd, fa, fb);
 }
 
-void aot_ps_sub(AOTState* s, int fd, int fa, int fb)
+AOT_SLOWPATH_CC void aot_ps_sub(AOTState* s, int fd, int fa, int fb)
 {
   PS_Sub(GetPPCState(s), fd, fa, fb);
 }
 
-void aot_ps_mul(AOTState* s, int fd, int fa, int fc)
+AOT_SLOWPATH_CC void aot_ps_mul(AOTState* s, int fd, int fa, int fc)
 {
   PS_Mul(GetPPCState(s), fd, fa, fc);
 }
 
 FP_IMPL_3(aot_ps_div, ps_div)
 
-void aot_ps_madd(AOTState* s, int fd, int fa, int fc, int fb)
+AOT_SLOWPATH_CC void aot_ps_madd(AOTState* s, int fd, int fa, int fc, int fb)
 {
   PS_Madd(GetPPCState(s), fd, fa, fc, fb);
 }
 
-void aot_ps_msub(AOTState* s, int fd, int fa, int fc, int fb)
+AOT_SLOWPATH_CC void aot_ps_msub(AOTState* s, int fd, int fa, int fc, int fb)
 {
   PS_Msub(GetPPCState(s), fd, fa, fc, fb);
 }
 
-void aot_ps_nmadd(AOTState* s, int fd, int fa, int fc, int fb)
+AOT_SLOWPATH_CC void aot_ps_nmadd(AOTState* s, int fd, int fa, int fc, int fb)
 {
   PS_Nmadd(GetPPCState(s), fd, fa, fc, fb);
 }
 
-void aot_ps_nmsub(AOTState* s, int fd, int fa, int fc, int fb)
+AOT_SLOWPATH_CC void aot_ps_nmsub(AOTState* s, int fd, int fa, int fc, int fb)
 {
   PS_Nmsub(GetPPCState(s), fd, fa, fc, fb);
 }
 
-void aot_ps_sum0(AOTState* s, int fd, int fa, int fc, int fb)
+AOT_SLOWPATH_CC void aot_ps_sum0(AOTState* s, int fd, int fa, int fc, int fb)
 {
   PS_Sum0(GetPPCState(s), fd, fa, fc, fb);
 }
 
-void aot_ps_sum1(AOTState* s, int fd, int fa, int fc, int fb)
+AOT_SLOWPATH_CC void aot_ps_sum1(AOTState* s, int fd, int fa, int fc, int fb)
 {
   PS_Sum1(GetPPCState(s), fd, fa, fc, fb);
 }
 
-void aot_ps_muls0(AOTState* s, int fd, int fa, int fc)
+AOT_SLOWPATH_CC void aot_ps_muls0(AOTState* s, int fd, int fa, int fc)
 {
   PS_Muls0(GetPPCState(s), fd, fa, fc);
 }
 
-void aot_ps_muls1(AOTState* s, int fd, int fa, int fc)
+AOT_SLOWPATH_CC void aot_ps_muls1(AOTState* s, int fd, int fa, int fc)
 {
   PS_Muls1(GetPPCState(s), fd, fa, fc);
 }
 
-void aot_ps_madds0(AOTState* s, int fd, int fa, int fc, int fb)
+AOT_SLOWPATH_CC void aot_ps_madds0(AOTState* s, int fd, int fa, int fc, int fb)
 {
   PS_Madds0(GetPPCState(s), fd, fa, fc, fb);
 }
 
-void aot_ps_madds1(AOTState* s, int fd, int fa, int fc, int fb)
+AOT_SLOWPATH_CC void aot_ps_madds1(AOTState* s, int fd, int fa, int fc, int fb)
 {
   PS_Madds1(GetPPCState(s), fd, fa, fc, fb);
 }
 
-void aot_ps_sel(AOTState* s, int fd, int fa, int fc, int fb)
+AOT_SLOWPATH_CC void aot_ps_sel(AOTState* s, int fd, int fa, int fc, int fb)
 {
   PS_Sel(GetPPCState(s), fd, fa, fc, fb);
 }
@@ -1266,40 +1266,40 @@ FP_IMPL_2(aot_ps_res, ps_res)
 FP_IMPL_2(aot_ps_rsqrte, ps_rsqrte)
 
 // PS moves — must operate on BOTH ps0 AND ps1 (unlike scalar fneg/fabs/fnabs)
-void aot_ps_neg(AOTState* s, int fd, int fb)
+AOT_SLOWPATH_CC void aot_ps_neg(AOTState* s, int fd, int fb)
 {
   PS_Neg(GetPPCState(s), fd, fb);
 }
 
-void aot_ps_mr(AOTState* s, int fd, int fb)
+AOT_SLOWPATH_CC void aot_ps_mr(AOTState* s, int fd, int fb)
 {
   PS_Mr(GetPPCState(s), fd, fb);
 }
 
-void aot_ps_abs(AOTState* s, int fd, int fb)
+AOT_SLOWPATH_CC void aot_ps_abs(AOTState* s, int fd, int fb)
 {
   PS_Abs(GetPPCState(s), fd, fb);
 }
 
-void aot_ps_nabs(AOTState* s, int fd, int fb)
+AOT_SLOWPATH_CC void aot_ps_nabs(AOTState* s, int fd, int fb)
 {
   PS_Nabs(GetPPCState(s), fd, fb);
 }
 
 // PS merge
-void aot_ps_merge00(AOTState* s, int fd, int fa, int fb)
+AOT_SLOWPATH_CC void aot_ps_merge00(AOTState* s, int fd, int fa, int fb)
 {
   PS_Merge00(GetPPCState(s), fd, fa, fb);
 }
-void aot_ps_merge01(AOTState* s, int fd, int fa, int fb)
+AOT_SLOWPATH_CC void aot_ps_merge01(AOTState* s, int fd, int fa, int fb)
 {
   PS_Merge01(GetPPCState(s), fd, fa, fb);
 }
-void aot_ps_merge10(AOTState* s, int fd, int fa, int fb)
+AOT_SLOWPATH_CC void aot_ps_merge10(AOTState* s, int fd, int fa, int fb)
 {
   PS_Merge10(GetPPCState(s), fd, fa, fb);
 }
-void aot_ps_merge11(AOTState* s, int fd, int fa, int fb)
+AOT_SLOWPATH_CC void aot_ps_merge11(AOTState* s, int fd, int fa, int fb)
 {
   PS_Merge11(GetPPCState(s), fd, fa, fb);
 }
@@ -1614,7 +1614,7 @@ extern "C"
 // PS quantized load/store — RAM fast path above, interpreter for everything else.
 // The u-forms update RA only after a successful access; the fast path cannot
 // raise a DSI (RAM addresses only), so the update is unconditional there.
-void aot_psq_l(AOTState* s, int fd, int ra, uint32_t inst_hex)
+AOT_SLOWPATH_CC void aot_psq_l(AOTState* s, int fd, int ra, uint32_t inst_hex)
 {
   UGeckoInstruction inst(inst_hex);
   auto& ppc_state = GetPPCState(s);
@@ -1626,7 +1626,7 @@ void aot_psq_l(AOTState* s, int fd, int ra, uint32_t inst_hex)
   }
   Interpreter::psq_l(GetInterpreter(), inst);
 }
-void aot_psq_lu(AOTState* s, int fd, int ra, uint32_t inst_hex)
+AOT_SLOWPATH_CC void aot_psq_lu(AOTState* s, int fd, int ra, uint32_t inst_hex)
 {
   UGeckoInstruction inst(inst_hex);
   auto& ppc_state = GetPPCState(s);
@@ -1641,7 +1641,7 @@ void aot_psq_lu(AOTState* s, int fd, int ra, uint32_t inst_hex)
   }
   Interpreter::psq_lu(GetInterpreter(), inst);
 }
-void aot_psq_st(AOTState* s, int fs, int ra, uint32_t inst_hex)
+AOT_SLOWPATH_CC void aot_psq_st(AOTState* s, int fs, int ra, uint32_t inst_hex)
 {
   UGeckoInstruction inst(inst_hex);
   auto& ppc_state = GetPPCState(s);
@@ -1653,7 +1653,7 @@ void aot_psq_st(AOTState* s, int fs, int ra, uint32_t inst_hex)
   }
   Interpreter::psq_st(GetInterpreter(), inst);
 }
-void aot_psq_stu(AOTState* s, int fs, int ra, uint32_t inst_hex)
+AOT_SLOWPATH_CC void aot_psq_stu(AOTState* s, int fs, int ra, uint32_t inst_hex)
 {
   UGeckoInstruction inst(inst_hex);
   auto& ppc_state = GetPPCState(s);
@@ -1669,7 +1669,7 @@ void aot_psq_stu(AOTState* s, int fs, int ra, uint32_t inst_hex)
   Interpreter::psq_stu(GetInterpreter(), inst);
 }
 // Indexed forms: no LSQE check, matching the interpreter.
-void aot_psq_lx(AOTState* s, uint32_t inst_hex)
+AOT_SLOWPATH_CC void aot_psq_lx(AOTState* s, uint32_t inst_hex)
 {
   UGeckoInstruction inst(inst_hex);
   auto& ppc_state = GetPPCState(s);
@@ -1679,7 +1679,7 @@ void aot_psq_lx(AOTState* s, uint32_t inst_hex)
     return;
   Interpreter::psq_lx(GetInterpreter(), inst);
 }
-void aot_psq_stx(AOTState* s, uint32_t inst_hex)
+AOT_SLOWPATH_CC void aot_psq_stx(AOTState* s, uint32_t inst_hex)
 {
   UGeckoInstruction inst(inst_hex);
   auto& ppc_state = GetPPCState(s);
@@ -1689,7 +1689,7 @@ void aot_psq_stx(AOTState* s, uint32_t inst_hex)
     return;
   Interpreter::psq_stx(GetInterpreter(), inst);
 }
-void aot_psq_lux(AOTState* s, uint32_t inst_hex)
+AOT_SLOWPATH_CC void aot_psq_lux(AOTState* s, uint32_t inst_hex)
 {
   UGeckoInstruction inst(inst_hex);
   auto& ppc_state = GetPPCState(s);
@@ -1701,7 +1701,7 @@ void aot_psq_lux(AOTState* s, uint32_t inst_hex)
   }
   Interpreter::psq_lux(GetInterpreter(), inst);
 }
-void aot_psq_stux(AOTState* s, uint32_t inst_hex)
+AOT_SLOWPATH_CC void aot_psq_stux(AOTState* s, uint32_t inst_hex)
 {
   UGeckoInstruction inst(inst_hex);
   auto& ppc_state = GetPPCState(s);

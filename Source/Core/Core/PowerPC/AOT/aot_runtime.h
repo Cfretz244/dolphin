@@ -613,73 +613,76 @@ extern void aot_icbi(AOTState* s, uint32_t addr);
 // Timebase
 extern uint32_t aot_mftb(AOTState* s, uint32_t spr);
 
-// FP arithmetic (all via runtime for NaN/exception correctness)
-extern void aot_faddx(AOTState* s, int fd, int fa, int fb);
-extern void aot_fsubx(AOTState* s, int fd, int fa, int fb);
-extern void aot_fmulx(AOTState* s, int fd, int fa, int fc);
-extern void aot_fdivx(AOTState* s, int fd, int fa, int fb);
-extern void aot_fmaddx(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_fmsubx(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_fnmsubx(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_fnmaddx(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_faddsx(AOTState* s, int fd, int fa, int fb);
-extern void aot_fsubsx(AOTState* s, int fd, int fa, int fb);
-extern void aot_fmulsx(AOTState* s, int fd, int fa, int fc);
-extern void aot_fdivsx(AOTState* s, int fd, int fa, int fb);
-extern void aot_fmaddsx(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_fmsubsx(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_fnmsubsx(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_fnmaddsx(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_fcmpu(AOTState* s, int crfd, int fa, int fb);
-extern void aot_fcmpo(AOTState* s, int crfd, int fa, int fb);
-extern void aot_frspx(AOTState* s, int fd, int fb);
-extern void aot_fctiwx(AOTState* s, int fd, int fb);
-extern void aot_fctiwzx(AOTState* s, int fd, int fb);
-extern void aot_fresx(AOTState* s, int fd, int fb);
-extern void aot_frsqrtex(AOTState* s, int fd, int fb);
-extern void aot_fselx(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_mtfsf(AOTState* s, int fm, int fb);
-extern void aot_mtfsfi(AOTState* s, int crfd, int imm);
-extern void aot_mcrfs(AOTState* s, int crfd, int crfs);
+// FP arithmetic (all via runtime for NaN/exception correctness). The FP/PS/psq
+// helpers below are AOT_SLOWPATH_CC (fp1): with FP registers cached in C locals
+// their calls sit on the cold fallback of every inline FP fast path, and the
+// plain C convention made each such site save/restore x9-x15 live values.
+extern AOT_SLOWPATH_CC void aot_faddx(AOTState* s, int fd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_fsubx(AOTState* s, int fd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_fmulx(AOTState* s, int fd, int fa, int fc);
+extern AOT_SLOWPATH_CC void aot_fdivx(AOTState* s, int fd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_fmaddx(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_fmsubx(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_fnmsubx(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_fnmaddx(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_faddsx(AOTState* s, int fd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_fsubsx(AOTState* s, int fd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_fmulsx(AOTState* s, int fd, int fa, int fc);
+extern AOT_SLOWPATH_CC void aot_fdivsx(AOTState* s, int fd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_fmaddsx(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_fmsubsx(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_fnmsubsx(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_fnmaddsx(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_fcmpu(AOTState* s, int crfd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_fcmpo(AOTState* s, int crfd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_frspx(AOTState* s, int fd, int fb);
+extern AOT_SLOWPATH_CC void aot_fctiwx(AOTState* s, int fd, int fb);
+extern AOT_SLOWPATH_CC void aot_fctiwzx(AOTState* s, int fd, int fb);
+extern AOT_SLOWPATH_CC void aot_fresx(AOTState* s, int fd, int fb);
+extern AOT_SLOWPATH_CC void aot_frsqrtex(AOTState* s, int fd, int fb);
+extern AOT_SLOWPATH_CC void aot_fselx(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_mtfsf(AOTState* s, int fm, int fb);
+extern AOT_SLOWPATH_CC void aot_mtfsfi(AOTState* s, int crfd, int imm);
+extern AOT_SLOWPATH_CC void aot_mcrfs(AOTState* s, int crfd, int crfs);
 
 // Paired singles (all via runtime)
-extern void aot_ps_add(AOTState* s, int fd, int fa, int fb);
-extern void aot_ps_sub(AOTState* s, int fd, int fa, int fb);
-extern void aot_ps_mul(AOTState* s, int fd, int fa, int fc);
-extern void aot_ps_div(AOTState* s, int fd, int fa, int fb);
-extern void aot_ps_madd(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_ps_msub(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_ps_nmadd(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_ps_nmsub(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_ps_sum0(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_ps_sum1(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_ps_muls0(AOTState* s, int fd, int fa, int fc);
-extern void aot_ps_muls1(AOTState* s, int fd, int fa, int fc);
-extern void aot_ps_madds0(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_ps_madds1(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_ps_sel(AOTState* s, int fd, int fa, int fc, int fb);
-extern void aot_ps_res(AOTState* s, int fd, int fb);
-extern void aot_ps_rsqrte(AOTState* s, int fd, int fb);
-extern void aot_ps_neg(AOTState* s, int fd, int fb);
-extern void aot_ps_mr(AOTState* s, int fd, int fb);
-extern void aot_ps_abs(AOTState* s, int fd, int fb);
-extern void aot_ps_nabs(AOTState* s, int fd, int fb);
-extern void aot_ps_merge00(AOTState* s, int fd, int fa, int fb);
-extern void aot_ps_merge01(AOTState* s, int fd, int fa, int fb);
-extern void aot_ps_merge10(AOTState* s, int fd, int fa, int fb);
-extern void aot_ps_merge11(AOTState* s, int fd, int fa, int fb);
-extern void aot_ps_cmpu0(AOTState* s, int crfd, int fa, int fb);
-extern void aot_ps_cmpo0(AOTState* s, int crfd, int fa, int fb);
-extern void aot_ps_cmpu1(AOTState* s, int crfd, int fa, int fb);
-extern void aot_ps_cmpo1(AOTState* s, int crfd, int fa, int fb);
-extern void aot_psq_l(AOTState* s, int fd, int ra, uint32_t inst);
-extern void aot_psq_lu(AOTState* s, int fd, int ra, uint32_t inst);
-extern void aot_psq_st(AOTState* s, int fs, int ra, uint32_t inst);
-extern void aot_psq_stu(AOTState* s, int fs, int ra, uint32_t inst);
-extern void aot_psq_lx(AOTState* s, uint32_t inst);
-extern void aot_psq_stx(AOTState* s, uint32_t inst);
-extern void aot_psq_lux(AOTState* s, uint32_t inst);
-extern void aot_psq_stux(AOTState* s, uint32_t inst);
+extern AOT_SLOWPATH_CC void aot_ps_add(AOTState* s, int fd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_sub(AOTState* s, int fd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_mul(AOTState* s, int fd, int fa, int fc);
+extern AOT_SLOWPATH_CC void aot_ps_div(AOTState* s, int fd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_madd(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_msub(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_nmadd(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_nmsub(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_sum0(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_sum1(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_muls0(AOTState* s, int fd, int fa, int fc);
+extern AOT_SLOWPATH_CC void aot_ps_muls1(AOTState* s, int fd, int fa, int fc);
+extern AOT_SLOWPATH_CC void aot_ps_madds0(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_madds1(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_sel(AOTState* s, int fd, int fa, int fc, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_res(AOTState* s, int fd, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_rsqrte(AOTState* s, int fd, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_neg(AOTState* s, int fd, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_mr(AOTState* s, int fd, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_abs(AOTState* s, int fd, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_nabs(AOTState* s, int fd, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_merge00(AOTState* s, int fd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_merge01(AOTState* s, int fd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_merge10(AOTState* s, int fd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_merge11(AOTState* s, int fd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_cmpu0(AOTState* s, int crfd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_cmpo0(AOTState* s, int crfd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_cmpu1(AOTState* s, int crfd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_ps_cmpo1(AOTState* s, int crfd, int fa, int fb);
+extern AOT_SLOWPATH_CC void aot_psq_l(AOTState* s, int fd, int ra, uint32_t inst);
+extern AOT_SLOWPATH_CC void aot_psq_lu(AOTState* s, int fd, int ra, uint32_t inst);
+extern AOT_SLOWPATH_CC void aot_psq_st(AOTState* s, int fs, int ra, uint32_t inst);
+extern AOT_SLOWPATH_CC void aot_psq_stu(AOTState* s, int fs, int ra, uint32_t inst);
+extern AOT_SLOWPATH_CC void aot_psq_lx(AOTState* s, uint32_t inst);
+extern AOT_SLOWPATH_CC void aot_psq_stx(AOTState* s, uint32_t inst);
+extern AOT_SLOWPATH_CC void aot_psq_lux(AOTState* s, uint32_t inst);
+extern AOT_SLOWPATH_CC void aot_psq_stux(AOTState* s, uint32_t inst);
 
 // ============================================================================
 // Single-precision FP fast paths (static inline, generated code calls these).
@@ -763,76 +766,119 @@ static inline double aot_force_25bit(double d) {
     return aot_bits_to_double(integral);
 }
 
-// ps[fd].Fill(float) + UpdateFPRFSingle; `clear` is the extra FPSCR bits the
-// instruction zeroes (fmulsx clears FI|FR, faddsx/fsubsx clear nothing).
-static inline void aot_fp_fill_single(AOTState* s, int fd, float r, uint32_t clear) {
+// ----------------------------------------------------------------------------
+// Value forms (fp1, 2026-10-06). Each fast path is a core
+//   int aot_<op>_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, <source halves>)
+// on register VALUES (bit patterns of ps[N].ps0/ps1): it returns 1 after
+// writing d0/d1 (ps[fd]) and *fpscr when the fast path applied, and 0 -- having
+// written nothing -- when the exact out-of-line helper is needed. Sources are
+// taken by value, so fd aliasing an operand is fine. The superblock emitter
+// calls the _v forms directly on C locals (_fN0/_fN1/_fpscr) and brackets the
+// cold helper call with an explicit write-back/reload; the `_fast(s, fd, ...)`
+// wrappers below are thin adapters over the same cores (AOTState memory), so
+// AOT_NO_SUPERBLOCKS=1 output keeps its exact semantics.
+//
+// *fpscr is read once (NI for ForceSingle) before anything is written: the
+// wrappers pass &s->fpscr and &s->ps[fd], which -fno-strict-aliasing treats as
+// possibly aliasing.
+// ----------------------------------------------------------------------------
+#define AOT_FP_V static inline __attribute__((always_inline)) int
+
+// ps[fd].Fill(float) / SetBoth + UpdateFPRFSingle: the new FPSCR. `clear` is
+// the extra FPSCR bits the instruction zeroes (fmulsx/fmaddsx clear FI|FR).
+static inline __attribute__((always_inline)) uint32_t aot_fpscr_fprf(uint32_t fpscr, float r, uint32_t clear) {
+    return (fpscr & ~(AOT_FPSCR_FPRF_MASK | clear)) | (aot_classify_float(r) << 12);
+}
+
+// Scalar single results: ps[fd].Fill(r) (both halves).
+static inline __attribute__((always_inline)) void aot_fp_fill_v(uint64_t* d0, uint64_t* d1, float r) {
     uint64_t bits = aot_double_to_bits((double)r);
-    s->ps[fd].ps0 = bits;
-    s->ps[fd].ps1 = bits;
-    s->fpscr = (s->fpscr & ~(AOT_FPSCR_FPRF_MASK | clear)) | (aot_classify_float(r) << 12);
+    *d0 = bits;
+    *d1 = bits;
 }
 
-static inline __attribute__((always_inline)) void aot_faddsx_fast(AOTState* s, int fd, int fa, int fb) {
-    double sum = aot_bits_to_double(s->ps[fa].ps0) + aot_bits_to_double(s->ps[fb].ps0);
-    if (__builtin_expect(!__builtin_isfinite(sum), 0)) { aot_faddsx(s, fd, fa, fb); return; }
-    aot_fp_fill_single(s, fd, aot_force_single(s->fpscr, sum), 0);
+AOT_FP_V aot_faddsx_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t b0) {
+    double sum = aot_bits_to_double(a0) + aot_bits_to_double(b0);
+    if (__builtin_expect(!__builtin_isfinite(sum), 0)) return 0;
+    uint32_t f = *fpscr;
+    float r = aot_force_single(f, sum);
+    aot_fp_fill_v(d0, d1, r);
+    *fpscr = aot_fpscr_fprf(f, r, 0);
+    return 1;
 }
 
-static inline __attribute__((always_inline)) void aot_fsubsx_fast(AOTState* s, int fd, int fa, int fb) {
-    double diff = aot_bits_to_double(s->ps[fa].ps0) - aot_bits_to_double(s->ps[fb].ps0);
-    if (__builtin_expect(!__builtin_isfinite(diff), 0)) { aot_fsubsx(s, fd, fa, fb); return; }
-    aot_fp_fill_single(s, fd, aot_force_single(s->fpscr, diff), 0);
+AOT_FP_V aot_fsubsx_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t b0) {
+    double diff = aot_bits_to_double(a0) - aot_bits_to_double(b0);
+    if (__builtin_expect(!__builtin_isfinite(diff), 0)) return 0;
+    uint32_t f = *fpscr;
+    float r = aot_force_single(f, diff);
+    aot_fp_fill_v(d0, d1, r);
+    *fpscr = aot_fpscr_fprf(f, r, 0);
+    return 1;
 }
 
-static inline __attribute__((always_inline)) void aot_fmulsx_fast(AOTState* s, int fd, int fa, int fc) {
-    double product = aot_bits_to_double(s->ps[fa].ps0) * aot_force_25bit(aot_bits_to_double(s->ps[fc].ps0));
-    if (__builtin_expect(__builtin_isnan(product), 0)) { aot_fmulsx(s, fd, fa, fc); return; }
-    aot_fp_fill_single(s, fd, aot_force_single(s->fpscr, product), AOT_FPSCR_FI | AOT_FPSCR_FR);
+AOT_FP_V aot_fmulsx_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t c0) {
+    double product = aot_bits_to_double(a0) * aot_force_25bit(aot_bits_to_double(c0));
+    if (__builtin_expect(__builtin_isnan(product), 0)) return 0;
+    uint32_t f = *fpscr;
+    float r = aot_force_single(f, product);
+    aot_fp_fill_v(d0, d1, r);
+    *fpscr = aot_fpscr_fprf(f, r, AOT_FPSCR_FI | AOT_FPSCR_FR);
+    return 1;
 }
 
-// ps[fd].SetBoth(ps0, ps1) + UpdateFPRFSingle(ps0). Both results are computed
-// before anything is written, so fd aliasing fa/fb/fc is fine.
-static inline void aot_ps_set_both(AOTState* s, int fd, float r0, float r1) {
-    s->ps[fd].ps0 = aot_double_to_bits((double)r0);
-    s->ps[fd].ps1 = aot_double_to_bits((double)r1);
-    s->fpscr = (s->fpscr & ~AOT_FPSCR_FPRF_MASK) | (aot_classify_float(r0) << 12);
+// Paired results: ps[fd].SetBoth(r0, r1) + UpdateFPRFSingle(r0).
+static inline __attribute__((always_inline)) void aot_ps_set_v(uint32_t* fpscr, uint32_t f, uint64_t* d0, uint64_t* d1, float r0, float r1) {
+    *d0 = aot_double_to_bits((double)r0);
+    *d1 = aot_double_to_bits((double)r1);
+    *fpscr = aot_fpscr_fprf(f, r0, 0);
 }
 
-static inline __attribute__((always_inline)) void aot_ps_add_fast(AOTState* s, int fd, int fa, int fb) {
-    double r0 = aot_bits_to_double(s->ps[fa].ps0) + aot_bits_to_double(s->ps[fb].ps0);
-    double r1 = aot_bits_to_double(s->ps[fa].ps1) + aot_bits_to_double(s->ps[fb].ps1);
-    if (__builtin_expect(!(__builtin_isfinite(r0) && __builtin_isfinite(r1)), 0)) { aot_ps_add(s, fd, fa, fb); return; }
-    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
+AOT_FP_V aot_ps_add_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1) {
+    double r0 = aot_bits_to_double(a0) + aot_bits_to_double(b0);
+    double r1 = aot_bits_to_double(a1) + aot_bits_to_double(b1);
+    if (__builtin_expect(!(__builtin_isfinite(r0) && __builtin_isfinite(r1)), 0)) return 0;
+    uint32_t f = *fpscr;
+    aot_ps_set_v(fpscr, f, d0, d1, aot_force_single(f, r0), aot_force_single(f, r1));
+    return 1;
 }
 
-static inline __attribute__((always_inline)) void aot_ps_sub_fast(AOTState* s, int fd, int fa, int fb) {
-    double r0 = aot_bits_to_double(s->ps[fa].ps0) - aot_bits_to_double(s->ps[fb].ps0);
-    double r1 = aot_bits_to_double(s->ps[fa].ps1) - aot_bits_to_double(s->ps[fb].ps1);
-    if (__builtin_expect(!(__builtin_isfinite(r0) && __builtin_isfinite(r1)), 0)) { aot_ps_sub(s, fd, fa, fb); return; }
-    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
+AOT_FP_V aot_ps_sub_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1) {
+    double r0 = aot_bits_to_double(a0) - aot_bits_to_double(b0);
+    double r1 = aot_bits_to_double(a1) - aot_bits_to_double(b1);
+    if (__builtin_expect(!(__builtin_isfinite(r0) && __builtin_isfinite(r1)), 0)) return 0;
+    uint32_t f = *fpscr;
+    aot_ps_set_v(fpscr, f, d0, d1, aot_force_single(f, r0), aot_force_single(f, r1));
+    return 1;
 }
 
-static inline __attribute__((always_inline)) void aot_ps_mul_fast(AOTState* s, int fd, int fa, int fc) {
-    double r0 = aot_bits_to_double(s->ps[fa].ps0) * aot_force_25bit(aot_bits_to_double(s->ps[fc].ps0));
-    double r1 = aot_bits_to_double(s->ps[fa].ps1) * aot_force_25bit(aot_bits_to_double(s->ps[fc].ps1));
-    if (__builtin_expect(__builtin_isnan(r0) || __builtin_isnan(r1), 0)) { aot_ps_mul(s, fd, fa, fc); return; }
-    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
+AOT_FP_V aot_ps_mul_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t a1, uint64_t c0, uint64_t c1) {
+    double r0 = aot_bits_to_double(a0) * aot_force_25bit(aot_bits_to_double(c0));
+    double r1 = aot_bits_to_double(a1) * aot_force_25bit(aot_bits_to_double(c1));
+    if (__builtin_expect(__builtin_isnan(r0) || __builtin_isnan(r1), 0)) return 0;
+    uint32_t f = *fpscr;
+    aot_ps_set_v(fpscr, f, d0, d1, aot_force_single(f, r0), aot_force_single(f, r1));
+    return 1;
 }
 
-static inline __attribute__((always_inline)) void aot_ps_muls0_fast(AOTState* s, int fd, int fa, int fc) {
-    double c0 = aot_force_25bit(aot_bits_to_double(s->ps[fc].ps0));
-    double r0 = aot_bits_to_double(s->ps[fa].ps0) * c0;
-    double r1 = aot_bits_to_double(s->ps[fa].ps1) * c0;
-    if (__builtin_expect(__builtin_isnan(r0) || __builtin_isnan(r1), 0)) { aot_ps_muls0(s, fd, fa, fc); return; }
-    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
+AOT_FP_V aot_ps_muls0_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t a1, uint64_t c0) {
+    double c = aot_force_25bit(aot_bits_to_double(c0));
+    double r0 = aot_bits_to_double(a0) * c;
+    double r1 = aot_bits_to_double(a1) * c;
+    if (__builtin_expect(__builtin_isnan(r0) || __builtin_isnan(r1), 0)) return 0;
+    uint32_t f = *fpscr;
+    aot_ps_set_v(fpscr, f, d0, d1, aot_force_single(f, r0), aot_force_single(f, r1));
+    return 1;
 }
 
-static inline __attribute__((always_inline)) void aot_ps_muls1_fast(AOTState* s, int fd, int fa, int fc) {
-    double c1 = aot_force_25bit(aot_bits_to_double(s->ps[fc].ps1));
-    double r0 = aot_bits_to_double(s->ps[fa].ps0) * c1;
-    double r1 = aot_bits_to_double(s->ps[fa].ps1) * c1;
-    if (__builtin_expect(__builtin_isnan(r0) || __builtin_isnan(r1), 0)) { aot_ps_muls1(s, fd, fa, fc); return; }
-    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
+AOT_FP_V aot_ps_muls1_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t a1, uint64_t c1) {
+    double c = aot_force_25bit(aot_bits_to_double(c1));
+    double r0 = aot_bits_to_double(a0) * c;
+    double r1 = aot_bits_to_double(a1) * c;
+    if (__builtin_expect(__builtin_isnan(r0) || __builtin_isnan(r1), 0)) return 0;
+    uint32_t f = *fpscr;
+    aot_ps_set_v(fpscr, f, d0, d1, aot_force_single(f, r0), aot_force_single(f, r1));
+    return 1;
 }
 
 // ----------------------------------------------------------------------------
@@ -866,118 +912,181 @@ static inline int aot_fmadds_core(double a, double c, double b, int sub, double*
 }
 
 // fmaddsx is the only one of the four that writes FI/FR.
-static inline __attribute__((always_inline)) void aot_fmaddsx_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+AOT_FP_V aot_fmaddsx_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t c0, uint64_t b0) {
     double r;
-    if (__builtin_expect(!aot_fmadds_core(aot_bits_to_double(s->ps[fa].ps0), aot_bits_to_double(s->ps[fc].ps0),
-                                          aot_bits_to_double(s->ps[fb].ps0), 0, &r), 0)) {
-        aot_fmaddsx(s, fd, fa, fc, fb);
-        return;
-    }
-    float res = aot_force_single(s->fpscr, r);
+    if (__builtin_expect(!aot_fmadds_core(aot_bits_to_double(a0), aot_bits_to_double(c0), aot_bits_to_double(b0), 0, &r), 0))
+        return 0;
+    uint32_t f = *fpscr;
+    float res = aot_force_single(f, r);
     uint32_t fi = (r != (double)res) ? AOT_FPSCR_FI : 0u;
-    aot_fp_fill_single(s, fd, res, AOT_FPSCR_FI | AOT_FPSCR_FR);
-    s->fpscr |= fi;
+    aot_fp_fill_v(d0, d1, res);
+    *fpscr = aot_fpscr_fprf(f, res, AOT_FPSCR_FI | AOT_FPSCR_FR) | fi;
+    return 1;
 }
 
-static inline __attribute__((always_inline)) void aot_fmsubsx_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+AOT_FP_V aot_fmsubsx_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t c0, uint64_t b0) {
     double r;
-    if (__builtin_expect(!aot_fmadds_core(aot_bits_to_double(s->ps[fa].ps0), aot_bits_to_double(s->ps[fc].ps0),
-                                          aot_bits_to_double(s->ps[fb].ps0), 1, &r), 0)) {
-        aot_fmsubsx(s, fd, fa, fc, fb);
-        return;
-    }
-    aot_fp_fill_single(s, fd, aot_force_single(s->fpscr, r), 0);
+    if (__builtin_expect(!aot_fmadds_core(aot_bits_to_double(a0), aot_bits_to_double(c0), aot_bits_to_double(b0), 1, &r), 0))
+        return 0;
+    uint32_t f = *fpscr;
+    float res = aot_force_single(f, r);
+    aot_fp_fill_v(d0, d1, res);
+    *fpscr = aot_fpscr_fprf(f, res, 0);
+    return 1;
 }
 
 // fnmadds/fnmsubs: result = isnan(tmp) ? tmp : -tmp; tmp is never NaN here.
-static inline __attribute__((always_inline)) void aot_fnmaddsx_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+AOT_FP_V aot_fnmaddsx_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t c0, uint64_t b0) {
     double r;
-    if (__builtin_expect(!aot_fmadds_core(aot_bits_to_double(s->ps[fa].ps0), aot_bits_to_double(s->ps[fc].ps0),
-                                          aot_bits_to_double(s->ps[fb].ps0), 0, &r), 0)) {
-        aot_fnmaddsx(s, fd, fa, fc, fb);
-        return;
-    }
-    aot_fp_fill_single(s, fd, -aot_force_single(s->fpscr, r), 0);
+    if (__builtin_expect(!aot_fmadds_core(aot_bits_to_double(a0), aot_bits_to_double(c0), aot_bits_to_double(b0), 0, &r), 0))
+        return 0;
+    uint32_t f = *fpscr;
+    float res = -aot_force_single(f, r);
+    aot_fp_fill_v(d0, d1, res);
+    *fpscr = aot_fpscr_fprf(f, res, 0);
+    return 1;
 }
 
-static inline __attribute__((always_inline)) void aot_fnmsubsx_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+AOT_FP_V aot_fnmsubsx_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t c0, uint64_t b0) {
     double r;
-    if (__builtin_expect(!aot_fmadds_core(aot_bits_to_double(s->ps[fa].ps0), aot_bits_to_double(s->ps[fc].ps0),
-                                          aot_bits_to_double(s->ps[fb].ps0), 1, &r), 0)) {
-        aot_fnmsubsx(s, fd, fa, fc, fb);
-        return;
-    }
-    aot_fp_fill_single(s, fd, -aot_force_single(s->fpscr, r), 0);
+    if (__builtin_expect(!aot_fmadds_core(aot_bits_to_double(a0), aot_bits_to_double(c0), aot_bits_to_double(b0), 1, &r), 0))
+        return 0;
+    uint32_t f = *fpscr;
+    float res = -aot_force_single(f, r);
+    aot_fp_fill_v(d0, d1, res);
+    *fpscr = aot_fpscr_fprf(f, res, 0);
+    return 1;
 }
 
 // Paired forms: both halves go through the core before anything is written;
 // if either half needs the exact path the whole op is sent to the helper.
 // c0/c1 select frC's halves (ps_madds0: c.ps0 twice, ps_madds1: c.ps1 twice).
-static inline int aot_ps_madd_core(AOTState* s, int fa, double c0, double c1, int fb, int sub,
-                                   double* r0, double* r1) {
-    return aot_fmadds_core(aot_bits_to_double(s->ps[fa].ps0), c0, aot_bits_to_double(s->ps[fb].ps0), sub, r0) &
-           aot_fmadds_core(aot_bits_to_double(s->ps[fa].ps1), c1, aot_bits_to_double(s->ps[fb].ps1), sub, r1);
+static inline __attribute__((always_inline)) int aot_ps_madd_core_v(uint64_t a0, uint64_t a1, uint64_t c0, uint64_t c1,
+                                                                   uint64_t b0, uint64_t b1, int sub, double* r0, double* r1) {
+    return aot_fmadds_core(aot_bits_to_double(a0), aot_bits_to_double(c0), aot_bits_to_double(b0), sub, r0) &
+           aot_fmadds_core(aot_bits_to_double(a1), aot_bits_to_double(c1), aot_bits_to_double(b1), sub, r1);
 }
 
-static inline __attribute__((always_inline)) void aot_ps_madd_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+AOT_FP_V aot_ps_madd_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t a1, uint64_t c0, uint64_t c1, uint64_t b0, uint64_t b1) {
     double r0, r1;
-    if (__builtin_expect(!aot_ps_madd_core(s, fa, aot_bits_to_double(s->ps[fc].ps0), aot_bits_to_double(s->ps[fc].ps1),
-                                           fb, 0, &r0, &r1), 0)) {
-        aot_ps_madd(s, fd, fa, fc, fb);
-        return;
-    }
-    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
+    if (__builtin_expect(!aot_ps_madd_core_v(a0, a1, c0, c1, b0, b1, 0, &r0, &r1), 0)) return 0;
+    uint32_t f = *fpscr;
+    aot_ps_set_v(fpscr, f, d0, d1, aot_force_single(f, r0), aot_force_single(f, r1));
+    return 1;
 }
 
-static inline __attribute__((always_inline)) void aot_ps_msub_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+AOT_FP_V aot_ps_msub_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t a1, uint64_t c0, uint64_t c1, uint64_t b0, uint64_t b1) {
     double r0, r1;
-    if (__builtin_expect(!aot_ps_madd_core(s, fa, aot_bits_to_double(s->ps[fc].ps0), aot_bits_to_double(s->ps[fc].ps1),
-                                           fb, 1, &r0, &r1), 0)) {
-        aot_ps_msub(s, fd, fa, fc, fb);
-        return;
-    }
-    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
+    if (__builtin_expect(!aot_ps_madd_core_v(a0, a1, c0, c1, b0, b1, 1, &r0, &r1), 0)) return 0;
+    uint32_t f = *fpscr;
+    aot_ps_set_v(fpscr, f, d0, d1, aot_force_single(f, r0), aot_force_single(f, r1));
+    return 1;
 }
 
-static inline __attribute__((always_inline)) void aot_ps_nmadd_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+AOT_FP_V aot_ps_nmadd_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t a1, uint64_t c0, uint64_t c1, uint64_t b0, uint64_t b1) {
     double r0, r1;
-    if (__builtin_expect(!aot_ps_madd_core(s, fa, aot_bits_to_double(s->ps[fc].ps0), aot_bits_to_double(s->ps[fc].ps1),
-                                           fb, 0, &r0, &r1), 0)) {
-        aot_ps_nmadd(s, fd, fa, fc, fb);
-        return;
-    }
-    aot_ps_set_both(s, fd, -aot_force_single(s->fpscr, r0), -aot_force_single(s->fpscr, r1));
+    if (__builtin_expect(!aot_ps_madd_core_v(a0, a1, c0, c1, b0, b1, 0, &r0, &r1), 0)) return 0;
+    uint32_t f = *fpscr;
+    aot_ps_set_v(fpscr, f, d0, d1, -aot_force_single(f, r0), -aot_force_single(f, r1));
+    return 1;
 }
 
-static inline __attribute__((always_inline)) void aot_ps_nmsub_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+AOT_FP_V aot_ps_nmsub_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t a1, uint64_t c0, uint64_t c1, uint64_t b0, uint64_t b1) {
     double r0, r1;
-    if (__builtin_expect(!aot_ps_madd_core(s, fa, aot_bits_to_double(s->ps[fc].ps0), aot_bits_to_double(s->ps[fc].ps1),
-                                           fb, 1, &r0, &r1), 0)) {
-        aot_ps_nmsub(s, fd, fa, fc, fb);
-        return;
-    }
-    aot_ps_set_both(s, fd, -aot_force_single(s->fpscr, r0), -aot_force_single(s->fpscr, r1));
+    if (__builtin_expect(!aot_ps_madd_core_v(a0, a1, c0, c1, b0, b1, 1, &r0, &r1), 0)) return 0;
+    uint32_t f = *fpscr;
+    aot_ps_set_v(fpscr, f, d0, d1, -aot_force_single(f, r0), -aot_force_single(f, r1));
+    return 1;
 }
 
+AOT_FP_V aot_ps_madds0_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t a1, uint64_t c0, uint64_t b0, uint64_t b1) {
+    double r0, r1;
+    if (__builtin_expect(!aot_ps_madd_core_v(a0, a1, c0, c0, b0, b1, 0, &r0, &r1), 0)) return 0;
+    uint32_t f = *fpscr;
+    aot_ps_set_v(fpscr, f, d0, d1, aot_force_single(f, r0), aot_force_single(f, r1));
+    return 1;
+}
+
+AOT_FP_V aot_ps_madds1_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t a1, uint64_t c1, uint64_t b0, uint64_t b1) {
+    double r0, r1;
+    if (__builtin_expect(!aot_ps_madd_core_v(a0, a1, c1, c1, b0, b1, 0, &r0, &r1), 0)) return 0;
+    uint32_t f = *fpscr;
+    aot_ps_set_v(fpscr, f, d0, d1, aot_force_single(f, r0), aot_force_single(f, r1));
+    return 1;
+}
+
+// ----------------------------------------------------------------------------
+// Memory-form fast paths: the value cores on AOTState, falling back to the
+// exact helper (unchanged entry points; the AOT_NO_SUPERBLOCKS=1 emission).
+// ----------------------------------------------------------------------------
+#define AOT_FP_PS(n) &s->ps[n].ps0, &s->ps[n].ps1
+static inline __attribute__((always_inline)) void aot_faddsx_fast(AOTState* s, int fd, int fa, int fb) {
+    if (__builtin_expect(!aot_faddsx_v(&s->fpscr, AOT_FP_PS(fd), s->ps[fa].ps0, s->ps[fb].ps0), 0)) aot_faddsx(s, fd, fa, fb);
+}
+static inline __attribute__((always_inline)) void aot_fsubsx_fast(AOTState* s, int fd, int fa, int fb) {
+    if (__builtin_expect(!aot_fsubsx_v(&s->fpscr, AOT_FP_PS(fd), s->ps[fa].ps0, s->ps[fb].ps0), 0)) aot_fsubsx(s, fd, fa, fb);
+}
+static inline __attribute__((always_inline)) void aot_fmulsx_fast(AOTState* s, int fd, int fa, int fc) {
+    if (__builtin_expect(!aot_fmulsx_v(&s->fpscr, AOT_FP_PS(fd), s->ps[fa].ps0, s->ps[fc].ps0), 0)) aot_fmulsx(s, fd, fa, fc);
+}
+static inline __attribute__((always_inline)) void aot_ps_add_fast(AOTState* s, int fd, int fa, int fb) {
+    if (__builtin_expect(!aot_ps_add_v(&s->fpscr, AOT_FP_PS(fd), s->ps[fa].ps0, s->ps[fa].ps1, s->ps[fb].ps0, s->ps[fb].ps1), 0))
+        aot_ps_add(s, fd, fa, fb);
+}
+static inline __attribute__((always_inline)) void aot_ps_sub_fast(AOTState* s, int fd, int fa, int fb) {
+    if (__builtin_expect(!aot_ps_sub_v(&s->fpscr, AOT_FP_PS(fd), s->ps[fa].ps0, s->ps[fa].ps1, s->ps[fb].ps0, s->ps[fb].ps1), 0))
+        aot_ps_sub(s, fd, fa, fb);
+}
+static inline __attribute__((always_inline)) void aot_ps_mul_fast(AOTState* s, int fd, int fa, int fc) {
+    if (__builtin_expect(!aot_ps_mul_v(&s->fpscr, AOT_FP_PS(fd), s->ps[fa].ps0, s->ps[fa].ps1, s->ps[fc].ps0, s->ps[fc].ps1), 0))
+        aot_ps_mul(s, fd, fa, fc);
+}
+static inline __attribute__((always_inline)) void aot_ps_muls0_fast(AOTState* s, int fd, int fa, int fc) {
+    if (__builtin_expect(!aot_ps_muls0_v(&s->fpscr, AOT_FP_PS(fd), s->ps[fa].ps0, s->ps[fa].ps1, s->ps[fc].ps0), 0))
+        aot_ps_muls0(s, fd, fa, fc);
+}
+static inline __attribute__((always_inline)) void aot_ps_muls1_fast(AOTState* s, int fd, int fa, int fc) {
+    if (__builtin_expect(!aot_ps_muls1_v(&s->fpscr, AOT_FP_PS(fd), s->ps[fa].ps0, s->ps[fa].ps1, s->ps[fc].ps1), 0))
+        aot_ps_muls1(s, fd, fa, fc);
+}
+static inline __attribute__((always_inline)) void aot_fmaddsx_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+    if (__builtin_expect(!aot_fmaddsx_v(&s->fpscr, AOT_FP_PS(fd), s->ps[fa].ps0, s->ps[fc].ps0, s->ps[fb].ps0), 0))
+        aot_fmaddsx(s, fd, fa, fc, fb);
+}
+static inline __attribute__((always_inline)) void aot_fmsubsx_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+    if (__builtin_expect(!aot_fmsubsx_v(&s->fpscr, AOT_FP_PS(fd), s->ps[fa].ps0, s->ps[fc].ps0, s->ps[fb].ps0), 0))
+        aot_fmsubsx(s, fd, fa, fc, fb);
+}
+static inline __attribute__((always_inline)) void aot_fnmaddsx_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+    if (__builtin_expect(!aot_fnmaddsx_v(&s->fpscr, AOT_FP_PS(fd), s->ps[fa].ps0, s->ps[fc].ps0, s->ps[fb].ps0), 0))
+        aot_fnmaddsx(s, fd, fa, fc, fb);
+}
+static inline __attribute__((always_inline)) void aot_fnmsubsx_fast(AOTState* s, int fd, int fa, int fc, int fb) {
+    if (__builtin_expect(!aot_fnmsubsx_v(&s->fpscr, AOT_FP_PS(fd), s->ps[fa].ps0, s->ps[fc].ps0, s->ps[fb].ps0), 0))
+        aot_fnmsubsx(s, fd, fa, fc, fb);
+}
+#define AOT_FP_PS_MADD_FAST(op)                                                                      \
+static inline __attribute__((always_inline)) void aot_##op##_fast(AOTState* s, int fd, int fa, int fc, int fb) { \
+    if (__builtin_expect(!aot_##op##_v(&s->fpscr, AOT_FP_PS(fd), s->ps[fa].ps0, s->ps[fa].ps1,       \
+                                       s->ps[fc].ps0, s->ps[fc].ps1, s->ps[fb].ps0, s->ps[fb].ps1), 0)) \
+        aot_##op(s, fd, fa, fc, fb);                                                                 \
+}
+AOT_FP_PS_MADD_FAST(ps_madd)
+AOT_FP_PS_MADD_FAST(ps_msub)
+AOT_FP_PS_MADD_FAST(ps_nmadd)
+AOT_FP_PS_MADD_FAST(ps_nmsub)
+#undef AOT_FP_PS_MADD_FAST
 static inline __attribute__((always_inline)) void aot_ps_madds0_fast(AOTState* s, int fd, int fa, int fc, int fb) {
-    double r0, r1;
-    double c0 = aot_bits_to_double(s->ps[fc].ps0);
-    if (__builtin_expect(!aot_ps_madd_core(s, fa, c0, c0, fb, 0, &r0, &r1), 0)) {
+    if (__builtin_expect(!aot_ps_madds0_v(&s->fpscr, AOT_FP_PS(fd), s->ps[fa].ps0, s->ps[fa].ps1, s->ps[fc].ps0,
+                                          s->ps[fb].ps0, s->ps[fb].ps1), 0))
         aot_ps_madds0(s, fd, fa, fc, fb);
-        return;
-    }
-    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
 }
-
 static inline __attribute__((always_inline)) void aot_ps_madds1_fast(AOTState* s, int fd, int fa, int fc, int fb) {
-    double r0, r1;
-    double c1 = aot_bits_to_double(s->ps[fc].ps1);
-    if (__builtin_expect(!aot_ps_madd_core(s, fa, c1, c1, fb, 0, &r0, &r1), 0)) {
+    if (__builtin_expect(!aot_ps_madds1_v(&s->fpscr, AOT_FP_PS(fd), s->ps[fa].ps0, s->ps[fa].ps1, s->ps[fc].ps1,
+                                          s->ps[fb].ps0, s->ps[fb].ps1), 0))
         aot_ps_madds1(s, fd, fa, fc, fb);
-        return;
-    }
-    aot_ps_set_both(s, fd, aot_force_single(s->fpscr, r0), aot_force_single(s->fpscr, r1));
 }
+#undef AOT_FP_PS
 
 // ----------------------------------------------------------------------------
 // Single <-> double bit conversions for lfs/stfs and psq float loads/stores:
@@ -1064,7 +1173,10 @@ static inline __attribute__((always_inline)) uint8_t* aot_psq_host_ptr_fm(const 
     return 0;
 }
 
-static inline __attribute__((always_inline)) int aot_psq_l_try(AOTState* s, const AotFastMem* fm, int fd, uint32_t ea, int i, int w) {
+/* Value forms (fp1): the loaded pair goes to *d0 and *d1 (written only on success),
+   the stored pair comes in as the register's two halves; HID2/GQR stay in
+   AOTState. aot_psq_{l,st}_try are the memory-form adapters. */
+static inline __attribute__((always_inline)) int aot_psq_l_try_v(AOTState* s, const AotFastMem* fm, uint64_t* d0, uint64_t* d1, uint32_t ea, int i, int w) {
     uint8_t* p;
     if (__builtin_expect((s->spr[AOT_SPR_HID2] & AOT_HID2_LSQE) != 0 &&
                          (s->spr[AOT_SPR_GQR0 + i] & 0x70000u) == 0 &&
@@ -1072,31 +1184,31 @@ static inline __attribute__((always_inline)) int aot_psq_l_try(AOTState* s, cons
         AOT_ASSUME_SEPARATE(p, s);
         if (w) {
             uint32_t v; __builtin_memcpy(&v, p, 4);
-            s->ps[fd].ps0 = aot_convert_to_double_fast(__builtin_bswap32(v));
-            s->ps[fd].ps1 = 0x3FF0000000000000ull;  /* 1.0 */
+            *d0 = aot_convert_to_double_fast(__builtin_bswap32(v));
+            *d1 = 0x3FF0000000000000ull;  /* 1.0 */
         } else {
             uint64_t v; __builtin_memcpy(&v, p, 8);
             v = __builtin_bswap64(v);
-            s->ps[fd].ps0 = aot_convert_to_double_fast((uint32_t)(v >> 32));
-            s->ps[fd].ps1 = aot_convert_to_double_fast((uint32_t)v);
+            *d0 = aot_convert_to_double_fast((uint32_t)(v >> 32));
+            *d1 = aot_convert_to_double_fast((uint32_t)v);
         }
         return 1;
     }
     return 0;
 }
 
-static inline __attribute__((always_inline)) int aot_psq_st_try(AOTState* s, const AotFastMem* fm, int fs, uint32_t ea, int i, int w) {
+static inline __attribute__((always_inline)) int aot_psq_st_try_v(AOTState* s, const AotFastMem* fm, uint64_t s0, uint64_t s1, uint32_t ea, int i, int w) {
     if (__builtin_expect((s->spr[AOT_SPR_HID2] & AOT_HID2_LSQE) != 0 &&
                          (s->spr[AOT_SPR_GQR0 + i] & 0x7u) == 0, 1)) {
         uint8_t* p;
-        uint32_t c0 = aot_convert_to_single_ftz_fast(s->ps[fs].ps0);
+        uint32_t c0 = aot_convert_to_single_ftz_fast(s0);
         if (__builtin_expect((p = aot_psq_host_ptr_fm(fm, ea)) != 0, 1)) {
             AOT_ASSUME_SEPARATE(p, s);
             if (w) {
                 uint32_t v = __builtin_bswap32(c0);
                 __builtin_memcpy(p, &v, 4);
             } else {
-                uint64_t v = __builtin_bswap64(((uint64_t)c0 << 32) | aot_convert_to_single_ftz_fast(s->ps[fs].ps1));
+                uint64_t v = __builtin_bswap64(((uint64_t)c0 << 32) | aot_convert_to_single_ftz_fast(s1));
                 __builtin_memcpy(p, &v, 8);
             }
             return 1;
@@ -1107,11 +1219,19 @@ static inline __attribute__((always_inline)) int aot_psq_st_try(AOTState* s, con
         uint32_t phys = aot_gp_physical(s, fm, ea, w ? 4u : 8u);
         if (phys) {
             if (w) aot_gp_store_u32(s, phys, c0);
-            else   aot_gp_store_pair_u32(s, phys, c0, aot_convert_to_single_ftz_fast(s->ps[fs].ps1));
+            else   aot_gp_store_pair_u32(s, phys, c0, aot_convert_to_single_ftz_fast(s1));
             return 1;
         }
     }
     return 0;
+}
+
+static inline __attribute__((always_inline)) int aot_psq_l_try(AOTState* s, const AotFastMem* fm, int fd, uint32_t ea, int i, int w) {
+    return aot_psq_l_try_v(s, fm, &s->ps[fd].ps0, &s->ps[fd].ps1, ea, i, w);
+}
+
+static inline __attribute__((always_inline)) int aot_psq_st_try(AOTState* s, const AotFastMem* fm, int fs, uint32_t ea, int i, int w) {
+    return aot_psq_st_try_v(s, fm, s->ps[fs].ps0, s->ps[fs].ps1, ea, i, w);
 }
 
 static inline __attribute__((always_inline)) void aot_psq_l_fast(AOTState* s, const AotFastMem* fm, int fd, int ra, uint32_t ea, int i, int w, uint32_t inst) {

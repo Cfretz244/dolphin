@@ -608,6 +608,224 @@ TEST_F(AotFpFastPathTest, FmaddsTieCasesTakeExactPath)
   EXPECT_EQ(state.ps[3].PS1AsU64(), SingleAsDouble(0xbf55bf17u));
 }
 
+// Value forms (fp1): the superblock emitter calls aot_<op>_v on C locals and,
+// only when it returns 0, writes the operands back and runs the exact helper on
+// AOTState. Model that exactly -- a local copy of all 32 registers + FPSCR, the
+// _v call, then either "locals -> state" or (after checking the declined call
+// wrote nothing) the helper on the state -- and compare with the interpreter,
+// over the fmadds-family cases (ties, NaN, infinities, denormals, the NI window
+// via the add/mul pairs) at every RN x NI and FPSCR/MSR environment, with fd
+// distinct from and aliasing every operand.
+namespace
+{
+using VFn = int (*)(u32* fpscr, u64* d0, u64* d1, const u64 (*r)[2], int fa, int fc, int fb);
+using SlowFn = void (*)(AOTState* s, int fd, int fa, int fc, int fb);
+
+struct VOp
+{
+  const char* name;
+  InterpFn interp;
+  VFn v;
+  SlowFn slow;
+};
+
+#define AOT_V_OP(nm, call, slowcall)                                                               \
+  VOp                                                                                              \
+  {                                                                                                \
+    #nm, &Interpreter::nm,                                                                         \
+        [](u32* f, u64* d0, u64* d1, const u64(*r)[2], int a, int c, int b) -> int {               \
+          (void)a, (void)c, (void)b;                                                               \
+          return call;                                                                             \
+        },                                                                                         \
+        [](AOTState* s, int d, int a, int c, int b) {                                              \
+          (void)c, (void)b;                                                                        \
+          slowcall;                                                                                \
+        }                                                                                          \
+  }
+
+const std::array<VOp, 18> s_v_ops{{
+    AOT_V_OP(faddsx, aot_faddsx_v(f, d0, d1, r[a][0], r[b][0]), aot_faddsx(s, d, a, b)),
+    AOT_V_OP(fsubsx, aot_fsubsx_v(f, d0, d1, r[a][0], r[b][0]), aot_fsubsx(s, d, a, b)),
+    AOT_V_OP(fmulsx, aot_fmulsx_v(f, d0, d1, r[a][0], r[c][0]), aot_fmulsx(s, d, a, c)),
+    AOT_V_OP(fmaddsx, aot_fmaddsx_v(f, d0, d1, r[a][0], r[c][0], r[b][0]),
+             aot_fmaddsx(s, d, a, c, b)),
+    AOT_V_OP(fmsubsx, aot_fmsubsx_v(f, d0, d1, r[a][0], r[c][0], r[b][0]),
+             aot_fmsubsx(s, d, a, c, b)),
+    AOT_V_OP(fnmaddsx, aot_fnmaddsx_v(f, d0, d1, r[a][0], r[c][0], r[b][0]),
+             aot_fnmaddsx(s, d, a, c, b)),
+    AOT_V_OP(fnmsubsx, aot_fnmsubsx_v(f, d0, d1, r[a][0], r[c][0], r[b][0]),
+             aot_fnmsubsx(s, d, a, c, b)),
+    AOT_V_OP(ps_add, aot_ps_add_v(f, d0, d1, r[a][0], r[a][1], r[b][0], r[b][1]),
+             aot_ps_add(s, d, a, b)),
+    AOT_V_OP(ps_sub, aot_ps_sub_v(f, d0, d1, r[a][0], r[a][1], r[b][0], r[b][1]),
+             aot_ps_sub(s, d, a, b)),
+    AOT_V_OP(ps_mul, aot_ps_mul_v(f, d0, d1, r[a][0], r[a][1], r[c][0], r[c][1]),
+             aot_ps_mul(s, d, a, c)),
+    AOT_V_OP(ps_muls0, aot_ps_muls0_v(f, d0, d1, r[a][0], r[a][1], r[c][0]),
+             aot_ps_muls0(s, d, a, c)),
+    AOT_V_OP(ps_muls1, aot_ps_muls1_v(f, d0, d1, r[a][0], r[a][1], r[c][1]),
+             aot_ps_muls1(s, d, a, c)),
+    AOT_V_OP(ps_madd,
+             aot_ps_madd_v(f, d0, d1, r[a][0], r[a][1], r[c][0], r[c][1], r[b][0], r[b][1]),
+             aot_ps_madd(s, d, a, c, b)),
+    AOT_V_OP(ps_msub,
+             aot_ps_msub_v(f, d0, d1, r[a][0], r[a][1], r[c][0], r[c][1], r[b][0], r[b][1]),
+             aot_ps_msub(s, d, a, c, b)),
+    AOT_V_OP(ps_nmadd,
+             aot_ps_nmadd_v(f, d0, d1, r[a][0], r[a][1], r[c][0], r[c][1], r[b][0], r[b][1]),
+             aot_ps_nmadd(s, d, a, c, b)),
+    AOT_V_OP(ps_nmsub,
+             aot_ps_nmsub_v(f, d0, d1, r[a][0], r[a][1], r[c][0], r[c][1], r[b][0], r[b][1]),
+             aot_ps_nmsub(s, d, a, c, b)),
+    AOT_V_OP(ps_madds0, aot_ps_madds0_v(f, d0, d1, r[a][0], r[a][1], r[c][0], r[b][0], r[b][1]),
+             aot_ps_madds0(s, d, a, c, b)),
+    AOT_V_OP(ps_madds1, aot_ps_madds1_v(f, d0, d1, r[a][0], r[a][1], r[c][1], r[b][0], r[b][1]),
+             aot_ps_madds1(s, d, a, c, b)),
+}};
+#undef AOT_V_OP
+}  // namespace
+
+TEST_F(AotFpFastPathTest, ValueFormsBitIdenticalToInterpreter)
+{
+  std::vector<FmaCase> cases = BuildFmaCases();
+  // The two-operand pairs (NI flush window, x op identity), laid out as in
+  // RunOne: ps[1] = (a, b), ps[2] = ps[4] = (b, a).
+  for (const auto& [a, b] : BuildOperandPairs())
+    cases.push_back({{a, b, b}, {b, a, a}});
+
+  Common::ScopeGuard restore_mode{
+      [] { Common::FPU::SetSIMDMode(Common::FPU::RoundMode::ROUND_NEAR, false); }};
+  constexpr u32 msr_fe = (1u << 11) | (1u << 8);
+
+  int total_mismatches = 0;
+  u64 runs = 0, declined = 0;
+  std::array<u64, s_v_ops.size()> op_declined{};
+  for (u32 rn = 0; rn < 4; ++rn)
+  {
+    for (const bool ni : {false, true})
+    {
+      Common::FPU::SetSIMDMode(static_cast<Common::FPU::RoundMode>(rn), ni);
+      const u32 mode_bits = (ni ? (1u << 2) : 0u) | rn;
+      const std::array<std::pair<u32, u32>, 3> envs{{
+          {mode_bits, 0},
+          {0xFFFF'F000u | mode_bits, 0},
+          {0xFFFF'F0F8u | mode_bits, msr_fe},
+      }};
+      for (size_t oi = 0; oi < s_v_ops.size(); ++oi)
+      {
+        const VOp& op = s_v_ops[oi];
+        int reported = 0;
+        int op_mismatches = 0;
+        for (const auto& [fpscr, msr] : envs)
+        {
+          for (const FmaCase& fc : cases)
+          {
+            for (const int fd : {3, 1, 2, 4})
+            {
+              UGeckoInstruction inst{};
+              inst.OPCD = 59;
+              inst.FD = fd;
+              inst.FA = 1;
+              inst.FC = 2;
+              inst.FB = 4;
+              inst.Rc = 0;
+
+              LoadFma(fc, fpscr, msr);
+              op.interp(system.GetInterpreter(), inst);
+              const Snapshot expected = Take();
+
+              LoadFma(fc, fpscr, msr);
+              auto& state = system.GetPPCState();
+              u64 r[32][2];
+              for (int i = 0; i < 32; ++i)
+              {
+                r[i][0] = state.ps[i].PS0AsU64();
+                r[i][1] = state.ps[i].PS1AsU64();
+              }
+              u32 lf = state.fpscr.Hex;
+              const u64 old0 = r[fd][0], old1 = r[fd][1];
+              const u32 oldf = lf;
+              bool wrote_on_decline = false;
+              if (op.v(&lf, &r[fd][0], &r[fd][1], r, 1, 2, 4))
+              {
+                state.ps[fd].SetBoth(r[fd][0], r[fd][1]);
+                state.fpscr.Hex = lf;
+              }
+              else
+              {
+                ++declined;
+                ++op_declined[oi];
+                wrote_on_decline = r[fd][0] != old0 || r[fd][1] != old1 || lf != oldf;
+                op.slow(ToAot(state), fd, 1, 2, 4);
+              }
+              const Snapshot actual = Take();
+              ++runs;
+              if (expected == actual && !wrote_on_decline)
+                continue;
+              ++op_mismatches;
+              if (reported++ < 10)
+              {
+                ADD_FAILURE() << fmt::format(
+                    "{}_v fd={} a={:016x}/{:016x} c={:016x}/{:016x} b={:016x}/{:016x} "
+                    "fpscr_in={:08x} msr={:08x} wrote_on_decline={}: interp ps[fd]={:016x}/{:016x} "
+                    "fpscr={:08x} exc={:x} | v ps[fd]={:016x}/{:016x} fpscr={:08x} exc={:x}",
+                    op.name, fd, fc.lo.a, fc.hi.a, fc.lo.c, fc.hi.c, fc.lo.b, fc.hi.b, fpscr, msr,
+                    wrote_on_decline, expected.ps[fd].ps0, expected.ps[fd].ps1, expected.fpscr,
+                    expected.exceptions, actual.ps[fd].ps0, actual.ps[fd].ps1, actual.fpscr,
+                    actual.exceptions);
+              }
+            }
+          }
+        }
+        EXPECT_EQ(op_mismatches, 0) << op.name << "_v RN=" << rn << " NI=" << ni;
+        total_mismatches += op_mismatches;
+      }
+    }
+  }
+  std::printf("AotFpFastPathTest value forms: %zu cases, %llu runs, %llu declined, %d mismatches\n",
+              cases.size(), static_cast<unsigned long long>(runs),
+              static_cast<unsigned long long>(declined), total_mismatches);
+  // Every value form must have exercised its slow-path trigger (NaN /
+  // non-finite for all; the even tie for the fmadds family).
+  for (size_t oi = 0; oi < s_v_ops.size(); ++oi)
+    EXPECT_GT(op_declined[oi], 0u) << s_v_ops[oi].name;
+  EXPECT_EQ(total_mismatches, 0);
+}
+
+// The tie cases specifically decline in every fused value form (both halves,
+// either half), so the even-tie correction always reaches the exact helper.
+TEST_F(AotFpFastPathTest, ValueFormsDeclineTies)
+{
+  Common::FPU::SetSIMDMode(Common::FPU::RoundMode::ROUND_NEAR, false);
+  std::mt19937_64 rng(0x5EED'AD07'F00D'0002ULL);
+  const std::vector<Triple> ties = BuildTieTriples(rng);
+  int checked = 0, accepted = 0;
+  for (const Triple& t : ties)
+  {
+    const double r =
+        std::fma(std::bit_cast<double>(t.a), Force25Bit(std::bit_cast<double>(t.c)),
+                 std::bit_cast<double>(t.b));
+    if ((std::bit_cast<u64>(r) & 0x1FFF'FFFFULL) != 0x1000'0000ULL)
+      continue;
+    const u64 one = 0x3FF0'0000'0000'0000ULL;
+    u32 f = 0;
+    u64 d0 = 0, d1 = 0;
+    ++checked;
+    accepted += aot_fmaddsx_v(&f, &d0, &d1, t.a, t.c, t.b);
+    accepted += aot_fnmaddsx_v(&f, &d0, &d1, t.a, t.c, t.b);
+    accepted += aot_ps_madd_v(&f, &d0, &d1, t.a, one, t.c, one, t.b, one);   // tie in ps0
+    accepted += aot_ps_madd_v(&f, &d0, &d1, one, t.a, one, t.c, one, t.b);   // tie in ps1
+    accepted += aot_ps_nmadd_v(&f, &d0, &d1, t.a, t.a, t.c, t.c, t.b, t.b);
+    accepted += aot_ps_madds0_v(&f, &d0, &d1, t.a, t.a, t.c, t.b, t.b);
+    accepted += aot_ps_madds1_v(&f, &d0, &d1, t.a, t.a, t.c, t.b, t.b);
+    EXPECT_EQ(f, 0u);
+    EXPECT_EQ(d0, 0u);
+    EXPECT_EQ(d1, 0u);
+  }
+  EXPECT_GE(checked, 500);
+  EXPECT_EQ(accepted, 0);
+}
+
 TEST(AotFpConvertTest, ConvertToDoubleExhaustive)
 {
   u64 mismatches = 0;
@@ -753,6 +971,71 @@ TEST(AotFpPsqTest, FloatPathMatchesConvert)
   fm.l1 = nullptr;
   for (const u32 a : {0xE000'0000u, 0xE000'0100u, 0xE000'3FF8u})
     EXPECT_EQ(aot_psq_host_ptr_fm(&fm, a), nullptr);
+}
+
+// psq value forms (fp1): aot_psq_{l,st}_try_v on register values match the
+// memory-form adapters, and a declined access (LSQE off, non-float GQR, an
+// address outside RAM/L1/the pipe) writes nothing.
+TEST(AotFpPsqTest, ValueFormsMatchMemoryForms)
+{
+  alignas(8) static u8 ram[0x1000];
+  static u32 dbat[1u << 15]{};
+  std::memset(dbat, 0, sizeof(dbat));
+  AotFastMem fm{ram, sizeof(ram), nullptr, 0, dbat, nullptr, 0};
+  AOTState s{};
+  s.spr[920] = 0x8000'0000u;
+  for (int i = 0; i < 8; ++i)
+    s.spr[912 + i] = 0x3F00'3F00u;
+  std::mt19937_64 rng(0x5EED'AD07'F00D'0005ULL);
+  int bad = 0;
+  for (int k = 0; k < 4000; ++k)
+  {
+    const u64 a = rng(), b = rng();
+    const u32 ea = 0x8000'0100u + 8u * static_cast<u32>(k % 64);
+    const int w = k & 1, gqr = k % 8;
+    // store: value form vs memory form, byte-identical RAM
+    u8 via_mem[8], via_v[8];
+    s.ps[7].ps0 = a;
+    s.ps[7].ps1 = b;
+    std::memset(ram + (ea - 0x8000'0000u), 0x11, 8);
+    EXPECT_EQ(aot_psq_st_try(&s, &fm, 7, ea, gqr, w), 1);
+    std::memcpy(via_mem, ram + (ea - 0x8000'0000u), 8);
+    std::memset(ram + (ea - 0x8000'0000u), 0x11, 8);
+    EXPECT_EQ(aot_psq_st_try_v(&s, &fm, a, b, ea, gqr, w), 1);
+    std::memcpy(via_v, ram + (ea - 0x8000'0000u), 8);
+    if (std::memcmp(via_mem, via_v, 8) != 0 && bad++ < 5)
+      ADD_FAILURE() << fmt::format("psq_st_try_v w={} {:016x}/{:016x}", w, a, b);
+    // load: value form vs memory form
+    std::memcpy(ram + (ea - 0x8000'0000u), &a, 8);
+    s.ps[8].ps0 = s.ps[8].ps1 = 0;
+    EXPECT_EQ(aot_psq_l_try(&s, &fm, 8, ea, gqr, w), 1);
+    u64 d0 = 1, d1 = 2;
+    EXPECT_EQ(aot_psq_l_try_v(&s, &fm, &d0, &d1, ea, gqr, w), 1);
+    if ((d0 != s.ps[8].ps0 || d1 != s.ps[8].ps1) && bad++ < 5)
+      ADD_FAILURE() << fmt::format("psq_l_try_v w={} raw {:016x}", w, a);
+  }
+  EXPECT_EQ(bad, 0);
+  // Declines write nothing.
+  const u64 s0 = 0x1111'2222'3333'4444ULL, s1 = 0x5555'6666'7777'8888ULL;
+  u64 d0 = s0, d1 = s1;
+  std::memset(ram, 0x77, sizeof(ram));
+  s.spr[920] = 0;  // LSQE off
+  EXPECT_EQ(aot_psq_l_try_v(&s, &fm, &d0, &d1, 0x8000'0100u, 0, 0), 0);
+  EXPECT_EQ(aot_psq_st_try_v(&s, &fm, s0, s1, 0x8000'0100u, 0, 0), 0);
+  s.spr[920] = 0x8000'0000u;
+  s.spr[912 + 3] = 0x0004'0004u;  // u8 quantized ld/st types: not the float path
+  EXPECT_EQ(aot_psq_l_try_v(&s, &fm, &d0, &d1, 0x8000'0100u, 3, 0), 0);
+  EXPECT_EQ(aot_psq_st_try_v(&s, &fm, s0, s1, 0x8000'0100u, 3, 0), 0);
+  EXPECT_EQ(aot_psq_l_try_v(&s, &fm, &d0, &d1, 0x9000'0000u, 0, 0), 0);  // outside RAM, no MEM2
+  EXPECT_EQ(aot_psq_st_try_v(&s, &fm, s0, s1, 0x9000'0000u, 0, 0), 0);   // and unmapped for the pipe
+  EXPECT_EQ(d0, s0);
+  EXPECT_EQ(d1, s1);
+  for (const u8 byte : ram)
+    if (byte != 0x77)
+    {
+      ADD_FAILURE() << "declined psq_st_try_v wrote RAM";
+      break;
+    }
 }
 
 // psq_st inline write-gather pipe path (float GQR): a store to the SDK's

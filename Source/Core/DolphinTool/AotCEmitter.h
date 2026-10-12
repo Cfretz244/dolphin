@@ -4,11 +4,13 @@
 #pragma once
 
 #include <bitset>
+#include <initializer_list>
 #include <map>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include "Common/CommonTypes.h"
 #include "Core/PowerPC/Gekko.h"
@@ -193,6 +195,15 @@ private:
   void EmitPsqFast(std::string& out, UGeckoInstruction inst, bool store, bool update = false);
   void EmitStfs(std::string& out, UGeckoInstruction inst, bool update, bool indexed);
   void EmitStfd(std::string& out, UGeckoInstruction inst, bool update, bool indexed);
+  // Single-precision FP / PS arithmetic with a static inline fast path: the
+  // memory-form `aot_<op>_fast(s,args)` call, or (superblocks) the value form
+  // `aot_<op>_v` on FP locals with a bracketed cold call of the exact helper.
+  // `srcs` = the (register, half) pairs the fast path reads, in _v order.
+  void EmitFpFast(std::string& out, const char* op, u32 fd,
+                  std::initializer_list<std::pair<u32, int>> srcs, const std::string& args);
+  // ps_mr/neg/abs/nabs/merge*: pure bit moves (no FPSCR); inline text under
+  // superblocks, the out-of-line helper otherwise.
+  void EmitPsMove(std::string& out, const char* op, u32 fd, u32 fa, u32 fb);
 
   // System/SPR
   void EmitMfspr(std::string& out, UGeckoInstruction inst);
@@ -276,16 +287,25 @@ private:
   // (return / musttail) writes back the locals defined so far, and helpers that
   // read or write those registers through AOTState memory get a write-back
   // before and a reload after. AOT_NO_SUPERBLOCKS=1 at translate time disables.
+  // Step 2 (fp1, 2026-10-06): FP/PS register halves and FPSCR as well
+  // (_fN0/_fN1 = bits of ps[N].ps0/ps1, _fpscr); bit 2N+h of the FP sets.
   bool m_superblocks = true;
   std::bitset<32> m_sb_gpr_used, m_sb_gpr_dirty;
   std::bitset<8> m_sb_cr_used, m_sb_cr_dirty;
   bool m_sb_lr_used = false, m_sb_lr_dirty = false;
   bool m_sb_ctr_used = false, m_sb_ctr_dirty = false;
+  std::bitset<64> m_sb_fp_used, m_sb_fp_dirty;
+  bool m_sb_fpscr_used = false, m_sb_fpscr_dirty = false;
   bool m_sb_fm_used = false;  // lazy per-function aot_fm copy emitted
   void SbReset();
   void SbFinishSegment(std::string& out, size_t start);
-  std::string SbWriteBack() const;
-  std::string SbReloadUsed() const;
+  std::string SbWriteBack() const;  // every dirty local (exits)
+  std::string SbGprWriteBack() const;
+  std::string SbGprReloadUsed() const;
+  // FP write-back of the dirty halves of `regs` (+ FPSCR if `fpscr`), and the
+  // matching reload of the used ones; `all` = every FP register.
+  std::string SbFpWriteBack(const std::bitset<32>& regs, bool fpscr) const;
+  std::string SbFpReload(const std::bitset<32>& regs, bool fpscr) const;
 
   const ModuleMode* m_module = nullptr;
   const ModuleImmReloc* m_cur_imm = nullptr;          // reloc on the current instruction

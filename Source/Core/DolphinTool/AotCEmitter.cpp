@@ -3,11 +3,13 @@
 
 #include "DolphinTool/AotCEmitter.h"
 
+#include <algorithm>
 #include <bitset>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_set>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -135,10 +137,13 @@ void AOTCEmitter::SbReset()
   m_sb_cr_dirty.reset();
   m_sb_lr_used = m_sb_lr_dirty = false;
   m_sb_ctr_used = m_sb_ctr_dirty = false;
+  m_sb_fp_used.reset();
+  m_sb_fp_dirty.reset();
+  m_sb_fpscr_used = m_sb_fpscr_dirty = false;
   m_sb_fm_used = false;
 }
 
-std::string AOTCEmitter::SbWriteBack() const
+std::string AOTCEmitter::SbGprWriteBack() const
 {
   std::string wb;
   for (u32 r = 0; r < 32; r++)
@@ -154,7 +159,7 @@ std::string AOTCEmitter::SbWriteBack() const
   return wb;
 }
 
-std::string AOTCEmitter::SbReloadUsed() const
+std::string AOTCEmitter::SbGprReloadUsed() const
 {
   std::string rl;
   for (u32 r = 0; r < 32; r++)
@@ -168,6 +173,35 @@ std::string AOTCEmitter::SbReloadUsed() const
   if (m_sb_ctr_used)
     rl += "_ctr=s->spr[9]; ";
   return rl;
+}
+
+std::string AOTCEmitter::SbFpWriteBack(const std::bitset<32>& regs, bool fpscr) const
+{
+  std::string wb;
+  for (u32 n = 0; n < 32; n++)
+    for (u32 h = 0; h < 2; h++)
+      if (regs[n] && m_sb_fp_dirty[2 * n + h])
+        wb += fmt::format("s->ps[{0}].ps{1}=_f{0}{1}; ", n, h);
+  if (fpscr && m_sb_fpscr_dirty)
+    wb += "s->fpscr=_fpscr; ";
+  return wb;
+}
+
+std::string AOTCEmitter::SbFpReload(const std::bitset<32>& regs, bool fpscr) const
+{
+  std::string rl;
+  for (u32 n = 0; n < 32; n++)
+    for (u32 h = 0; h < 2; h++)
+      if (regs[n] && m_sb_fp_used[2 * n + h])
+        rl += fmt::format("_f{0}{1}=s->ps[{0}].ps{1}; ", n, h);
+  if (fpscr && m_sb_fpscr_used)
+    rl += "_fpscr=s->fpscr; ";
+  return rl;
+}
+
+std::string AOTCEmitter::SbWriteBack() const
+{
+  return SbGprWriteBack() + SbFpWriteBack(std::bitset<32>().set(), true);
 }
 
 namespace
@@ -203,7 +237,8 @@ SbHelperKind ClassifyHelper(const std::string& name, bool psq_protocol_segment)
   // EmitPsqFast's register-cache form: the fast path touches no GPR, and the
   // fallback is bracketed by explicit AOT_GPR_MEM write-back/reload of its base.
   static const std::unordered_set<std::string> psq_protocol = {
-      "aot_psq_l_try", "aot_psq_st_try", "aot_psq_l", "aot_psq_st", "aot_psq_lu", "aot_psq_stu"};
+      "aot_psq_l_try_v", "aot_psq_st_try_v", "aot_psq_l", "aot_psq_st", "aot_psq_lu",
+      "aot_psq_stu"};
   static const std::unordered_set<std::string> barrier = {
       "aot_fcmpu",    "aot_fcmpo",    "aot_ps_cmpu0", "aot_ps_cmpo0", "aot_ps_cmpu1",
       "aot_ps_cmpo1", "aot_mcrfs",    "aot_mtcrf",    "aot_cr_logical"};
@@ -220,6 +255,163 @@ SbHelperKind ClassifyHelper(const std::string& name, bool psq_protocol_segment)
   return SbHelperKind::Barrier;
 }
 
+// The FP dimension (fp1): how a helper call reaches ps[] / FPSCR in AOTState.
+//
+//   helper(s)                                            kind       before the call       after
+//   ---------------------------------------------------  ---------  --------------------  ---------
+//   aot_fdivsx fresx frspx fctiwx fctiwzx frsqrtex       Call       dirty halves of fd +  used
+//   aot_fdivx fselx faddx fsubx fmulx fmaddx fmsubx       (s,fd,     every source reg,     halves of
+//     fnmaddx fnmsubx                                     srcs...)   dirty FPSCR           fd, FPSCR
+//   aot_ps_div sel res rsqrte sum0 sum1
+//   aot_ps_neg mr abs nabs merge00/01/10/11 (only if
+//     emitted out of line; superblocks inline them)
+//   the 18 exact helpers of the value forms (faddsx ...  Call (unbracketed) / None inside their
+//     ps_madds1) and aot_psq_l/lu/st/stu                 own @FPWB/@FPRL bracket (psq: Full
+//                                                        unbracketed)
+//   aot_fcmpu fcmpo ps_cmpu0/o0/u1/o1 (s,crfd,fa,fb)     Compare    fa, fb, FPSCR         FPSCR
+//   aot_mtfsf (s,fm,fb)                                  Mtfsf      fb, FPSCR             FPSCR
+//   aot_mtfsfi (s,crfd,imm), aot_mcrfs (s,crfd,crfs)     Fpscr      FPSCR                 FPSCR
+//   *_fm memory helpers, *_v value forms, the GPR/CR     None       -                     -
+//     value helpers, aot_fpu_available, mtmsr_fast,
+//     m[ft]spr_special, sc/twi/rfi/idle/dcb*/icbi/
+//     sr_updated/mftb, convert_*, mfcr/mtcrf/
+//     cr_logical, host_ptr_fm (none reads ps[]/fpscr;
+//     exceptions they raise go through s->exceptions)
+//   aot_interpreter_single_step, memory-form psq          Full       every dirty half +    every used
+//     (aot_psq_*x, *_fast, *_try), anything unknown                  FPSCR                 half, FPSCR
+//
+// Literal s->ps[N].psH / s->fpscr text in a Barrier-form segment is treated as
+// a source and a destination (write back before, reload after).
+enum class SbFpKind
+{
+  None,
+  Call,
+  Compare,
+  Mtfsf,
+  Fpscr,
+  Full,
+};
+
+SbFpKind ClassifyFpHelper(const std::string& name, bool bracketed_segment)
+{
+  static const std::unordered_set<std::string> call = {
+      "aot_fdivsx",   "aot_fresx",     "aot_frspx",      "aot_fctiwx",     "aot_fctiwzx",
+      "aot_frsqrtex", "aot_fdivx",     "aot_fselx",      "aot_faddx",      "aot_fsubx",
+      "aot_fmulx",    "aot_fmaddx",    "aot_fmsubx",     "aot_fnmaddx",    "aot_fnmsubx",
+      "aot_ps_div",   "aot_ps_sel",    "aot_ps_res",     "aot_ps_rsqrte",  "aot_ps_sum0",
+      "aot_ps_sum1",  "aot_ps_neg",    "aot_ps_mr",      "aot_ps_abs",     "aot_ps_nabs",
+      "aot_ps_merge00", "aot_ps_merge01", "aot_ps_merge10", "aot_ps_merge11"};
+  static const std::unordered_set<std::string> value_slow = {
+      "aot_faddsx",  "aot_fsubsx",   "aot_fmulsx",   "aot_fmaddsx",  "aot_fmsubsx",
+      "aot_fnmaddsx", "aot_fnmsubsx", "aot_ps_add",   "aot_ps_sub",   "aot_ps_mul",
+      "aot_ps_muls0", "aot_ps_muls1", "aot_ps_madd",  "aot_ps_msub",  "aot_ps_nmadd",
+      "aot_ps_nmsub", "aot_ps_madds0", "aot_ps_madds1"};
+  static const std::unordered_set<std::string> psq_slow = {"aot_psq_l", "aot_psq_lu",
+                                                           "aot_psq_st", "aot_psq_stu"};
+  static const std::unordered_set<std::string> compare = {
+      "aot_fcmpu", "aot_fcmpo", "aot_ps_cmpu0", "aot_ps_cmpo0", "aot_ps_cmpu1", "aot_ps_cmpo1"};
+  static const std::unordered_set<std::string> none = {
+      "aot_rotl", "aot_rotation_mask", "aot_fpu_available", "aot_mtmsr_fast",
+      "aot_mfspr_special", "aot_mtspr_special", "aot_sc", "aot_twi", "aot_rfi", "aot_dcbz",
+      "aot_dcbz_l", "aot_dcbt", "aot_icbi", "aot_idle", "aot_sr_updated", "aot_mftb",
+      "aot_convert_to_double_fast", "aot_convert_to_single_fast", "aot_cmp_signed",
+      "aot_cmp_unsigned", "aot_cr_get_bit", "aot_cr_set_field", "aot_mfcr", "aot_mtcrf",
+      "aot_cr_logical", "aot_host_ptr_fm"};
+  if (value_slow.contains(name))
+    return bracketed_segment ? SbFpKind::None : SbFpKind::Call;
+  if (psq_slow.contains(name))
+    return bracketed_segment ? SbFpKind::None : SbFpKind::Full;
+  if (call.contains(name))
+    return SbFpKind::Call;
+  if (compare.contains(name))
+    return SbFpKind::Compare;
+  if (name == "aot_mtfsf")
+    return SbFpKind::Mtfsf;
+  if (name == "aot_mtfsfi" || name == "aot_mcrfs")
+    return SbFpKind::Fpscr;
+  if (none.contains(name) || EndsWith(name, "_fm") ||
+      (EndsWith(name, "_v") && !name.starts_with("aot_psq")) || name == "aot_psq_l_try_v" ||
+      name == "aot_psq_st_try_v")
+    return SbFpKind::None;
+  return SbFpKind::Full;
+}
+
+// "(s,1,2,3)" at seg[paren] -> {1,2,3}; false if any argument is not a plain
+// decimal literal.
+bool ParseIntArgs(const std::string& seg, size_t paren, std::vector<u32>* args)
+{
+  if (!StartsWith(seg, paren, "(s,"))
+    return false;
+  size_t i = paren + 3;
+  while (true)
+  {
+    if (i >= seg.size() || !std::isdigit(static_cast<unsigned char>(seg[i])))
+      return false;
+    u32 v = 0;
+    while (i < seg.size() && std::isdigit(static_cast<unsigned char>(seg[i])))
+      v = v * 10 + u32(seg[i++] - '0');
+    args->push_back(v);
+    if (i < seg.size() && seg[i] == ',')
+    {
+      i++;
+      continue;
+    }
+    return i < seg.size() && seg[i] == ')';
+  }
+}
+
+// "@FPWB{F,11,0,8}" / "@FPRL{F,11}" register-list markers left by EmitFpFast /
+// EmitPsqFast for SbFinishSegment; `pos` points at '{'. Returns the index past
+// '}' (npos when malformed).
+size_t ParseFpMarker(const std::string& s, size_t pos, std::bitset<32>* regs, bool* fpscr)
+{
+  const size_t close = s.find('}', pos);
+  if (close == std::string::npos)
+    return std::string::npos;
+  size_t i = pos + 1;
+  while (i < close)
+  {
+    if (s[i] == 'F')
+    {
+      *fpscr = true;
+      i++;
+    }
+    else if (std::isdigit(static_cast<unsigned char>(s[i])))
+    {
+      u32 v = 0;
+      while (i < close && std::isdigit(static_cast<unsigned char>(s[i])))
+        v = v * 10 + u32(s[i++] - '0');
+      if (v >= 32)
+        return std::string::npos;
+      (*regs)[v] = true;
+    }
+    else
+    {
+      return std::string::npos;
+    }
+    if (i < close && s[i] == ',')
+      i++;
+  }
+  return close + 1;
+}
+
+std::string StripFpMarkers(const std::string& seg)
+{
+  std::string out;
+  out.reserve(seg.size());
+  for (size_t i = 0; i < seg.size();)
+  {
+    if (StartsWith(seg, i, "@FPWB{") || StartsWith(seg, i, "@FPRL{"))
+    {
+      const size_t close = seg.find('}', i);
+      i = close == std::string::npos ? seg.size() : close + 1;
+      continue;
+    }
+    out += seg[i++];
+  }
+  return out;
+}
+
 bool IsIdentChar(char c)
 {
   return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
@@ -232,9 +424,13 @@ void AOTCEmitter::SbFinishSegment(std::string& out, size_t start)
     return;
   const std::string seg = out.substr(start);
 
-  // Classify the helpers this instruction calls.
+  // Classify the helpers this instruction calls, in both dimensions.
   SbHelperKind kind = SbHelperKind::Safe;
-  const bool psq_protocol_segment = seg.find("_try(s,&aot_fm,") != std::string::npos;
+  const bool psq_protocol_segment = seg.find("_try_v(s,&aot_fm,") != std::string::npos;
+  const bool fp_bracketed = seg.find("@FPWB{") != std::string::npos;
+  bool fp_full = false;
+  std::bitset<32> fp_wb_regs, fp_rl_regs;
+  bool fp_wb_fpscr = false, fp_rl_fpscr = false;
   for (size_t pos = seg.find("aot_"); pos != std::string::npos; pos = seg.find("aot_", pos + 1))
   {
     if (pos > 0 && IsIdentChar(seg[pos - 1]))
@@ -245,6 +441,50 @@ void AOTCEmitter::SbFinishSegment(std::string& out, size_t start)
     if (end >= seg.size() || seg[end] != '(')
       continue;  // aot_fm, aot_fast_mem, aot_single_block_mode, ...
     const std::string name = seg.substr(pos, end - pos);
+
+    const SbFpKind fk = ClassifyFpHelper(name, fp_bracketed);
+    if (fk == SbFpKind::Full)
+    {
+      fp_full = true;
+    }
+    else if (fk != SbFpKind::None)
+    {
+      std::vector<u32> args;
+      const bool ok = ParseIntArgs(seg, end, &args);
+      const auto reg_ok = [&](size_t i) { return i < args.size() && args[i] < 32; };
+      if (fk == SbFpKind::Call && ok && args.size() >= 2)
+      {
+        for (size_t i = 0; i < args.size(); i++)
+        {
+          if (!reg_ok(i))
+            fp_full = true;
+          else
+            fp_wb_regs[args[i]] = true;
+        }
+        if (reg_ok(0))
+          fp_rl_regs[args[0]] = true;
+        fp_wb_fpscr = fp_rl_fpscr = true;
+      }
+      else if (fk == SbFpKind::Compare && ok && args.size() == 3 && reg_ok(1) && reg_ok(2))
+      {
+        fp_wb_regs[args[1]] = fp_wb_regs[args[2]] = true;
+        fp_wb_fpscr = fp_rl_fpscr = true;
+      }
+      else if (fk == SbFpKind::Mtfsf && ok && args.size() == 2 && reg_ok(1))
+      {
+        fp_wb_regs[args[1]] = true;
+        fp_wb_fpscr = fp_rl_fpscr = true;
+      }
+      else if (fk == SbFpKind::Fpscr)
+      {
+        fp_wb_fpscr = fp_rl_fpscr = true;
+      }
+      else
+      {
+        fp_full = true;
+      }
+    }
+
     if (name == "aot_cmp_signed" || name == "aot_cmp_unsigned" || name == "aot_cr_get_bit" ||
         name == "aot_cr_set_field")
       continue;  // rewritten to value forms below
@@ -259,6 +499,35 @@ void AOTCEmitter::SbFinishSegment(std::string& out, size_t start)
     if (!std::isdigit(static_cast<unsigned char>(seg[pos + 7])))
       kind = SbHelperKind::Barrier;
   }
+  // Literal FP references; anything not of the form s->ps[N].ps0|1 forces the
+  // full FP barrier.
+  std::bitset<32> fp_lit_regs;
+  bool fp_lit_fpscr = false;
+  for (size_t pos = seg.find("s->ps["); pos != std::string::npos; pos = seg.find("s->ps[", pos + 1))
+  {
+    size_t e = pos + 6;
+    u32 n = 0;
+    while (e < seg.size() && std::isdigit(static_cast<unsigned char>(seg[e])))
+      n = n * 10 + u32(seg[e++] - '0');
+    if (e == pos + 6 || n >= 32 || !(StartsWith(seg, e, "].ps0") || StartsWith(seg, e, "].ps1")) ||
+        (e + 5 < seg.size() && IsIdentChar(seg[e + 5])))
+      fp_full = true;
+    else
+      fp_lit_regs[n] = true;
+  }
+  for (size_t pos = seg.find("s->fpscr"); pos != std::string::npos;
+       pos = seg.find("s->fpscr", pos + 1))
+  {
+    if (pos + 8 < seg.size() && IsIdentChar(seg[pos + 8]))
+      fp_full = true;
+    else
+      fp_lit_fpscr = true;
+  }
+  const bool fp_call = fp_wb_regs.any() || fp_wb_fpscr || fp_rl_regs.any() || fp_rl_fpscr;
+  // A whole-FP-state helper, or a memory-form FP call mixed with FP text in one
+  // instruction: keep everything in memory form.
+  if (fp_full || (fp_call && (fp_lit_regs.any() || fp_lit_fpscr)))
+    kind = SbHelperKind::Barrier;
 
   std::string prefix;
   if (seg.find("&aot_fm") != std::string::npos && !m_sb_fm_used)
@@ -270,15 +539,26 @@ void AOTCEmitter::SbFinishSegment(std::string& out, size_t start)
   // Barrier form: the text keeps addressing AOTState memory. Make memory
   // current, run it, then refresh every local named so far.
   const auto emit_barrier = [&] {
-    const std::string wb = SbWriteBack();
+    std::bitset<32> all;
+    all.set();
+    const std::bitset<32> fwb = fp_full ? all : (fp_wb_regs | fp_lit_regs);
+    const std::bitset<32> frl = fp_full ? all : (fp_rl_regs | fp_lit_regs);
+    const bool fwb_fpscr = fp_full || fp_wb_fpscr || fp_lit_fpscr;
+    const bool frl_fpscr = fp_full || fp_rl_fpscr || fp_lit_fpscr;
+    const std::string wb = SbGprWriteBack() + SbFpWriteBack(fwb, fwb_fpscr);
     m_sb_gpr_dirty.reset();
     m_sb_cr_dirty.reset();
     m_sb_lr_dirty = m_sb_ctr_dirty = false;
-    const std::string rl = SbReloadUsed();
+    for (u32 n = 0; n < 32; n++)
+      if (fwb[n])
+        m_sb_fp_dirty[2 * n] = m_sb_fp_dirty[2 * n + 1] = false;
+    if (fwb_fpscr)
+      m_sb_fpscr_dirty = false;
+    const std::string rl = SbGprReloadUsed() + SbFpReload(frl, frl_fpscr);
     out.resize(start);
     if (!prefix.empty() || !wb.empty())
       out += "    " + prefix + wb + "\n";
-    out += seg;
+    out += fp_bracketed ? StripFpMarkers(seg) : seg;
     if (!rl.empty())
       out += "    " + rl + "\n";
   };
@@ -293,7 +573,8 @@ void AOTCEmitter::SbFinishSegment(std::string& out, size_t start)
   r.reserve(seg.size() + 64);
   std::bitset<32> gpr_ref;
   std::bitset<8> cr_ref;
-  bool lr_ref = false, ctr_ref = false;
+  std::bitset<64> fp_ref;
+  bool lr_ref = false, ctr_ref = false, fpscr_ref = false;
   auto read_num = [&](size_t pos, size_t* end) {
     u32 v = 0;
     size_t e = pos;
@@ -311,6 +592,58 @@ void AOTCEmitter::SbFinishSegment(std::string& out, size_t start)
       r += fmt::format("_g{}", n);
       gpr_ref[n] = true;
       i = e + 1;  // skip ']'
+    }
+    else if (StartsWith(seg, i, "s->ps["))
+    {
+      // validated above: s->ps[N].ps0|1
+      const u32 n = read_num(i + 6, &e);
+      const u32 h = u32(seg[e + 4] - '0');
+      r += fmt::format("_f{}{}", n, h);
+      fp_ref[2 * n + h] = true;
+      i = e + 5;
+    }
+    else if (StartsWith(seg, i, "s->fpscr"))
+    {
+      r += "_fpscr";
+      fpscr_ref = true;
+      i += 8;
+    }
+    else if (StartsWith(seg, i, "@FPWB{") || StartsWith(seg, i, "@FPRL{"))
+    {
+      // Cold fallback of a value form / psq try: write back the listed
+      // registers' dirty halves (and FPSCR) before the exact helper; reload
+      // the destination (and FPSCR) after it. Dirty state here is the state
+      // before this instruction (the fast path's own definitions are on the
+      // other branch).
+      const bool wb = seg[i + 3] == 'W';
+      std::bitset<32> regs;
+      bool f = false;
+      const size_t next = ParseFpMarker(seg, i + 5, &regs, &f);
+      if (next == std::string::npos)
+      {
+        r += seg[i++];  // leaks into C: compile error, never silent
+        continue;
+      }
+      if (wb)
+      {
+        r += SbFpWriteBack(regs, f);
+      }
+      else
+      {
+        for (u32 n = 0; n < 32; n++)
+        {
+          if (!regs[n])
+            continue;
+          r += fmt::format("_f{0}0=s->ps[{0}].ps0; _f{0}1=s->ps[{0}].ps1; ", n);
+          fp_ref[2 * n] = fp_ref[2 * n + 1] = true;
+        }
+        if (f)
+        {
+          r += "_fpscr=s->fpscr; ";
+          fpscr_ref = true;
+        }
+      }
+      i = next;
     }
     else if (StartsWith(seg, i, "s->spr[8]"))
     {
@@ -360,10 +693,12 @@ void AOTCEmitter::SbFinishSegment(std::string& out, size_t start)
     }
   }
 
-  // Definitions: a local followed by an assignment / ++ / -- operator.
+  // Definitions: a local followed by an assignment / ++ / -- operator, or (FP)
+  // passed by address to a value form: `(&_fN0` / `,&_fpscr`.
   std::bitset<32> gpr_def;
   std::bitset<8> cr_def;
-  bool lr_def = false, ctr_def = false;
+  std::bitset<64> fp_def;
+  bool lr_def = false, ctr_def = false, fpscr_def = false;
   size_t first_def_pos = std::string::npos;
   for (size_t i = 0; i < r.size(); i++)
   {
@@ -373,7 +708,7 @@ void AOTCEmitter::SbFinishSegment(std::string& out, size_t start)
     while (e < r.size() && IsIdentChar(r[e]))
       e++;
     const std::string tok = r.substr(i, e - i);
-    int which = -1;  // 0 gpr, 1 cr, 2 lr, 3 ctr
+    int which = -1;  // 0 gpr, 1 cr, 2 lr, 3 ctr, 4 fp half, 5 fpscr
     u32 n = 0;
     if (tok.size() >= 3 && tok[1] == 'g' && std::isdigit(static_cast<unsigned char>(tok[2])))
     {
@@ -389,13 +724,29 @@ void AOTCEmitter::SbFinishSegment(std::string& out, size_t start)
       which = 2;
     else if (tok == "_ctr")
       which = 3;
+    else if ((tok.size() == 4 || tok.size() == 5) && tok[1] == 'f' &&
+             std::all_of(tok.begin() + 2, tok.end(),
+                         [](char c) { return std::isdigit(static_cast<unsigned char>(c)); }))
+    {
+      const u32 reg = u32(std::stoul(tok.substr(2, tok.size() - 3)));
+      const u32 half = u32(tok.back() - '0');
+      if (reg < 32 && half < 2)
+      {
+        which = 4;
+        n = 2 * reg + half;
+      }
+    }
+    else if (tok == "_fpscr")
+      which = 5;
     if (which < 0)
       continue;
     size_t k = e;
     while (k < r.size() && r[k] == ' ')
       k++;
     bool def = false;
-    if (k < r.size())
+    if (which >= 4 && i >= 2 && r[i - 1] == '&' && (r[i - 2] == '(' || r[i - 2] == ','))
+      def = true;
+    else if (k < r.size())
     {
       if (r[k] == '=' && (k + 1 >= r.size() || r[k + 1] != '='))
         def = true;
@@ -406,7 +757,7 @@ void AOTCEmitter::SbFinishSegment(std::string& out, size_t start)
     }
     if (!def)
       continue;
-    if (first_def_pos == std::string::npos)
+    if (first_def_pos == std::string::npos && which < 4)
       first_def_pos = i;
     if (which == 0)
       gpr_def[n] = true;
@@ -414,8 +765,12 @@ void AOTCEmitter::SbFinishSegment(std::string& out, size_t start)
       cr_def[n] = true;
     else if (which == 2)
       lr_def = true;
-    else
+    else if (which == 3)
       ctr_def = true;
+    else if (which == 4)
+      fp_def[n] = true;
+    else
+      fpscr_def = true;
   }
 
   // A register-reading helper with a local definition in the same
@@ -450,19 +805,47 @@ void AOTCEmitter::SbFinishSegment(std::string& out, size_t start)
     prefix += "_ctr=s->spr[9]; ";
     m_sb_ctr_used = true;
   }
+  for (u32 i = 0; i < 64; i++)
+    if (fp_ref[i] && !m_sb_fp_used[i])
+    {
+      prefix += fmt::format("_f{0}{1}=s->ps[{0}].ps{1}; ", i / 2, i % 2);
+      m_sb_fp_used[i] = true;
+    }
+  if (fpscr_ref && !m_sb_fpscr_used)
+  {
+    prefix += "_fpscr=s->fpscr; ";
+    m_sb_fpscr_used = true;
+  }
 
   if (kind == SbHelperKind::ReadsRegs)
   {
-    prefix += SbWriteBack();
+    prefix += SbGprWriteBack();
     m_sb_gpr_dirty.reset();
     m_sb_cr_dirty.reset();
     m_sb_lr_dirty = m_sb_ctr_dirty = false;
+  }
+
+  // Memory-form FP helper (this segment names no FP local; see above): its
+  // sources (+ a dirty destination, which an enabled exception may leave
+  // unwritten) and FPSCR go to memory first, its results come back after.
+  std::string fp_reload;
+  if (fp_call)
+  {
+    prefix += SbFpWriteBack(fp_wb_regs, fp_wb_fpscr);
+    for (u32 n = 0; n < 32; n++)
+      if (fp_wb_regs[n])
+        m_sb_fp_dirty[2 * n] = m_sb_fp_dirty[2 * n + 1] = false;
+    if (fp_wb_fpscr)
+      m_sb_fpscr_dirty = false;
+    fp_reload = SbFpReload(fp_rl_regs, fp_rl_fpscr);
   }
 
   m_sb_gpr_dirty |= gpr_def;
   m_sb_cr_dirty |= cr_def;
   m_sb_lr_dirty |= lr_def;
   m_sb_ctr_dirty |= ctr_def;
+  m_sb_fp_dirty |= fp_def;
+  m_sb_fpscr_dirty |= fpscr_def;
 
   // Every exit writes back the locals defined so far.
   const std::string wb = SbWriteBack();
@@ -520,6 +903,8 @@ void AOTCEmitter::SbFinishSegment(std::string& out, size_t start)
   if (!prefix.empty())
     out += "    " + prefix + "\n";
   out += body;
+  if (!fp_reload.empty())
+    out += "    " + fp_reload + "\n";
 }
 
 std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bool from_trace,
@@ -590,6 +975,14 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
         cdecl += fmt::format("{}_c{}", cdecl.empty() ? "    uint64_t " : ",", f);
     if (!cdecl.empty())
       decl += cdecl + ";\n";
+    std::string fdecl;
+    for (u32 i = 0; i < 64; i++)
+      if (m_sb_fp_used[i])
+        fdecl += fmt::format("{}_f{}{}", fdecl.empty() ? "    uint64_t " : ",", i / 2, i % 2);
+    if (!fdecl.empty())
+      decl += fdecl + ";\n";
+    if (m_sb_fpscr_used)
+      decl += "    uint32_t _fpscr;\n";
     if (m_sb_fm_used)
       decl += "    AotFastMem aot_fm;\n";
     out.insert(out.find('\n') + 1, decl);
@@ -1898,15 +2291,22 @@ void AOTCEmitter::EmitPsqFast(std::string& out, UGeckoInstruction inst, bool sto
     // update forms, writes gpr[ra] there) sees memory, so write the base back
     // and reload it on that cold path alone. AOT_GPR_MEM is the spelling the
     // superblock rewriter leaves as a real AOTState access.
-    const char* tryfn = store ? "aot_psq_st_try" : "aot_psq_l_try";
+    // FP side (fp1): the try takes the FP register as values / destination
+    // pointers (C locals after the post-pass); the fallback writes the
+    // register's dirty halves back first (psq_st reads them; a psq_l whose
+    // access faults leaves fd unwritten) and psq_l(u) reloads fd after.
+    const std::string fpreg = store ? fmt::format("s->ps[{0}].ps0,s->ps[{0}].ps1", rd) :
+                                      fmt::format("&s->ps[{0}].ps0,&s->ps[{0}].ps1", rd);
+    const char* tryfn = store ? "aot_psq_st_try_v" : "aot_psq_l_try_v";
     const char* slow = store ? (update ? "stu" : "st") : (update ? "lu" : "l");
     const std::string wb = ra ? fmt::format("AOT_GPR_MEM(s,{0})=s->gpr[{0}]; ", ra) : "";
-    out += fmt::format("    {{ uint32_t _ea={}; if({}(s,&aot_fm,{},_ea,{},{})) {{ {}}} else {{ {}"
-                       "aot_psq_{}(s,{},{},{}u); {}}} }}\n",
-                       ea, tryfn, rd, I(inst.I), I(inst.W),
-                       update ? fmt::format("s->gpr[{}]=_ea; ", ra) : "", wb, slow, rd, ra,
+    out += fmt::format("    {{ uint32_t _ea={}; if({}(s,&aot_fm,{},_ea,{},{})) {{ {}}} else {{ "
+                       "@FPWB{{{}}} {}aot_psq_{}(s,{},{},{}u); {}{}}} }}\n",
+                       ea, tryfn, fpreg, I(inst.I), I(inst.W),
+                       update ? fmt::format("s->gpr[{}]=_ea; ", ra) : "", rd, wb, slow, rd, ra,
                        inst.hex,
-                       update ? fmt::format("s->gpr[{0}]=AOT_GPR_MEM(s,{0}); ", ra) : "");
+                       update ? fmt::format("s->gpr[{0}]=AOT_GPR_MEM(s,{0}); ", ra) : "",
+                       store ? "" : fmt::format("@FPRL{{{}}} ", rd));
     return;
   }
   out += fmt::format("    aot_psq_{}_fast(s,&aot_fm,{},{},{},{},{},{}u);\n",
@@ -2125,6 +2525,78 @@ void AOTCEmitter::EmitMcrf(std::string& out, UGeckoInstruction inst)
   out += fmt::format("    s->cr_fields[{}]=s->cr_fields[{}];\n", I(inst.CRFD), I(inst.CRFS));
 }
 
+// Single-precision arithmetic with an inline fast path (see EmitFpFast in the
+// header). Superblock form:
+//   if(!aot_ps_madds0_v(&s->fpscr,&s->ps[11].ps0,&s->ps[11].ps1,s->ps[0].ps0,...)){
+//     @FPWB{F,11,0,8,6} aot_ps_madds0(s,11,0,8,6); @FPRL{F,11} }
+// SbFinishSegment turns the s->ps / s->fpscr references into locals and the
+// markers into the cold path's write-back of the dirty operand halves (+FPSCR)
+// and the reload of fd (+FPSCR); only that cold path touches AOTState.
+void AOTCEmitter::EmitFpFast(std::string& out, const char* op, u32 fd,
+                             std::initializer_list<std::pair<u32, int>> srcs,
+                             const std::string& args)
+{
+  if (!m_superblocks)
+  {
+    out += fmt::format("    aot_{}_fast(s,{});\n", op, args);
+    return;
+  }
+  std::string v = fmt::format("&s->fpscr,&s->ps[{0}].ps0,&s->ps[{0}].ps1", fd);
+  std::string regs = fmt::format("F,{}", fd);
+  std::bitset<32> listed;
+  listed[fd] = true;
+  for (const auto& [reg, half] : srcs)
+  {
+    v += fmt::format(",s->ps[{}].ps{}", reg, half);
+    if (!listed[reg])
+    {
+      listed[reg] = true;
+      regs += fmt::format(",{}", reg);
+    }
+  }
+  out += fmt::format("    if(!aot_{0}_v({1})){{ @FPWB{{{2}}} aot_{0}(s,{3}); @FPRL{{F,{4}}} }}\n", op,
+                     v, regs, args, fd);
+}
+
+// ps_mr/neg/abs/nabs and ps_merge00/01/10/11 (Interpreter_PairedUtils.h PS_Mr
+// ... PS_Merge11): bit moves that touch neither FPSCR nor CR (the emitter never
+// passes Rc). Both halves are read before fd is written (fd may alias).
+void AOTCEmitter::EmitPsMove(std::string& out, const char* op, u32 fd, u32 fa, u32 fb)
+{
+  const std::string name = op;
+  const bool merge = name.starts_with("merge");
+  if (!m_superblocks)
+  {
+    if (merge)
+      out += fmt::format("    aot_ps_{}(s,{},{},{});\n", op, fd, fa, fb);
+    else
+      out += fmt::format("    aot_ps_{}(s,{},{});\n", op, fd, fb);
+    return;
+  }
+  std::string h0, h1;
+  if (name == "mr")
+  {
+    if (fd == fb)
+      return;
+    h0 = fmt::format("s->ps[{}].ps0", fb);
+    h1 = fmt::format("s->ps[{}].ps1", fb);
+  }
+  else if (name == "neg" || name == "abs" || name == "nabs")
+  {
+    const char* bit = name == "neg" ? "^(1ULL<<63)" : name == "abs" ? "&~(1ULL<<63)" : "|(1ULL<<63)";
+    h0 = fmt::format("s->ps[{}].ps0{}", fb, bit);
+    h1 = fmt::format("s->ps[{}].ps1{}", fb, bit);
+  }
+  else
+  {
+    // merge<x><y>: ps0 = a.ps<x>, ps1 = b.ps<y>
+    h0 = fmt::format("s->ps[{}].ps{}", fa, name[5]);
+    h1 = fmt::format("s->ps[{}].ps{}", fb, name[6]);
+  }
+  out += fmt::format("    {{ uint64_t _m0={0},_m1={1}; s->ps[{2}].ps0=_m0; s->ps[{2}].ps1=_m1; }}\n", h0,
+                     h1, fd);
+}
+
 // ============================================================================
 // FP instructions — runtime helpers for correctness. fadds/fsubs/fmuls and the
 // fmadds/fmsubs/fnmadds/fnmsubs family use the static inline *_fast paths in
@@ -2141,14 +2613,14 @@ bool AOTCEmitter::EmitTable59(std::string& out, UGeckoInstruction inst, u32 pc)
   switch (I(inst.SUBOP5))
   {
   case 18: out += fmt::format("    aot_fdivsx(s,{},{},{});\n", fd, fa, fb); return true;
-  case 20: out += fmt::format("    aot_fsubsx_fast(s,{},{},{});\n", fd, fa, fb); return true;
-  case 21: out += fmt::format("    aot_faddsx_fast(s,{},{},{});\n", fd, fa, fb); return true;
+  case 20: EmitFpFast(out, "fsubsx", fd, {{fa, 0}, {fb, 0}}, fmt::format("{},{},{}", fd, fa, fb)); return true;
+  case 21: EmitFpFast(out, "faddsx", fd, {{fa, 0}, {fb, 0}}, fmt::format("{},{},{}", fd, fa, fb)); return true;
   case 24: out += fmt::format("    aot_fresx(s,{},{});\n", fd, fb); return true;
-  case 25: out += fmt::format("    aot_fmulsx_fast(s,{},{},{});\n", fd, fa, fc); return true;
-  case 28: out += fmt::format("    aot_fmsubsx_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 29: out += fmt::format("    aot_fmaddsx_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 30: out += fmt::format("    aot_fnmsubsx_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 31: out += fmt::format("    aot_fnmaddsx_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 25: EmitFpFast(out, "fmulsx", fd, {{fa, 0}, {fc, 0}}, fmt::format("{},{},{}", fd, fa, fc)); return true;
+  case 28: EmitFpFast(out, "fmsubsx", fd, {{fa, 0}, {fc, 0}, {fb, 0}}, fmt::format("{},{},{},{}", fd, fa, fc, fb)); return true;
+  case 29: EmitFpFast(out, "fmaddsx", fd, {{fa, 0}, {fc, 0}, {fb, 0}}, fmt::format("{},{},{},{}", fd, fa, fc, fb)); return true;
+  case 30: EmitFpFast(out, "fnmsubsx", fd, {{fa, 0}, {fc, 0}, {fb, 0}}, fmt::format("{},{},{},{}", fd, fa, fc, fb)); return true;
+  case 31: EmitFpFast(out, "fnmaddsx", fd, {{fa, 0}, {fc, 0}, {fb, 0}}, fmt::format("{},{},{},{}", fd, fa, fc, fb)); return true;
   default: return false;
   }
 }
@@ -2255,35 +2727,35 @@ bool AOTCEmitter::EmitTable4(std::string& out, UGeckoInstruction inst, u32 pc)
   {
   case 10: out += fmt::format("    aot_ps_sum0(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 11: out += fmt::format("    aot_ps_sum1(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 12: out += fmt::format("    aot_ps_muls0_fast(s,{},{},{});\n", fd, fa, fc); return true;
-  case 13: out += fmt::format("    aot_ps_muls1_fast(s,{},{},{});\n", fd, fa, fc); return true;
-  case 14: out += fmt::format("    aot_ps_madds0_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 15: out += fmt::format("    aot_ps_madds1_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 12: EmitFpFast(out, "ps_muls0", fd, {{fa, 0}, {fa, 1}, {fc, 0}}, fmt::format("{},{},{}", fd, fa, fc)); return true;
+  case 13: EmitFpFast(out, "ps_muls1", fd, {{fa, 0}, {fa, 1}, {fc, 1}}, fmt::format("{},{},{}", fd, fa, fc)); return true;
+  case 14: EmitFpFast(out, "ps_madds0", fd, {{fa, 0}, {fa, 1}, {fc, 0}, {fb, 0}, {fb, 1}}, fmt::format("{},{},{},{}", fd, fa, fc, fb)); return true;
+  case 15: EmitFpFast(out, "ps_madds1", fd, {{fa, 0}, {fa, 1}, {fc, 1}, {fb, 0}, {fb, 1}}, fmt::format("{},{},{},{}", fd, fa, fc, fb)); return true;
   case 18: out += fmt::format("    aot_ps_div(s,{},{},{});\n", fd, fa, fb); return true;
-  case 20: out += fmt::format("    aot_ps_sub_fast(s,{},{},{});\n", fd, fa, fb); return true;
-  case 21: out += fmt::format("    aot_ps_add_fast(s,{},{},{});\n", fd, fa, fb); return true;
+  case 20: EmitFpFast(out, "ps_sub", fd, {{fa, 0}, {fa, 1}, {fb, 0}, {fb, 1}}, fmt::format("{},{},{}", fd, fa, fb)); return true;
+  case 21: EmitFpFast(out, "ps_add", fd, {{fa, 0}, {fa, 1}, {fb, 0}, {fb, 1}}, fmt::format("{},{},{}", fd, fa, fb)); return true;
   case 23: out += fmt::format("    aot_ps_sel(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
   case 24: out += fmt::format("    aot_ps_res(s,{},{});\n", fd, fb); return true;
-  case 25: out += fmt::format("    aot_ps_mul_fast(s,{},{},{});\n", fd, fa, fc); return true;
+  case 25: EmitFpFast(out, "ps_mul", fd, {{fa, 0}, {fa, 1}, {fc, 0}, {fc, 1}}, fmt::format("{},{},{}", fd, fa, fc)); return true;
   case 26: out += fmt::format("    aot_ps_rsqrte(s,{},{});\n", fd, fb); return true;
-  case 28: out += fmt::format("    aot_ps_msub_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 29: out += fmt::format("    aot_ps_madd_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 30: out += fmt::format("    aot_ps_nmsub_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
-  case 31: out += fmt::format("    aot_ps_nmadd_fast(s,{},{},{},{});\n", fd, fa, fc, fb); return true;
+  case 28: EmitFpFast(out, "ps_msub", fd, {{fa, 0}, {fa, 1}, {fc, 0}, {fc, 1}, {fb, 0}, {fb, 1}}, fmt::format("{},{},{},{}", fd, fa, fc, fb)); return true;
+  case 29: EmitFpFast(out, "ps_madd", fd, {{fa, 0}, {fa, 1}, {fc, 0}, {fc, 1}, {fb, 0}, {fb, 1}}, fmt::format("{},{},{},{}", fd, fa, fc, fb)); return true;
+  case 30: EmitFpFast(out, "ps_nmsub", fd, {{fa, 0}, {fa, 1}, {fc, 0}, {fc, 1}, {fb, 0}, {fb, 1}}, fmt::format("{},{},{},{}", fd, fa, fc, fb)); return true;
+  case 31: EmitFpFast(out, "ps_nmadd", fd, {{fa, 0}, {fa, 1}, {fc, 0}, {fc, 1}, {fb, 0}, {fb, 1}}, fmt::format("{},{},{},{}", fd, fa, fc, fb)); return true;
   default: break;
   }
 
   // PS misc (SUBOP10 again for moves/compares/merges)
   switch (I(inst.SUBOP10))
   {
-  case 40:  out += fmt::format("    aot_ps_neg(s,{},{});\n", fd, fb); return true;
-  case 72:  out += fmt::format("    aot_ps_mr(s,{},{});\n", fd, fb); return true;
-  case 136: out += fmt::format("    aot_ps_nabs(s,{},{});\n", fd, fb); return true;
-  case 264: out += fmt::format("    aot_ps_abs(s,{},{});\n", fd, fb); return true;
-  case 528: out += fmt::format("    aot_ps_merge00(s,{},{},{});\n", fd, fa, fb); return true;
-  case 560: out += fmt::format("    aot_ps_merge01(s,{},{},{});\n", fd, fa, fb); return true;
-  case 592: out += fmt::format("    aot_ps_merge10(s,{},{},{});\n", fd, fa, fb); return true;
-  case 624: out += fmt::format("    aot_ps_merge11(s,{},{},{});\n", fd, fa, fb); return true;
+  case 40:  EmitPsMove(out, "neg", fd, fa, fb); return true;
+  case 72:  EmitPsMove(out, "mr", fd, fa, fb); return true;
+  case 136: EmitPsMove(out, "nabs", fd, fa, fb); return true;
+  case 264: EmitPsMove(out, "abs", fd, fa, fb); return true;
+  case 528: EmitPsMove(out, "merge00", fd, fa, fb); return true;
+  case 560: EmitPsMove(out, "merge01", fd, fa, fb); return true;
+  case 592: EmitPsMove(out, "merge10", fd, fa, fb); return true;
+  case 624: EmitPsMove(out, "merge11", fd, fa, fb); return true;
   case 0:   out += fmt::format("    aot_ps_cmpu0(s,{},{},{});\n", I(inst.CRFD), fa, fb); return true;
   case 32:  out += fmt::format("    aot_ps_cmpo0(s,{},{},{});\n", I(inst.CRFD), fa, fb); return true;
   case 64:  out += fmt::format("    aot_ps_cmpu1(s,{},{},{});\n", I(inst.CRFD), fa, fb); return true;
