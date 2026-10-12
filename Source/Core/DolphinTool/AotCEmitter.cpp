@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <unordered_set>
 #include <vector>
 
@@ -141,6 +142,42 @@ void AOTCEmitter::SbReset()
   m_sb_fp_dirty.reset();
   m_sb_fpscr_used = m_sb_fpscr_dirty = false;
   m_sb_fm_used = false;
+}
+
+AOTCEmitter::SbSets AOTCEmitter::SbSave() const
+{
+  SbSets s;
+  s.gpr_used = m_sb_gpr_used;
+  s.gpr_dirty = m_sb_gpr_dirty;
+  s.cr_used = m_sb_cr_used;
+  s.cr_dirty = m_sb_cr_dirty;
+  s.lr_used = m_sb_lr_used;
+  s.lr_dirty = m_sb_lr_dirty;
+  s.ctr_used = m_sb_ctr_used;
+  s.ctr_dirty = m_sb_ctr_dirty;
+  s.fp_used = m_sb_fp_used;
+  s.fp_dirty = m_sb_fp_dirty;
+  s.fpscr_used = m_sb_fpscr_used;
+  s.fpscr_dirty = m_sb_fpscr_dirty;
+  s.fm_used = m_sb_fm_used;
+  return s;
+}
+
+void AOTCEmitter::SbSeed(const SbSets& s)
+{
+  m_sb_gpr_used |= s.gpr_used;
+  m_sb_gpr_dirty |= s.gpr_dirty;
+  m_sb_cr_used |= s.cr_used;
+  m_sb_cr_dirty |= s.cr_dirty;
+  m_sb_lr_used |= s.lr_used;
+  m_sb_lr_dirty |= s.lr_dirty;
+  m_sb_ctr_used |= s.ctr_used;
+  m_sb_ctr_dirty |= s.ctr_dirty;
+  m_sb_fp_used |= s.fp_used;
+  m_sb_fp_dirty |= s.fp_dirty;
+  m_sb_fpscr_used |= s.fpscr_used;
+  m_sb_fpscr_dirty |= s.fpscr_dirty;
+  m_sb_fm_used = s.fm_used;
 }
 
 std::string AOTCEmitter::SbGprWriteBack() const
@@ -940,6 +977,53 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
   m_idle_loop_start =
       (!m_module && !m_guarded_images && IsBusyWaitLoop(block_addr, num_instructions)) ?
           block_addr : 0;
+  // Self-loop (sl1): see AotCEmitter.h. Idle loops keep their aot_idle exit;
+  // runtime-swapped (volatile) heads and image variants keep the musttail.
+  m_self_loop_branch_pc =
+      (m_superblocks && !m_module && !m_guarded_images && own_symbol.empty() &&
+       m_idle_loop_start == 0 && m_known_blocks.contains(block_addr) &&
+       !m_volatile_targets.contains(block_addr)) ?
+          SelfLoopBranchPc(block_addr, num_instructions) :
+          0;
+  m_self_loop_addr = m_self_loop_branch_pc != 0 ? block_addr : 0;
+  if (m_self_loop_addr != 0)
+  {
+    // Pass 1: emit the body as usual into scratch; EmitBlockBody snapshots the
+    // used/dirty sets right after the loop block's instruction loop (= the
+    // dirty set at the back-edge, which is the last instruction's taken path)
+    // and stops. Pass 2 seeds them, so
+    //   - `used` suppresses every first-use load inside the loop body (the
+    //     preload below runs once, on entry);
+    //   - `dirty` makes every exit and cold bracket in the body write back the
+    //     loop-carried locals a previous iteration may have modified (a clean
+    //     local written back on iteration 1 is harmless: locals always hold
+    //     the architectural value).
+    // The body is straight-line, so pass 2's dirty set at the back-edge equals
+    // the seed: one pass reaches the fixpoint. Pass-2 text shape:
+    //   <decls>                       (inserted below, as for every function)
+    //   aot_fm=...; _gN=s->gpr[N]; ... _fN0=s->ps[N].ps0; ... _fpscr=s->fpscr;
+    //   _loop:;
+    //   if(!aot_fpu_available(s,X)) {...}   (re-tested every iteration)
+    //   <body: no first-use loads of the seeded locals>
+    //   s->downcount-=N; if(<edge stop test>){ <write-back> s->pc=X; return; }
+    //   goto _loop;
+    //   <fall-through trailer / chain-inlined bodies, as before>
+    const auto unhandled = m_unhandled_opcodes;
+    std::string scratch;
+    m_self_loop_pass1 = true;
+    EmitBlockBody(scratch, block_addr, num_instructions);
+    m_self_loop_pass1 = false;
+    m_unhandled_opcodes = unhandled;
+    m_inline_depth = 0;
+    m_inline_insts = num_instructions;
+    SbReset();
+    SbSeed(m_self_loop_sets);
+    std::string preload = m_sb_fm_used ? fmt::format("aot_fm={}; ", FastMemSource()) : "";
+    preload += SbGprReloadUsed() + SbFpReload(std::bitset<32>().set(), true);
+    if (!preload.empty())
+      out += "    " + preload + "\n";
+    out += "_loop:;\n";
+  }
   EmitBlockBody(out, block_addr, num_instructions);
   if (m_superblocks)
   {
@@ -995,6 +1079,32 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
   return out;
 }
 
+// Target of a b / bc with a static displacement (OPCD 18 / 16); nullopt for
+// anything else.
+static std::optional<u32> StaticBranchTarget(UGeckoInstruction inst, u32 pc)
+{
+  if (inst.OPCD == 18)
+    return inst.AA ? u32(SignExt26(inst.LI << 2)) : pc + u32(SignExt26(inst.LI << 2));
+  if (inst.OPCD == 16)
+    return inst.AA ? u32(SignExt16(s16(inst.BD << 2))) : pc + u32(SignExt16(s16(inst.BD << 2)));
+  return std::nullopt;
+}
+
+// pc of the block's last instruction when it is a b / bc (LK=0) back to the
+// block's own start, else 0.
+u32 AOTCEmitter::SelfLoopBranchPc(u32 block_addr, u32 num_instructions) const
+{
+  if (num_instructions == 0)
+    return 0;
+  const u32 pc = block_addr + (num_instructions - 1) * 4;
+  const auto word = m_memory.ReadInstruction(pc);
+  if (!word)
+    return 0;
+  const UGeckoInstruction inst(*word);
+  const std::optional<u32> target = StaticBranchTarget(inst, pc);
+  return (target && *target == block_addr && !inst.LK) ? pc : 0;
+}
+
 // Mirrors PPCAnalyzer::IsBusyWaitLoop: loops to itself with no other branch,
 // no CTR use, no stores, and only reads registers it wrote earlier in the loop
 // (or never writes registers it read). Register in/out sets follow
@@ -1018,19 +1128,10 @@ bool AOTCEmitter::IsBusyWaitLoop(u32 block_addr, u32 num_instructions) const
     {
       if (i != num_instructions - 1)
         return false;
-      u32 target;
-      if (inst.OPCD == 18)
-        target = inst.AA ? u32(SignExt26(inst.LI << 2)) : pc + u32(SignExt26(inst.LI << 2));
-      else if (inst.OPCD == 16)
-      {
-        if (!(inst.BO & BO_DONT_DECREMENT_FLAG))
-          return false;  // uses CTR
-        target = inst.AA ? u32(SignExt16(s16(inst.BD << 2))) :
-                           pc + u32(SignExt16(s16(inst.BD << 2)));
-      }
-      else
-        return false;
-      return target == block_addr && !inst.LK;
+      if (inst.OPCD == 16 && !(inst.BO & BO_DONT_DECREMENT_FLAG))
+        return false;  // uses CTR
+      const std::optional<u32> target = StaticBranchTarget(inst, pc);
+      return target && *target == block_addr && !inst.LK;
     }
     if (info->type != OpType::Integer && info->type != OpType::Load)
       return false;
@@ -1152,6 +1253,14 @@ void AOTCEmitter::EmitBlockBody(std::string& out, u32 block_addr, u32 num_instru
   }
   m_cur_imm = nullptr;
   m_cur_branch = nullptr;
+
+  // Self-loop pass 1 (see TranslateBlock): the sets over the loop block only;
+  // the rest of this pass's text is discarded.
+  if (m_self_loop_pass1 && m_inline_depth == 0)
+  {
+    m_self_loop_sets = SbSave();
+    return;
+  }
 
   // Always emit a fallthrough exit at the end of every block.
   // Branch instructions that are taken will `return` before reaching this.
@@ -2084,7 +2193,18 @@ void AOTCEmitter::EmitBranchTo(std::string& out, u32 target, u32 current_pc,
     out += fmt::format("    s->downcount-={};\n", m_block_cycle_count);
     out += fmt::format("    if(s->downcount<=0||(s->exceptions&0xFFFFFEFAu) AOT_EDGE_STOP){{ s->pc={}; return; }}\n",
                        pc_expr);
-    out += fmt::format("    [[clang::musttail]] return {}(s);\n", BlockFn(target, dol_target));
+    if (m_inline_depth == 0 && m_self_loop_addr != 0 && target == m_self_loop_addr &&
+        current_pc == m_self_loop_branch_pc && !dol_target)
+    {
+      // Self-loop back-edge (sl1): the register cache stays live; the label
+      // invariant is established by TranslateBlock's two-pass emission. The
+      // edge test above is unchanged (timing, exceptions, harness stop).
+      out += "    goto _loop;\n";
+    }
+    else
+    {
+      out += fmt::format("    [[clang::musttail]] return {}(s);\n", BlockFn(target, dol_target));
+    }
   }
   else
   {

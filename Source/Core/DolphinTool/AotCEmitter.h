@@ -307,6 +307,29 @@ private:
   std::string SbFpWriteBack(const std::bitset<32>& regs, bool fpscr) const;
   std::string SbFpReload(const std::bitset<32>& regs, bool fpscr) const;
 
+  // Self-loop blocks as a C goto loop (sl1, 2026-10-12): a top-level block
+  // whose last instruction branches back to its own start keeps its register
+  // cache across iterations (`goto _loop;` instead of a musttail to itself).
+  // TranslateBlock emits such a block twice: pass 1 (text discarded) records
+  // the used/dirty sets over the loop body; pass 2 seeds them, preloads every
+  // used local before the `_loop:` label, and emits the body for real. Zero
+  // when the current block is not such a loop.
+  struct SbSets
+  {
+    std::bitset<32> gpr_used, gpr_dirty;
+    std::bitset<8> cr_used, cr_dirty;
+    bool lr_used = false, lr_dirty = false, ctr_used = false, ctr_dirty = false;
+    std::bitset<64> fp_used, fp_dirty;
+    bool fpscr_used = false, fpscr_dirty = false, fm_used = false;
+  };
+  SbSets SbSave() const;
+  void SbSeed(const SbSets& seed);
+  u32 SelfLoopBranchPc(u32 block_addr, u32 num_instructions) const;
+  u32 m_self_loop_addr = 0;       // loop head (== the block being translated) or 0
+  u32 m_self_loop_branch_pc = 0;  // pc of the back-edge branch (the last instruction)
+  bool m_self_loop_pass1 = false;
+  SbSets m_self_loop_sets;  // pass-1 snapshot after the loop block's instruction loop
+
   const ModuleMode* m_module = nullptr;
   const ModuleImmReloc* m_cur_imm = nullptr;          // reloc on the current instruction
   const ModuleBranchOverride* m_cur_branch = nullptr;  // branch override on current inst
