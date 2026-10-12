@@ -445,7 +445,9 @@ int VtxAotCommand(const std::vector<std::string>& args)
     f << "# Auto-generated vertex loader AOT build script\n";
     f << "set -e\n\n";
     f << "CLANG=${CLANG:-clang}\n";
-    f << "CFLAGS=\"-c -O2 -flto=thin -arch arm64 -I.\"\n\n";
+    f << "CFLAGS=\"-c -O2 -flto=thin -arch arm64 -I.\"\n";
+    // Extra flags of the block translation (dolphin-tool translate's aot_flags.txt).
+    f << "[[ -f aot_flags.txt ]] && CFLAGS=\"$CFLAGS $(cat aot_flags.txt)\"\n\n";
 
     f << fmt::format("$CLANG $CFLAGS {}_vtx_loaders.c -o {}_vtx_loaders.o\n", prefix, prefix);
     f << fmt::format("$CLANG $CFLAGS {}_vtx_dispatch.c -o {}_vtx_dispatch.o\n", prefix, prefix);

@@ -93,7 +93,15 @@ private:
   void RunDiff();
   void CaptureSnapshot(PPCSnapshot& snap);
   void RestoreSnapshot(const PPCSnapshot& snap);
-  bool CompareSnapshots(const PPCSnapshot& a, const PPCSnapshot& b, u32 block_pc, FILE* log);
+  // fpscr_ignore: FPSCR bits left out of the comparison (dolphin-tool diff
+  // --fprf-off passes kFpscrStatusMask).
+  bool CompareSnapshots(const PPCSnapshot& a, const PPCSnapshot& b, u32 block_pc, FILE* log,
+                        u32 fpscr_ignore = 0);
+  // True when a and b differ, and only inside kFpscrStatusMask.
+  bool FpscrStatusOnly(const PPCSnapshot& a, const PPCSnapshot& b);
+  // FPSCR FPRF (bits 12-16) | FI (17) | FR (18): the status bits the AOT fast
+  // paths skip under AOT_FPRF=0, like Dolphin's JIT with Core/FPRF=false.
+  static constexpr u32 kFpscrStatusMask = 0x0007F000u;
   void LogDivergence(u32 block_pc, u32 num_instr, const PPCSnapshot& pre,
                      const PPCSnapshot& aot_result, const PPCSnapshot& interp_result, FILE* log);
   bool BlockReadsTimebase(u32 block_addr, u32 num_instructions);
@@ -129,4 +137,6 @@ private:
   // truncate the log or re-load the savestate; once concluded it only breaks.
   bool m_diff_entered = false;
   bool m_diff_concluded = false;
+  // dolphin-tool diff --fprf-off: FPSCR compared modulo kFpscrStatusMask.
+  bool m_fprf_off = false;
 };

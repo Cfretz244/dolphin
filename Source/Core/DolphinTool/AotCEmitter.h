@@ -57,6 +57,17 @@ struct ModuleMode
   std::vector<u32> section_sizes;
 };
 
+// AOT_FPRF translate mode (fprf1, 2026-10-12; see aot_runtime.h AOT_FPRF).
+// Environment AOT_FPRF unset or "1" = exact FPSCR status bits on the FP fast
+// paths (default), "0" = JIT parity (the fast paths skip FPRF/FI/FR). Any other
+// value is a fatal error (exits).
+int AotFprfMode();
+// The extra C flags every compile of the generated code must use
+// ("-DAOT_FPRF=<n>"): baked into build.sh and written to <dir>/aot_flags.txt,
+// which build-aot-ios.sh and build_vtx.sh append to their flags.
+std::string AotExtraCFlags();
+void WriteAotFlagsFile(const std::string& dir);
+
 // Translates PPC basic blocks into C source code for AOT compilation.
 // Each PPC block becomes a C function operating on an AOTState struct
 // that is layout-compatible with Dolphin's PowerPCState.
@@ -290,6 +301,9 @@ private:
   // Step 2 (fp1, 2026-10-06): FP/PS register halves and FPSCR as well
   // (_fN0/_fN1 = bits of ps[N].ps0/ps1, _fpscr); bit 2N+h of the FP sets.
   bool m_superblocks = true;
+  // AOT_FPRF=0 (fprf1): the _v value forms do not define _fpscr (the runtime
+  // skips their FPSCR status store), so they no longer mark it dirty.
+  bool m_fprf_exact = true;
   std::bitset<32> m_sb_gpr_used, m_sb_gpr_dirty;
   std::bitset<8> m_sb_cr_used, m_sb_cr_dirty;
   bool m_sb_lr_used = false, m_sb_lr_dirty = false;

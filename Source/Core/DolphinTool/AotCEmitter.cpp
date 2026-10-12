@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bitset>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
@@ -33,11 +34,43 @@ static constexpr u32 kMaxInlineBlockInsts = 12;
 static constexpr int kMaxInlineDepth = 16;
 static constexpr u32 kMaxInlineTotalInsts = 192;
 
+int AotFprfMode()
+{
+  const char* v = std::getenv("AOT_FPRF");
+  if (!v || std::strcmp(v, "1") == 0)
+    return 1;
+  if (std::strcmp(v, "0") == 0)
+    return 0;
+  fmt::println(stderr, "Error: AOT_FPRF must be unset, 0 or 1 (got '{}')", v);
+  std::exit(EXIT_FAILURE);
+}
+
+std::string AotExtraCFlags()
+{
+  return fmt::format("-DAOT_FPRF={}", AotFprfMode());
+}
+
+void WriteAotFlagsFile(const std::string& dir)
+{
+  const std::string path = dir + "/aot_flags.txt";
+  FILE* f = std::fopen(path.c_str(), "w");
+  if (!f)
+  {
+    fmt::println(stderr, "Error: cannot write {}", path);
+    std::exit(EXIT_FAILURE);
+  }
+  fmt::println(f, "{}", AotExtraCFlags());
+  std::fclose(f);
+  fmt::println(stderr, "  FPSCR status (AOT_FPRF): {} ({})", AotFprfMode(),
+               AotFprfMode() ? "exact" : "JIT parity: fast paths skip FPRF/FI/FR");
+}
+
 AOTCEmitter::AOTCEmitter(const PPCMemoryImage& memory, std::set<u32> known_blocks,
                          std::string prefix)
     : m_memory(memory), m_known_blocks(std::move(known_blocks)), m_prefix(std::move(prefix))
 {
   m_superblocks = std::getenv("AOT_NO_SUPERBLOCKS") == nullptr;
+  m_fprf_exact = AotFprfMode() != 0;
 }
 
 void AOTCEmitter::SetModuleMode(const ModuleMode* mode, std::set<u32> module_blocks)
@@ -782,11 +815,19 @@ void AOTCEmitter::SbFinishSegment(std::string& out, size_t start)
       k++;
     bool def = false;
     if (which >= 4 && i >= 2 && r[i - 1] == '&' && (r[i - 2] == '(' || r[i - 2] == ','))
-      def = true;
+    {
+      // AOT_FPRF=0: a value form leaves *fpscr untouched (aot_runtime.h).
+      def = which == 4 || m_fprf_exact;
+    }
     else if (k < r.size())
     {
       if (r[k] == '=' && (k + 1 >= r.size() || r[k + 1] != '='))
-        def = true;
+      {
+        // AOT_FPRF=0: the cold bracket's `_fpscr=s->fpscr;` reload after the
+        // exact helper leaves the local equal to memory -- not a definition.
+        // (Exact mode keeps the old classification: byte-identical output.)
+        def = which != 5 || m_fprf_exact || !StartsWith(r, k + 1, "s->fpscr");
+      }
       else if (k + 1 < r.size() && ((r[k] == '+' && r[k + 1] == '+') || (r[k] == '-' && r[k + 1] == '-')))
         def = true;
       else if (k + 1 < r.size() && std::strchr("+-*/&|^", r[k]) && r[k + 1] == '=')

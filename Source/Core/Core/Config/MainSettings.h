@@ -399,6 +399,7 @@ extern const Info<bool> MAIN_DEBUG_AOT_COMPARE_RAM;
 extern const Info<std::string> MAIN_DEBUG_AOT_DIFF_LOG_PATH;
 extern const Info<u32> MAIN_DEBUG_AOT_DIFF_MAX_BLOCKS;
 extern const Info<u32> MAIN_DEBUG_AOT_DIFF_MAX_DIVERGENCES;
+extern const Info<bool> MAIN_DEBUG_AOT_DIFF_FPRF_OFF;
 extern const Info<u32> MAIN_DEBUG_AOT_DIFF_FILTER_MIN;
 extern const Info<u32> MAIN_DEBUG_AOT_DIFF_FILTER_MAX;
 extern const Info<std::string> MAIN_DEBUG_AOT_DIFF_SAVESTATE_PATH;

@@ -98,6 +98,13 @@ int DiffCommand(const std::vector<std::string>& args)
       .set_default("0")
       .help("Also diff RAM contents after each block (3 copies of 24MB)");
 
+  parser.add_option("--fprf-off")
+      .action("store_true")
+      .set_default("0")
+      .help("Compare FPSCR modulo its status bits FPRF|FI|FR (0x0007F000), for libraries "
+            "translated with AOT_FPRF=0 (JIT parity). Blocks whose only difference is those "
+            "bits are counted in both modes (fpscr-status-only)");
+
   parser.add_option("--savestate")
       .action("store")
       .metavar("<path>")
@@ -122,6 +129,7 @@ int DiffCommand(const std::vector<std::string>& args)
   const u32 max_blocks_val = static_cast<u32>(std::stoul(std::string(options["max_blocks"])));
   const u32 max_div_val = static_cast<u32>(std::stoul(std::string(options["max_divergences"])));
   const bool self_diff = static_cast<int>(options.get("self_diff")) != 0;
+  const bool fprf_off = static_cast<int>(options.get("fprf_off")) != 0;
 
   // Initialize UICommon (config system, video backend)
   UICommon::SetUserDirectory(options.is_set("user") ? std::string(options["user"]) : "");
@@ -160,6 +168,7 @@ int DiffCommand(const std::vector<std::string>& args)
                            static_cast<int>(options.get("compare_ram")) != 0);
   Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_MAX_BLOCKS, max_blocks_val);
   Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_MAX_DIVERGENCES, max_div_val);
+  Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_FPRF_OFF, fprf_off);
   Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_FILTER_MIN, filter_min);
   Config::SetCurrent(Config::MAIN_DEBUG_AOT_DIFF_FILTER_MAX, filter_max);
 
@@ -191,6 +200,8 @@ int DiffCommand(const std::vector<std::string>& args)
                max_div_val);
   if (self_diff)
     fmt::println(std::cerr, "AOT Diff: Self-diff mode (interpreter vs interpreter)");
+  if (fprf_off)
+    fmt::println(std::cerr, "AOT Diff: --fprf-off: FPSCR compared modulo FPRF|FI|FR");
 
   // Install signal handler so Ctrl+C works
   std::signal(SIGINT, DiffSignalHandler);

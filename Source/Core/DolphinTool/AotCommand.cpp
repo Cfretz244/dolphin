@@ -951,10 +951,11 @@ int AotCommand(const std::vector<std::string>& args)
     // LCG RNGs); -fno-strict-aliasing: insurance for generated pointer casts.
     // -DAOT_HARNESS=1: macOS libs keep the aot_single_block_mode test on block edges
     // so the AOT_COMPARE harness can stop chaining; iOS libs compile it out.
+    // AotExtraCFlags (-DAOT_FPRF=<n>) also goes to aot_flags.txt for build-aot-ios.sh.
     script << "BLOCK_CFLAGS=\"-Os -flto=thin -arch arm64 -mcpu=apple-a14"
-              " -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1\"\n";
+              " -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1 " << AotExtraCFlags() << "\"\n";
     script << "DISPATCH_CFLAGS=\"-O2 -flto=thin -arch arm64 -mcpu=apple-a14"
-              " -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1\"\n";
+              " -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1 " << AotExtraCFlags() << "\"\n";
     // Bounded parallelism: hundreds of block files with one clang each swamps
     // the machine. xargs -P instead of `wait -n` — macOS ships bash 3.2.
     script << "JOBS=\"${AOT_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}\"\n\n";
@@ -985,6 +986,7 @@ int AotCommand(const std::vector<std::string>& args)
     script.close();
     chmod(build_script.c_str(), 0755);
     fmt::println(std::cerr, "  Build script: {}", build_script);
+    WriteAotFlagsFile(output_dir);
   }
 
   // 7. Report results

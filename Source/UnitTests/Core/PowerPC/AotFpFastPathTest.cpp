@@ -37,6 +37,16 @@
 
 #include "TestValues.h"
 
+// AotFpFastPathFprfOffTest.cpp re-includes this file with AOT_FPRF=0 (JIT-parity
+// FPSCR status, fprf1): the fast paths then skip FPRF/FI/FR, so FPSCR is compared
+// modulo those bits (exactly what `dolphin-tool diff --fprf-off` does), and the
+// tests that do not involve FPSCR are compiled only once (AOT_FP_TEST_FPRF_OFF_TU).
+#if AOT_FPRF
+constexpr u32 kFpscrCompareMask = 0xFFFF'FFFFu;
+#else
+constexpr u32 kFpscrCompareMask = ~0x0007'F000u;  // FPRF | FI | FR
+#endif
+
 namespace
 {
 using InterpFn = void (*)(Interpreter&, UGeckoInstruction);
@@ -75,7 +85,8 @@ struct Snapshot
       if (ps[i].ps0 != o.ps[i].ps0 || ps[i].ps1 != o.ps[i].ps1)
         return false;
     }
-    return fpscr == o.fpscr && exceptions == o.exceptions && srr1 == o.srr1;
+    return ((fpscr ^ o.fpscr) & kFpscrCompareMask) == 0 && exceptions == o.exceptions &&
+           srr1 == o.srr1;
   }
 };
 
@@ -826,6 +837,7 @@ TEST_F(AotFpFastPathTest, ValueFormsDeclineTies)
   EXPECT_EQ(accepted, 0);
 }
 
+#ifndef AOT_FP_TEST_FPRF_OFF_TU
 TEST(AotFpConvertTest, ConvertToDoubleExhaustive)
 {
   u64 mismatches = 0;
@@ -1466,4 +1478,32 @@ TEST_F(AotFpFastPathTest, MtmsrFastPathMatchesMSRUpdated)
   }
   EXPECT_EQ(bad, 0);
 }
+#endif  // AOT_FP_TEST_FPRF_OFF_TU
+
+#if !AOT_FPRF
+// JIT parity: an accepted fast path leaves every FPSCR bit as it was (the
+// exact helpers, taken on decline, still update the status bits).
+TEST_F(AotFpFastPathTest, FprfOffFastPathsLeaveFpscrUntouched)
+{
+  Common::FPU::SetSIMDMode(Common::FPU::RoundMode::ROUND_NEAR, false);
+  const u64 one = 0x3FF0'0000'0000'0000ULL, half = 0x3FE0'0000'0000'0000ULL;
+  int accepted = 0;
+  for (const u32 fpscr_in : {0x0000'0000u, 0x0007'F000u, 0xFFFF'F0F8u, 0x0002'1004u})
+  {
+    for (const VOp& op : s_v_ops)
+    {
+      u64 r[32][2];
+      for (int i = 0; i < 32; ++i)
+        r[i][0] = r[i][1] = (i & 1) ? one : half;
+      u32 f = fpscr_in;
+      if (op.v(&f, &r[3][0], &r[3][1], r, 1, 2, 4))
+      {
+        ++accepted;
+        EXPECT_EQ(f, fpscr_in) << op.name;
+      }
+    }
+  }
+  EXPECT_EQ(accepted, 4 * static_cast<int>(s_v_ops.size()));
+}
+#endif
 #endif  // DOLPHIN_HAS_AOT

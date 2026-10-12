@@ -767,7 +767,8 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
     auto script = Output(output + "/build.sh");
     script << "#!/bin/bash\nset -euo pipefail\ncd \"$(dirname \"$0\")\"\n";
     script << "export IMAGE_CFLAGS='-Os -flto=thin -arch arm64 -mcpu=apple-a14 -fwrapv "
-              "-fno-strict-aliasing -DAOT_HARNESS=1'\n";
+              "-fno-strict-aliasing -DAOT_HARNESS=1 "
+           << AotExtraCFlags() << "'\n";
     script << fmt::format("printf '%s\\0' {}_blocks_*.c | xargs -0 -n1 -P \"${{AOT_JOBS:-4}}\" sh "
                           "-c 'exec clang -c $IMAGE_CFLAGS -I. \"$1\" -o \"${{1%.c}}.o\"' sh\n",
                           prefix);
@@ -778,6 +779,7 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
                           prefix, prefix);
     script << fmt::format("ar rcs lib{}_aot.a {}_*.o\n", prefix, prefix);
     script.close();
+    WriteAotFlagsFile(output);
     fmt::println(std::cerr,
                  "Translated {} content-guarded DOL blocks (experimental; measure guard cost)",
                  blocks.size());
@@ -1965,9 +1967,11 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
       script << "#!/bin/bash\nset -e\ncd \"$(dirname \"$0\")\"\n";
       script << fmt::format("PREFIX=\"{}\"\n", prefix);
       script << "BLOCK_CFLAGS=\"-Os -flto=thin -arch arm64 -mcpu=apple-a14"
-                " -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1\"\n";
+                " -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1 "
+             << AotExtraCFlags() << "\"\n";
       script << "DISPATCH_CFLAGS=\"-O2 -flto=thin -arch arm64 -mcpu=apple-a14"
-                " -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1\"\n";
+                " -fwrapv -fno-strict-aliasing -DAOT_HARNESS=1 "
+             << AotExtraCFlags() << "\"\n";
       script << "JOBS=\"${AOT_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}\"\n\n";
       script << "echo \"Compiling AOT blocks with LTO (${JOBS} jobs)...\"\n";
       script << "export BLOCK_CFLAGS\n";
@@ -1984,6 +1988,7 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
                                              std::filesystem::perms::group_exec |
                                              std::filesystem::perms::others_exec,
                                    std::filesystem::perm_options::add);
+      WriteAotFlagsFile(output);
     }
     size_t translated = 0;
     std::map<std::string, u32> unhandled;

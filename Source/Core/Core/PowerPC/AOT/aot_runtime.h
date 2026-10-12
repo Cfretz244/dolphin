@@ -770,7 +770,7 @@ static inline double aot_force_25bit(double d) {
 // Value forms (fp1, 2026-10-06). Each fast path is a core
 //   int aot_<op>_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, <source halves>)
 // on register VALUES (bit patterns of ps[N].ps0/ps1): it returns 1 after
-// writing d0/d1 (ps[fd]) and *fpscr when the fast path applied, and 0 -- having
+// writing d0/d1 (ps[fd]) and *fpscr (AOT_FPRF=1 only) when the fast path applied, and 0 -- having
 // written nothing -- when the exact out-of-line helper is needed. Sources are
 // taken by value, so fd aliasing an operand is fine. The superblock emitter
 // calls the _v forms directly on C locals (_fN0/_fN1/_fpscr) and brackets the
@@ -784,11 +784,47 @@ static inline double aot_force_25bit(double d) {
 // ----------------------------------------------------------------------------
 #define AOT_FP_V static inline __attribute__((always_inline)) int
 
+// AOT_FPRF (fprf1, 2026-10-12): FPSCR status bits on the value-form fast paths.
+// 1 (default) = exact: every fast path classifies its result and rewrites
+// FPRF (bits 12-16), clearing FI/FR where the interpreter does -- bit-identical
+// to the interpreter. 0 = JIT parity: the fast paths leave FPSCR untouched (the
+// NI read for ForceSingle stays). Dolphin's own JIT never computes these bits
+// by default: Config::MAIN_FPRF defaults to false (MainSettings.cpp), JitBase
+// m_fprf follows it, and JitArm64 SetFPRFIfNeeded / the fprf gate in fcmpX
+// (JitArm64_FloatingPoint.cpp) skip every FPRF/FPCC write, so every normal
+// Dolphin session -- including the traces this translation came from -- runs
+// with FPRF "sometimes updated" (only interpreter fallbacks write it). Under
+// AOT_FPRF=0 the AOT matches that: the exact out-of-line helpers, the compare
+// helpers and the interpreter fallback still write FPRF/FI/FR exactly. Set at
+// translate time (dolphin-tool translate with env AOT_FPRF=0 writes
+// -DAOT_FPRF=0 into build.sh and aot_flags.txt; build-aot-ios.sh appends
+// aot_flags.txt), and the emitter then stops treating the value forms as
+// definitions of the _fpscr local. The diff harness compares FPSCR modulo
+// FPRF|FI|FR with `dolphin-tool diff --fprf-off`. Header-only: no ABI change.
+#ifndef AOT_FPRF
+#define AOT_FPRF 1
+#endif
+
 // ps[fd].Fill(float) / SetBoth + UpdateFPRFSingle: the new FPSCR. `clear` is
 // the extra FPSCR bits the instruction zeroes (fmulsx/fmaddsx clear FI|FR).
+// AOT_FPRF=0: FPSCR is returned unchanged.
 static inline __attribute__((always_inline)) uint32_t aot_fpscr_fprf(uint32_t fpscr, float r, uint32_t clear) {
+#if AOT_FPRF
     return (fpscr & ~(AOT_FPSCR_FPRF_MASK | clear)) | (aot_classify_float(r) << 12);
+#else
+    (void)r;
+    (void)clear;
+    return fpscr;
+#endif
 }
+
+// The fast paths' FPSCR status store: `*p = v` when exact, nothing (no store,
+// the value is dead) under AOT_FPRF=0.
+#if AOT_FPRF
+#define AOT_FPSCR_STATUS(p, v) (*(p) = (v))
+#else
+#define AOT_FPSCR_STATUS(p, v) ((void)(p), (void)(v))
+#endif
 
 // Scalar single results: ps[fd].Fill(r) (both halves).
 static inline __attribute__((always_inline)) void aot_fp_fill_v(uint64_t* d0, uint64_t* d1, float r) {
@@ -803,7 +839,7 @@ AOT_FP_V aot_faddsx_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, 
     uint32_t f = *fpscr;
     float r = aot_force_single(f, sum);
     aot_fp_fill_v(d0, d1, r);
-    *fpscr = aot_fpscr_fprf(f, r, 0);
+    AOT_FPSCR_STATUS(fpscr, aot_fpscr_fprf(f, r, 0));
     return 1;
 }
 
@@ -813,7 +849,7 @@ AOT_FP_V aot_fsubsx_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, 
     uint32_t f = *fpscr;
     float r = aot_force_single(f, diff);
     aot_fp_fill_v(d0, d1, r);
-    *fpscr = aot_fpscr_fprf(f, r, 0);
+    AOT_FPSCR_STATUS(fpscr, aot_fpscr_fprf(f, r, 0));
     return 1;
 }
 
@@ -823,7 +859,7 @@ AOT_FP_V aot_fmulsx_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, 
     uint32_t f = *fpscr;
     float r = aot_force_single(f, product);
     aot_fp_fill_v(d0, d1, r);
-    *fpscr = aot_fpscr_fprf(f, r, AOT_FPSCR_FI | AOT_FPSCR_FR);
+    AOT_FPSCR_STATUS(fpscr, aot_fpscr_fprf(f, r, AOT_FPSCR_FI | AOT_FPSCR_FR));
     return 1;
 }
 
@@ -831,7 +867,7 @@ AOT_FP_V aot_fmulsx_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, 
 static inline __attribute__((always_inline)) void aot_ps_set_v(uint32_t* fpscr, uint32_t f, uint64_t* d0, uint64_t* d1, float r0, float r1) {
     *d0 = aot_double_to_bits((double)r0);
     *d1 = aot_double_to_bits((double)r1);
-    *fpscr = aot_fpscr_fprf(f, r0, 0);
+    AOT_FPSCR_STATUS(fpscr, aot_fpscr_fprf(f, r0, 0));
 }
 
 AOT_FP_V aot_ps_add_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1) {
@@ -920,7 +956,7 @@ AOT_FP_V aot_fmaddsx_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0,
     float res = aot_force_single(f, r);
     uint32_t fi = (r != (double)res) ? AOT_FPSCR_FI : 0u;
     aot_fp_fill_v(d0, d1, res);
-    *fpscr = aot_fpscr_fprf(f, res, AOT_FPSCR_FI | AOT_FPSCR_FR) | fi;
+    AOT_FPSCR_STATUS(fpscr, aot_fpscr_fprf(f, res, AOT_FPSCR_FI | AOT_FPSCR_FR) | fi);
     return 1;
 }
 
@@ -931,7 +967,7 @@ AOT_FP_V aot_fmsubsx_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0,
     uint32_t f = *fpscr;
     float res = aot_force_single(f, r);
     aot_fp_fill_v(d0, d1, res);
-    *fpscr = aot_fpscr_fprf(f, res, 0);
+    AOT_FPSCR_STATUS(fpscr, aot_fpscr_fprf(f, res, 0));
     return 1;
 }
 
@@ -943,7 +979,7 @@ AOT_FP_V aot_fnmaddsx_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0
     uint32_t f = *fpscr;
     float res = -aot_force_single(f, r);
     aot_fp_fill_v(d0, d1, res);
-    *fpscr = aot_fpscr_fprf(f, res, 0);
+    AOT_FPSCR_STATUS(fpscr, aot_fpscr_fprf(f, res, 0));
     return 1;
 }
 
@@ -954,7 +990,7 @@ AOT_FP_V aot_fnmsubsx_v(uint32_t* fpscr, uint64_t* d0, uint64_t* d1, uint64_t a0
     uint32_t f = *fpscr;
     float res = -aot_force_single(f, r);
     aot_fp_fill_v(d0, d1, res);
-    *fpscr = aot_fpscr_fprf(f, res, 0);
+    AOT_FPSCR_STATUS(fpscr, aot_fpscr_fprf(f, res, 0));
     return 1;
 }
 

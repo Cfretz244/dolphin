@@ -685,6 +685,8 @@ const Info<std::string> MAIN_DEBUG_AOT_DIFF_LOG_PATH{{System::Main, "Debug", "AO
 const Info<u32> MAIN_DEBUG_AOT_DIFF_MAX_BLOCKS{{System::Main, "Debug", "AOTDiffMaxBlocks"}, 0};
 const Info<u32> MAIN_DEBUG_AOT_DIFF_MAX_DIVERGENCES{{System::Main, "Debug", "AOTDiffMaxDivergences"},
                                                     1};
+// dolphin-tool diff --fprf-off: compare FPSCR modulo FPRF|FI|FR (AOT_FPRF=0 libraries).
+const Info<bool> MAIN_DEBUG_AOT_DIFF_FPRF_OFF{{System::Main, "Debug", "AOTDiffFprfOff"}, false};
 const Info<u32> MAIN_DEBUG_AOT_DIFF_FILTER_MIN{{System::Main, "Debug", "AOTDiffFilterMin"}, 0};
 const Info<u32> MAIN_DEBUG_AOT_DIFF_FILTER_MAX{{System::Main, "Debug", "AOTDiffFilterMax"},
                                                0xFFFFFFFF};

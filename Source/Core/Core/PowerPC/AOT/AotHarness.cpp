@@ -641,8 +641,14 @@ void AotHarness::RestoreSnapshot(const PPCSnapshot& snap)
     m_ppc_state.spr[kSysSprs[i]] = snap.spr_sys[i];
 }
 
+bool AotHarness::FpscrStatusOnly(const PPCSnapshot& a, const PPCSnapshot& b)
+{
+  return ((a.fpscr ^ b.fpscr) & kFpscrStatusMask) != 0 &&
+         CompareSnapshots(a, b, 0, nullptr, kFpscrStatusMask);
+}
+
 bool AotHarness::CompareSnapshots(const PPCSnapshot& a, const PPCSnapshot& b, u32 block_pc,
-                               FILE* log)
+                               FILE* log, u32 fpscr_ignore)
 {
   bool match = true;
 
@@ -667,7 +673,7 @@ bool AotHarness::CompareSnapshots(const PPCSnapshot& a, const PPCSnapshot& b, u3
     match = false;
   if (a.spr_lr != b.spr_lr || a.spr_ctr != b.spr_ctr)
     match = false;
-  if (a.fpscr != b.fpscr)
+  if ((a.fpscr ^ b.fpscr) & ~fpscr_ignore)
     match = false;
   if (a.msr != b.msr)
     match = false;
@@ -747,8 +753,20 @@ void AotHarness::LogDivergence(u32 block_pc, u32 num_instr, const PPCSnapshot& p
   if (aot_result.msr != interp_result.msr)
     fmt::print(log, "  MSR: AOT={:#010x}  INTERP={:#010x}\n", aot_result.msr, interp_result.msr);
   if (aot_result.fpscr != interp_result.fpscr)
-    fmt::print(log, "  FPSCR: AOT={:#010x}  INTERP={:#010x}\n", aot_result.fpscr,
+  {
+    fmt::print(log, "  FPSCR: AOT={:#010x}  INTERP={:#010x}", aot_result.fpscr,
                interp_result.fpscr);
+    if (m_fprf_off)
+    {
+      const u32 a = aot_result.fpscr & ~kFpscrStatusMask;
+      const u32 b = interp_result.fpscr & ~kFpscrStatusMask;
+      if (a != b)
+        fmt::print(log, "  (masked --fprf-off: AOT={:#010x}  INTERP={:#010x})", a, b);
+      else
+        fmt::print(log, "  (FPRF/FI/FR only: masked by --fprf-off)");
+    }
+    fmt::print(log, "\n");
+  }
   if (aot_result.exceptions != interp_result.exceptions)
     fmt::print(log, "  EXCEPTIONS: AOT={:#010x}  INTERP={:#010x}\n", aot_result.exceptions,
                interp_result.exceptions);
@@ -921,6 +939,8 @@ void AotHarness::RunDiff()
   const u32 max_divergences = Config::Get(Config::MAIN_DEBUG_AOT_DIFF_MAX_DIVERGENCES);
   const u32 filter_min = Config::Get(Config::MAIN_DEBUG_AOT_DIFF_FILTER_MIN);
   const u32 filter_max = Config::Get(Config::MAIN_DEBUG_AOT_DIFF_FILTER_MAX);
+  m_fprf_off = Config::Get(Config::MAIN_DEBUG_AOT_DIFF_FPRF_OFF);
+  const u32 fpscr_ignore = m_fprf_off ? kFpscrStatusMask : 0u;
   const GuestRam guest_ram = GetGuestRam(memory);
   const u32 shadow_size = guest_ram.Total();
 
@@ -954,6 +974,16 @@ void AotHarness::RunDiff()
   u32 blocks_skipped_unknown = 0;
   u32 blocks_skipped_mmio = 0;
   u32 divergence_count = 0;
+  // Compared blocks whose only difference (registers, RAM, MMIO) is inside
+  // the FPSCR status bits (FPRF|FI|FR), counted with and without --fprf-off;
+  // of those, the ones on the MMIO path (where, unmasked, a register-only
+  // difference without MMIO writes is accepted as timing-skip instead).
+  u32 fpscr_status_only = 0;
+  u32 fpscr_status_only_mmio = 0;
+  const auto print_fpscr_status_only = [&](FILE* f) {
+    fmt::print(f, "fpscr-status-only blocks: {} ({}) | MMIO-path: {}\n", fpscr_status_only,
+               m_fprf_off ? "masked" : "counted", fpscr_status_only_mmio);
+  };
   u32 total_block_visits = 0;
   u32 last_status_visits = 0;
   constexpr u32 STATUS_INTERVAL = 5000;  // Print status every N block visits
@@ -968,6 +998,8 @@ void AotHarness::RunDiff()
   fmt::print(log, "Block boundaries loaded: {}\n", m_block_sizes.size());
   if (m_image_block_size)
     fmt::print(log, "Dynamic DOL image boundaries: enabled\n");
+  fmt::print(log, "FPSCR status bits (FPRF|FI|FR, {:#010x}): {}\n", kFpscrStatusMask,
+             m_fprf_off ? "MASKED (--fprf-off, JIT parity)" : "compared (exact)");
   fmt::print(log, "RAM size: {} MB (MEM1 {} MB + MEM2 {} MB)\n\n", shadow_size / (1024 * 1024),
              guest_ram.mem1_size / (1024 * 1024), guest_ram.mem2_size / (1024 * 1024));
   std::fflush(log);
@@ -1306,7 +1338,7 @@ void AotHarness::RunDiff()
         CaptureSnapshot(interp_result);
 
         // Compare registers + MMIO writes + RAM
-        bool reg_match = CompareSnapshots(aot_result, interp_result, block_pc, log);
+        bool reg_match = CompareSnapshots(aot_result, interp_result, block_pc, log, fpscr_ignore);
         bool mmio_match = (aot_mmio.size() == interp_mmio.size());
         if (mmio_match)
         {
@@ -1329,6 +1361,11 @@ void AotHarness::RunDiff()
         }
 
         bool diverged = !reg_match || !mmio_match;
+        if (mmio_match && FpscrStatusOnly(aot_result, interp_result))
+        {
+          fpscr_status_only++;
+          fpscr_status_only_mmio++;
+        }
 
         // Timing-dependent MMIO read detection: if registers diverged but MMIO
         // writes matched AND both had zero MMIO writes, this is likely a polling
@@ -1439,7 +1476,7 @@ void AotHarness::RunDiff()
         continue;
       }
 
-      bool reg_diverged = !CompareSnapshots(aot_result, interp_result, block_pc, log);
+      bool reg_diverged = !CompareSnapshots(aot_result, interp_result, block_pc, log, fpscr_ignore);
 
       // Compare RAM: AOT result is in m_ram_shadow_aot, interpreter result is in current RAM
       bool ram_diverged = false;
@@ -1470,6 +1507,8 @@ void AotHarness::RunDiff()
       }
 
       bool diverged = reg_diverged || ram_diverged;
+      if (!ram_diverged && FpscrStatusOnly(aot_result, interp_result))
+        fpscr_status_only++;
 
       // Only print on divergence (periodic status handles progress)
       if (diverged)
@@ -1484,6 +1523,7 @@ void AotHarness::RunDiff()
         if (divergence_count >= max_divergences)
         {
           fmt::print(log, "\nMax divergences ({}) reached. Stopping.\n", max_divergences);
+          print_fpscr_status_only(log);
           std::fflush(log);
           if (log != stdout)
             std::fclose(log);
@@ -1531,6 +1571,7 @@ void AotHarness::RunDiff()
                    blocks_compared, blocks_skipped_unknown, blocks_skipped_mmio, divergence_count,
                    blocks_skipped_exception);
         fmt::print(log, "Real-mode (MSR.IR=0) blocks compared: {}\n", blocks_compared_real);
+        print_fpscr_status_only(log);
         std::fflush(log);
         if (log != stdout)
           std::fclose(log);
@@ -1567,6 +1608,7 @@ void AotHarness::RunDiff()
              blocks_compared, blocks_skipped_unknown, blocks_skipped_mmio, divergence_count,
              blocks_skipped_exception);
   fmt::print(log, "Real-mode (MSR.IR=0) blocks compared: {}\n", blocks_compared_real);
+  print_fpscr_status_only(log);
   std::fflush(log);
   if (log != stdout)
     std::fclose(log);
