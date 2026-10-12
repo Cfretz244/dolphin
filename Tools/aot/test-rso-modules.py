@@ -229,6 +229,7 @@ AOT_SLOWPATH_CC uint32_t aot_read_u32_slow(AOTState* s, uint32_t addr) {
 }
 void aot_register_game(const char* id, void (*d)(AOTState*), AOTBlockFunc (*l)(uint32_t), uint32_t v) {}
 void aot_register_game_image(const char* id, const char* h) {}
+void aot_register_game_flags(const char* id, uint32_t f) {}
 void aot_register_image_block_sizes(const char* id, uint32_t (*lookup)(uint32_t)) {}
 void aot_register_game_images(const char* id, const AotImageDesc* i, uint32_t n, uint32_t v) { assert(v == AOT_IMAGES_VERSION); images = i; image_count = n; }
 void aot_register_game_rso_modules(const char* id, const AotRsoModuleDesc* m, uint32_t n, uint32_t v) { assert(v == AOT_IMAGES_VERSION); rso = m; rso_count = n; }

@@ -80,6 +80,7 @@ int aot_match_code(uint32_t pc, const uint32_t* words, uint32_t count) {
 void aot_interpreter_single_step(AOTState* s) { ++fallbacks; s->downcount=0; }
 void aot_register_game(const char* id, void (*d)(AOTState*), AOTBlockFunc (*l)(uint32_t), uint32_t v) {}
 void aot_register_game_image(const char* id, const char* h) {}
+void aot_register_game_flags(const char* id, uint32_t f) {}
 void aot_register_image_block_sizes(const char* id, uint32_t (*lookup)(uint32_t)) { block_size=lookup; }
 static void execute(AOTBlockFunc fn, uint32_t expected) {
   AOTState s = {0}; s.pc=0x80004000; s.downcount=100; s.spr[8]=0x80004008;

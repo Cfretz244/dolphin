@@ -128,6 +128,7 @@ void aot_mtspr_special(AOTState* s, uint32_t spr, uint32_t val) { if (spr == 272
 void aot_rfi(AOTState* s) { ++rfis; s->pc = s->spr[26]; s->msr = s->spr[27]; s->downcount = 0; }
 void aot_register_game(const char* id, void (*d)(AOTState*), AOTBlockFunc (*l)(uint32_t), uint32_t v) {}
 void aot_register_game_image(const char* id, const char* h) {}
+void aot_register_game_flags(const char* id, uint32_t f) {}
 void aot_register_image_block_sizes(const char* id, uint32_t (*lookup)(uint32_t)) {}
 void aot_register_game_images(const char* id, const AotImageDesc* i, uint32_t n, uint32_t v) { assert(v == AOT_IMAGES_VERSION); images = i; image_count = n; }
 static void vector(uint32_t msr, uint32_t expect_r3, int expect_fallbacks) {
