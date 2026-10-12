@@ -13,6 +13,7 @@ descriptor and end the dispatch in aot_rso_dispatch. The compiled library is the
 run at two different module bases through a stub tracker.
 Usage: python3 Tools/aot/test-rso-modules.py /absolute/path/to/dolphin-tool
 """
+import os
 import pathlib
 import struct
 import subprocess
@@ -20,8 +21,8 @@ import sys
 import tempfile
 
 
-def run(*args, ok=True):
-    p = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+def run(*args, ok=True, env=None):
+    p = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
     if (p.returncode == 0) != ok:
         raise AssertionError(f'{args}: exit {p.returncode}\n{p.stdout}')
     return p.stdout
@@ -124,6 +125,10 @@ def make_fst(files):
 
 def main():
     tool = str(pathlib.Path(sys.argv[1]).resolve())
+    # Slow-path counting contract: the harness has no RAM (aot_fast_mem zeroed) and counts
+    # aot_*_slow calls, so fastmem's direct window access is incompatible by design. The
+    # fastmem memory path is covered by test-fastmem.py and the ROM gates.
+    env = dict(os.environ, AOT_FASTMEM='0')
     with tempfile.TemporaryDirectory(prefix='aot-rso-modules-') as temp:
         root = pathlib.Path(temp)
         rso = make_rso(
@@ -164,7 +169,7 @@ def main():
         spec = f'0:T/RSO/RSO_Test.rso:{static}'
         out = root / 'generated'
         log = run(tool, 'translate', '--iso', str(disc), '--cfg', str(cfg), '--output', str(out),
-                  '--rso-module', spec)
+                  '--rso-module', spec, env=env)
         assert 'RSO module TSTE01_rso0 (RSO_Test.plf, T/RSO/RSO_Test.rso)' in log, log
         assert '(1 cross-module import sites)' in log, log
         mod = (out / 'TSTE01_blocks_rso0.c').read_text()
@@ -182,9 +187,9 @@ def main():
         bad = root / 'bad-static.txt'
         bad.write_text('1 0x80004000\n2 0x81000000\n')
         run(tool, 'translate', '--iso', str(disc), '--cfg', str(cfg), '--output',
-            str(root / 'bad1'), '--rso-module', f'0:T/RSO/RSO_Test.rso:{bad}', ok=False)
+            str(root / 'bad1'), '--rso-module', f'0:T/RSO/RSO_Test.rso:{bad}', ok=False, env=env)
         run(tool, 'translate', '--iso', str(disc), '--cfg', str(cfg), '--output',
-            str(root / 'bad2'), '--rso-module', spec, '--rso-module', spec, ok=False)
+            str(root / 'bad2'), '--rso-module', spec, '--rso-module', spec, ok=False, env=env)
         harness = out / 'test.c'
         harness.write_text(r'''
 #include <assert.h>

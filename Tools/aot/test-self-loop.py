@@ -138,6 +138,10 @@ int main(void) {
 def main():
     tool = str(pathlib.Path(sys.argv[1]).resolve())
     env = {k: v for k, v in os.environ.items() if k != 'AOT_NO_SUPERBLOCKS'}
+    # Slow-path counting contract: the harness has no RAM (aot_fast_mem zeroed) and counts
+    # aot_*_slow calls, so fastmem's direct window access is incompatible by design. The
+    # fastmem memory path is covered by test-fastmem.py and the ROM gates.
+    env['AOT_FASTMEM'] = '0'
     with tempfile.TemporaryDirectory(prefix='aot-self-loop-') as temp:
         root = pathlib.Path(temp)
         iso = bytearray(0x4000)
