@@ -19,6 +19,7 @@
 #include "Core/CoreTiming.h"
 #include "Core/HW/CPU.h"
 #include "Core/HW/DVD/DVDThread.h"
+#include "Core/PowerPC/AOT/AotFallbackTrace.h"
 #include "Core/PowerPC/AOT/AotImageTracker.h"
 #include "Core/PowerPC/AOT/AotModuleTracker.h"
 #include "Core/PowerPC/AOT/AotRegistry.h"
@@ -49,6 +50,11 @@ extern "C" int aot_stats_enabled;
 extern "C" uint64_t aot_stat_exception_checks;
 extern "C" uint64_t aot_stat_exception_bits[16];
 extern "C" uint64_t aot_stat_exception_masked;
+
+// AOT_FALLBACK_TRACE=<path> (macOS harness): the on-device fallback tracer
+// (AotFallbackTrace.h; iOS drives it from the bridge). Opened by this session's
+// Init, ended by its Shutdown.
+static bool s_env_fallback_trace = false;
 
 static void interp_only_dispatch(AOTState* s)
 {
@@ -130,6 +136,13 @@ void AOTCore::Init()
     m_expected_dol_sha256.clear();
   }
 
+  if (const char* trace = std::getenv("AOT_FALLBACK_TRACE"); trace && *trace)
+  {
+    aot_fallback_trace_begin(trace);
+    s_env_fallback_trace = true;
+  }
+  AotFallbackTrace::SetSessionHasLibrary(m_dispatch != m_interp_dispatch);
+
 #ifdef DOLPHIN_AOT_HARNESS
   m_harness = AotHarness::MaybeCreate(m_system, entry, m_dispatch, m_interp_dispatch);
 #endif
@@ -137,6 +150,17 @@ void AOTCore::Init()
 
 void AOTCore::Shutdown()
 {
+  // CPU thread is done: write what the fallback tracer has (the frontend may
+  // flush/end again after Core::Stop; both are idempotent).
+  if (s_env_fallback_trace)
+  {
+    aot_fallback_trace_end();
+    s_env_fallback_trace = false;
+  }
+  else
+  {
+    aot_fallback_trace_flush();
+  }
   aot_dump_fallback_stats();
 #ifdef DOLPHIN_AOT_HARNESS
   m_harness.reset();

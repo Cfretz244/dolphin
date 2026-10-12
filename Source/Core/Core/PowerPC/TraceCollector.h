@@ -52,6 +52,18 @@ public:
   bool IsActive() const { return m_active; }
   void SetActive(bool active) { m_active = active; }
 
+  // Current record counts (the AOT fallback recorder's flush log line).
+  size_t BlockCount() const
+  {
+    std::lock_guard lock(m_mutex);
+    return m_blocks.size();
+  }
+  size_t EdgeCount() const
+  {
+    std::lock_guard lock(m_mutex);
+    return m_edges.size();
+  }
+
   void FlushToDisk(const std::string& path) const;
   void MergeFromDisk(const std::string& path);
   void Clear();

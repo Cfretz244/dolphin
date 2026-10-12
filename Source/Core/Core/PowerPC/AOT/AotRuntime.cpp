@@ -33,6 +33,7 @@
 #include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/Interpreter/ExceptionUtils.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
+#include "Core/PowerPC/AOT/AotFallbackTrace.h"
 #include "Core/PowerPC/AOT/AotFastmem.h"
 #include "Core/PowerPC/AOT/AotImageTracker.h"
 #include "Core/PowerPC/AOT/AotModuleTracker.h"
@@ -974,6 +975,20 @@ void aot_interpreter_single_step(AOTState* s)
   auto& system = GetSystem();
 
   auto& interpreter = system.GetInterpreter();
+
+  // #22 trace1: on-device coverage recorder (AotFallbackTrace.h; on by default
+  // on iOS). Off = one relaxed load + branch.
+  if (AotFallbackTrace::IsRecording())
+  {
+    const u32 pc = ppc_state.pc;
+    AotFallbackTrace::Before(GetMMU(), pc);
+    ppc_state.npc = pc + 4;
+    const int cycles = interpreter.SingleStepInner();
+    AotFallbackTrace::After(pc, ppc_state.npc);
+    ppc_state.pc = ppc_state.npc;
+    ppc_state.downcount -= cycles;
+    return;
+  }
 
   ppc_state.npc = ppc_state.pc + 4;
   int cycles = interpreter.SingleStepInner();

@@ -23,6 +23,9 @@
 //   AOT_LOG_PC=<file>            log every dispatch PC
 //   AOT_TRACK_FALLBACKS=1        count interpreter fallbacks per PC (works in
 //                                the fast loop too; enabled as a side effect)
+//   AOT_FALLBACK_TRACE=<path>    record interpreter-fallback code as a .dpht v4
+//                                trace (AotFallbackTrace.h; read in AOTCore::Init,
+//                                works in production builds too)
 //   AOT_FRAME_SAVESTATE=<path>   savestate ring at every field (see OnNewField)
 //   AOT_FRAME_SAVESTATE_SLOTS=N  ring size (default 20)
 // dolphin-tool diff drives RunDiff via the MAIN_DEBUG_AOT_DIFF_* Config keys.
