@@ -65,10 +65,11 @@ struct ModuleMode
 // (-DAOT_FPRF=<n> in build.sh / aot_flags.txt).
 int AotFprfMode();
 // AOT_FASTMEM translate mode (fastmem1, 2026-10-12; see aot_runtime.h `_fmw`).
-// Environment AOT_FASTMEM unset or "0" = the `_fm` range-verdict memory helpers
-// (default), "1" = the `_fmw` window helpers (one host load/store per guest
-// access; the library registers AOT_GAME_FLAG_FASTMEM and needs the runtime's
-// fastmem window). Any other value is a fatal error (exits).
+// Environment AOT_FASTMEM unset or "1" = the `_fmw` window helpers (one host
+// load/store per guest access; the library registers AOT_GAME_FLAG_FASTMEM and
+// needs the runtime's fastmem window; the DEFAULT since #21, operator
+// 2026-10-12), "0" = the `_fm` range-verdict memory helpers. Any other value is
+// a fatal error (exits).
 int AotFastmemMode();
 // The extra C flags every compile of the generated code must use
 // ("-DAOT_FPRF=<n> -DAOT_FASTMEM=<m>"): baked into build.sh and written to <dir>/aot_flags.txt,

@@ -48,11 +48,13 @@ int AotFprfMode()
 
 int AotFastmemMode()
 {
+  // Default 1 (fastmem window) since #21 (operator, 2026-10-12: "fastmem did it.
+  // This is playable."). AOT_FASTMEM=0 selects the `_fm` range-verdict helpers.
   const char* v = std::getenv("AOT_FASTMEM");
-  if (!v || std::strcmp(v, "0") == 0)
-    return 0;
-  if (std::strcmp(v, "1") == 0)
+  if (!v || std::strcmp(v, "1") == 0)
     return 1;
+  if (std::strcmp(v, "0") == 0)
+    return 0;
   fmt::println(stderr, "Error: AOT_FASTMEM must be unset, 0 or 1 (got '{}')", v);
   std::exit(EXIT_FAILURE);
 }
