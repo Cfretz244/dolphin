@@ -74,11 +74,14 @@ void TraceCollector::FlushToDisk(const std::string& path) const
 {
   std::lock_guard lock(m_mutex);
 
+  // Write to a temp file and rename it over `path` (atomic replace), so a concurrent reader (e.g.
+  // the iOS diagnostics export) never sees a half-written trace.
+  const std::string tmp_path = path + ".tmp";
   File::CreateFullPath(path);
-  File::IOFile file(path, "wb");
+  File::IOFile file(tmp_path, "wb");
   if (!file.IsOpen())
   {
-    ERROR_LOG_FMT(DYNA_REC, "TraceCollector: Failed to open {} for writing", path);
+    ERROR_LOG_FMT(DYNA_REC, "TraceCollector: Failed to open {} for writing", tmp_path);
     return;
   }
 
@@ -154,6 +157,13 @@ void TraceCollector::FlushToDisk(const std::string& path) const
 
   file.Seek(0, File::SeekOrigin::Begin);
   file.WriteBytes(&header, sizeof(header));
+
+  const bool written = file.IsGood();
+  if (!file.Close() || !written || !File::Rename(tmp_path, path))
+  {
+    File::Delete(tmp_path, File::IfAbsentBehavior::NoConsoleWarning);
+    return;
+  }
 
   INFO_LOG_FMT(DYNA_REC,
                "TraceCollector: Flushed {} blocks ({} with snapshots, {} snapshots), {} edges, "
