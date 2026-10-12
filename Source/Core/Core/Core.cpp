@@ -180,6 +180,12 @@ void DisplayMessage(std::string message, int time_in_ms)
   if (!IsRunningOrStarting(Core::System::GetInstance()))
     return;
 
+  // Also into the log: headless runs (Null backend) and the iOS bridge have no
+  // on-screen display, and these carry the savestate load/save verdicts
+  // ("Loaded State from ...", "This savestate was created using the
+  // incompatible version ...") that device telemetry needs.
+  NOTICE_LOG_FMT(CORE, "OSD: {}", message);
+
   // Actually displaying non-ASCII could cause things to go pear-shaped
   if (!std::ranges::all_of(message, Common::IsPrintableCharacter))
     return;

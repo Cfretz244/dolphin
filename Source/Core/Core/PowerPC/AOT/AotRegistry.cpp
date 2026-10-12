@@ -4,6 +4,8 @@
 #include "Core/PowerPC/AOT/AotRegistry.h"
 
 #include <algorithm>
+#include <cstring>
+#include <string>
 
 #include "Common/Logging/Log.h"
 
@@ -180,4 +182,39 @@ extern "C" void aot_register_game_rso_modules(const char* game_id,
                                               uint32_t images_version)
 {
   AotRegistry::Instance().RegisterRsoModules(game_id, modules, count, images_version);
+}
+
+// Human-readable summary of every linked AOT library, for frontends that write
+// a build/diagnostics file (the iOS bridge's build.txt): one line per game with
+// the boot-DOL sha256 the image-identity guard verifies, the multi-image
+// descriptors and the RSO module count. Writes at most out_len-1 bytes plus a
+// NUL; returns the full length (like snprintf).
+extern "C" size_t aot_registry_describe(char* out, size_t out_len)
+{
+  std::string text;
+  for (const std::string& id : AotRegistry::Instance().GetRegisteredGameIDs())
+  {
+    const auto entry = AotRegistry::Instance().Find(id);
+    if (!entry)
+      continue;
+    text += "aot " + id + " dol_sha256=" + (entry->dol_sha256.empty() ? "-" : entry->dol_sha256);
+    text += " images=" + std::to_string(entry->image_count);
+    for (uint32_t i = 0; i < entry->image_count; i++)
+    {
+      const char* name = entry->images[i].name;
+      text += i == 0 ? " [" : ",";
+      text += name ? name : "?";
+      if (i + 1 == entry->image_count)
+        text += "]";
+    }
+    text += " rso_modules=" + std::to_string(entry->rso_module_count);
+    text += "\n";
+  }
+  if (out && out_len)
+  {
+    const size_t n = std::min(text.size(), out_len - 1);
+    std::memcpy(out, text.data(), n);
+    out[n] = '\0';
+  }
+  return text.size();
 }

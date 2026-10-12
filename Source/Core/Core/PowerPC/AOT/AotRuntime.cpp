@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -219,6 +220,11 @@ static u64 s_guard_reuses = 0;
 
 static bool s_track_fallbacks = false;
 static std::unordered_map<u32, u64> s_fallback_counts;
+// Running sum of s_fallback_counts (= interpreter single-steps while tracking).
+// Atomic only so a frontend telemetry thread (aot_get_counters, the iOS
+// heartbeat) can read it without walking the map; the CPU thread is the only
+// writer, so a relaxed load+store compiles to a plain ldr/add/str.
+static std::atomic<u64> s_fallback_total{0};
 // Event counters printed with the fallback report (AOT_TRACK_FALLBACKS=1).
 extern "C" int aot_stats_enabled = 0;
 extern "C" uint64_t aot_stat_exception_checks = 0;   // Run-loop CheckExceptions calls
@@ -362,6 +368,7 @@ void aot_shutdown()
   s_track_fallbacks = false;
   aot_stats_enabled = s_track_fallbacks ? 1 : 0;
   s_fallback_counts.clear();
+  s_fallback_total.store(0, std::memory_order_relaxed);
 }
 
 // ============================================================================
@@ -569,6 +576,7 @@ void aot_enable_fallback_tracking()
   s_track_fallbacks = true;
   aot_stats_enabled = 1;
   s_fallback_counts.clear();
+  s_fallback_total.store(0, std::memory_order_relaxed);
 }
 
 // Frontend switch for trust-code mode; takes effect at the next aot_init_fast_mem
@@ -642,6 +650,29 @@ void aot_log_fallback_stats(int top_n)
     NOTICE_LOG_FMT(CORE, "AOTSTAT fb {:>10} pc={:#010x} {}{}{}", sorted[i].second, pc, opname,
                    module.empty() ? "" : "  ", module);
   }
+}
+
+// Running totals for frontend telemetry (the iOS bridge's 5-s heartbeat), read
+// from a non-CPU thread: plain u64 counters owned by the CPU thread, so a read
+// may be a few increments stale -- fine for interval deltas. Totals restart at
+// 0 with each tracking session; callers must treat a decrease as a reset.
+// Fills up to max_count of: [0] interpreter fallbacks (single-steps), [1] guard
+// checks, [2] guard memo reuses, [3] aot_idle calls, [4] rfi, [5] mtmsr,
+// [6] gather-pipe helper stores. Returns the number written. All stay 0 unless
+// fallback tracking is on (aot_enable_fallback_tracking).
+int aot_get_counters(uint64_t* out, int max_count)
+{
+  const uint64_t v[] = {s_fallback_total.load(std::memory_order_relaxed),
+                        s_guard_checks,
+                        s_guard_reuses,
+                        s_stat_idle,
+                        s_stat_rfi,
+                        s_stat_mtmsr,
+                        s_stat_gp_store + s_stat_gp_psq};
+  const int n = std::min<int>(max_count, static_cast<int>(std::size(v)));
+  for (int i = 0; i < n; i++)
+    out[i] = v[i];
+  return n < 0 ? 0 : n;
 }
 
 void aot_dump_fallback_stats()
@@ -742,7 +773,11 @@ void aot_interpreter_single_step(AOTState* s)
   auto& ppc_state = GetPPCState(s);
 
   if (s_track_fallbacks)
+  {
     s_fallback_counts[ppc_state.pc]++;
+    s_fallback_total.store(s_fallback_total.load(std::memory_order_relaxed) + 1,
+                           std::memory_order_relaxed);
+  }
 
   auto& system = GetSystem();
 
