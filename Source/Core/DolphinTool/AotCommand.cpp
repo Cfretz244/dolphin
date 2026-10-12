@@ -923,6 +923,8 @@ int AotCommand(const std::vector<std::string>& args)
         prefix, prefix, prefix);
     file << fmt::format("    aot_register_game_image(\"{}\", \"{}\");\n", prefix,
                         dol_sha256_hex);
+    if (AotFastmemMode())
+      file << fmt::format("    aot_register_game_flags(\"{}\", AOT_GAME_FLAG_FASTMEM);\n", prefix);
     if (!mods.empty())
     {
       file << fmt::format("    aot_register_game_modules(\"{}\", {}_modules, {}u);\n", prefix,

@@ -3,6 +3,8 @@
 
 #include "Core/PowerPC/AOT/AOTCore.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -38,6 +40,7 @@ static_assert(static_cast<int>(PowerPC::CPUCore::AOT) == 6,
 extern "C" const int kDolphinCPUCoreAOT = static_cast<int>(PowerPC::CPUCore::AOT);
 
 extern "C" void aot_init_fast_mem();
+extern "C" int aot_fastmem_session_init();
 extern "C" void aot_shutdown();
 extern "C" void aot_dump_fallback_stats();
 extern "C" int aot_stats_enabled;
@@ -94,6 +97,28 @@ void AOTCore::Init()
                  "AOTCore: No AOT library for game {}. Available: [{}]. "
                  "Falling back to interpreter.",
                  game_id, available);
+  }
+
+  // fastmem1: a library translated with AOT_FASTMEM=1 dereferences
+  // aot_fast_mem.base + ea on every guest access, so it must not run without
+  // the window. AOT_FASTMEM_WINDOW=1 brings the window up for any library
+  // (exercises reservation, aliases and the handler; non-fastmem code never
+  // touches it).
+  const bool fastmem_required = entry && (entry->flags & AOT_GAME_FLAG_FASTMEM) != 0;
+  const char* fastmem_env = std::getenv("AOT_FASTMEM_WINDOW");
+  const bool fastmem_probe = fastmem_env && std::strcmp(fastmem_env, "1") == 0;
+  if ((fastmem_required || fastmem_probe) && !aot_fastmem_session_init() && fastmem_required)
+  {
+    ERROR_LOG_FMT(AOT, "AOTCore: the AOT library for {} needs the fastmem window, which could "
+                       "not be set up -- running the interpreter for this session.",
+                  game_id);
+    NOTICE_LOG_FMT(AOT, "AOTCore: fastmem window unavailable; AOT disabled for this session");
+    PanicAlertFmt("The AOT library for {} was built for the fastmem window (AOT_FASTMEM=1), "
+                  "which could not be set up on this device (see the log). The game will run "
+                  "on the interpreter.",
+                  game_id);
+    m_dispatch = m_interp_dispatch;
+    m_expected_dol_sha256.clear();
   }
 
 #ifdef DOLPHIN_AOT_HARNESS

@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -32,6 +33,7 @@
 #include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/Interpreter/ExceptionUtils.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
+#include "Core/PowerPC/AOT/AotFastmem.h"
 #include "Core/PowerPC/AOT/AotImageTracker.h"
 #include "Core/PowerPC/AOT/AotModuleTracker.h"
 #ifdef DOLPHIN_AOT_HARNESS
@@ -282,6 +284,26 @@ static inline const u8* StatsCodePtr(u32 pc)
   return s_ram_ptr && pc + 4 <= s_ram_size ? s_ram_ptr + pc : nullptr;
 }
 
+static std::chrono::steady_clock::time_point s_fastmem_since;
+
+// Fault counters of the window, as one log fragment (empty without a window).
+static std::string FastmemStatsLine()
+{
+  if (!aot_fast_mem.base)
+    return {};
+  AotFastmemStats st;
+  aot_fastmem_get_stats(&st);
+  const double secs = std::max(
+      1e-3, std::chrono::duration<double>(std::chrono::steady_clock::now() - s_fastmem_since)
+                .count());
+  const u64 total = aot_fastmem_fault_total();
+  return fmt::format("fm_fault={} ({:.0f}/s over {:.0f}s) reads low={} mmio={} efb={} other={} "
+                     "writes low={} mmio={} efb={} other={} unhandled={}",
+                     total, static_cast<double>(total) / secs, secs, st.reads[0], st.reads[1],
+                     st.reads[2], st.reads[3], st.writes[0], st.writes[1], st.writes[2],
+                     st.writes[3], st.unhandled);
+}
+
 extern "C"
 {
 
@@ -292,7 +314,7 @@ extern "C"
 // RAM fast-path descriptor exported to generated code: aot_runtime.h inlines
 // the RAM fast path into every block and calls the aot_*_slow functions below
 // for everything else. AotFastMem itself is defined in aot_runtime.h.
-AotFastMem aot_fast_mem = {nullptr, 0, nullptr, 0, nullptr, nullptr, 0, 0};
+AotFastMem aot_fast_mem = {nullptr, 0, nullptr, 0, nullptr, nullptr, 0, 0, nullptr};
 
 void aot_init_fast_mem()
 {
@@ -339,6 +361,33 @@ void aot_init_fast_mem()
   aot_fast_mem.l1_lim = (s_l1_ptr != nullptr && s_l1_size >= 8) ? s_l1_size - 7 : 0;
 }
 
+// fastmem1: the 4 GiB guest window (AotFastmem.cpp) for libraries translated
+// with AOT_FASTMEM=1 (or every session under AOT_FASTMEM_WINDOW=1, to exercise
+// the window with any library). Called by AOTCore::Init after
+// aot_init_fast_mem (needs the cached buffer pointers). Returns 1 when the
+// window is up (aot_fast_mem.base set), 0 otherwise (base stays NULL).
+int aot_fastmem_session_init()
+{
+  AotFastmemInit r;
+  const int ok =
+      aot_fastmem_window_create(ToAot(s_system->GetPPCState()), s_ram_ptr, s_ram_size,
+                                s_exram_ptr, s_exram_size, s_l1_ptr, s_l1_size, &r);
+  const auto alias = [](int a) { return a < 0 ? "-" : a ? "ok" : "FAIL"; };
+  const std::string line = fmt::format(
+      "AOT fastmem window: {} base={} reserve_kr={:#x} protect_kr={:#x} alias MEM1@80={} "
+      "MEM1@C0={} MEM2@90={} MEM2@D0={} L1@E0={} handler={} selftest={}/8 {} "
+      "fault={:.1f}us{}{}",
+      ok ? "UP" : "FAILED", fmt::ptr(r.base), r.reserve_kr, r.protect_kr, alias(r.alias[0]),
+      alias(r.alias[1]), alias(r.alias[2]), alias(r.alias[3]), alias(r.alias[4]),
+      r.handler_installed, r.selftest_faults, r.selftest_ok ? "ok" : "FAIL", r.fault_us,
+      r.error[0] ? " error: " : "", r.error);
+  std::fprintf(stderr, "%s\n", line.c_str());
+  NOTICE_LOG_FMT(CORE, "{}", line);
+  aot_fast_mem.base = ok ? r.base : nullptr;
+  s_fastmem_since = std::chrono::steady_clock::now();
+  return ok;
+}
+
 // Counterpart to aot_init_fast_mem, called from AOTCore::Shutdown. The RAM/L1
 // buffers are reallocated on the next boot, so the cached pointers must not
 // survive into a second game's session.
@@ -365,6 +414,14 @@ void aot_shutdown()
   aot_fast_mem.l1 = nullptr;
   aot_fast_mem.l1_size = 0;
   aot_fast_mem.l1_lim = 0;
+  if (aot_fast_mem.base)
+  {
+    const std::string fm = FastmemStatsLine();
+    std::fprintf(stderr, "AOT fastmem window down: %s\n", fm.c_str());
+    NOTICE_LOG_FMT(CORE, "AOT fastmem window down: {}", fm);
+  }
+  aot_fast_mem.base = nullptr;
+  aot_fastmem_window_destroy();
   s_track_fallbacks = false;
   aot_stats_enabled = s_track_fallbacks ? 1 : 0;
   s_fallback_counts.clear();
@@ -629,6 +686,11 @@ void aot_log_fallback_stats(int top_n)
                  s_stat_mtmsr, dmtmsr, s_stat_idle, didle, gp, dgp);
   if (const std::string rso = AotImageTracker::RsoStatsLine(); !rso.empty())
     NOTICE_LOG_FMT(CORE, "AOTSTAT {}", rso);
+  if (const std::string fm = FastmemStatsLine(); !fm.empty())
+  {
+    static u64 last_fm = 0;
+    NOTICE_LOG_FMT(CORE, "AOTSTAT {} dfm_fault={}", fm, delta(aot_fastmem_fault_total(), last_fm));
+  }
 
   const size_t limit = std::min<size_t>(sorted.size(), top_n > 0 ? size_t(top_n) : 0);
   for (size_t i = 0; i < limit; i++)
@@ -658,8 +720,9 @@ void aot_log_fallback_stats(int top_n)
 // 0 with each tracking session; callers must treat a decrease as a reset.
 // Fills up to max_count of: [0] interpreter fallbacks (single-steps), [1] guard
 // checks, [2] guard memo reuses, [3] aot_idle calls, [4] rfi, [5] mtmsr,
-// [6] gather-pipe helper stores. Returns the number written. All stay 0 unless
-// fallback tracking is on (aot_enable_fallback_tracking).
+// [6] gather-pipe helper stores, [7] fastmem window faults (fastmem1; counted
+// whether or not tracking is on). Returns the number written. [0]-[6] stay 0
+// unless fallback tracking is on (aot_enable_fallback_tracking).
 int aot_get_counters(uint64_t* out, int max_count)
 {
   const uint64_t v[] = {s_fallback_total.load(std::memory_order_relaxed),
@@ -668,7 +731,8 @@ int aot_get_counters(uint64_t* out, int max_count)
                         s_stat_idle,
                         s_stat_rfi,
                         s_stat_mtmsr,
-                        s_stat_gp_store + s_stat_gp_psq};
+                        s_stat_gp_store + s_stat_gp_psq,
+                        aot_fastmem_fault_total()};
   const int n = std::min<int>(max_count, static_cast<int>(std::size(v)));
   for (int i = 0; i < n; i++)
     out[i] = v[i];
@@ -707,6 +771,8 @@ void aot_dump_fallback_stats()
   fmt::print(stderr, "Unique PCs: {}\n", sorted.size());
   if (const std::string rso = AotImageTracker::RsoStatsLine(); !rso.empty())
     fmt::print(stderr, "{}\n", rso);
+  if (const std::string fm = FastmemStatsLine(); !fm.empty())
+    fmt::print(stderr, "Fastmem window: {}\n", fm);
   fmt::print(stderr, "\n");
 
   const size_t limit = std::min<size_t>(sorted.size(), 50);

@@ -346,7 +346,11 @@ static void CpuThread(Core::System& system, const std::optional<std::string>& sa
   system.GetPerfMetrics().Reset();
 
   // The JIT need to be able to intercept faults, both for fastmem and for the BLR optimization.
-  const bool exception_handler = EMM::IsExceptionHandlerSupported();
+  // The AOT core has no JIT to hand faults to; its fastmem window (AotFastmem.cpp) handles its
+  // own faults with a signal handler on the faulting thread, and on Apple a thread exception
+  // port that declines every fault would cost ~150 us per fault before that signal arrives.
+  const bool exception_handler = EMM::IsExceptionHandlerSupported() &&
+                                 Config::Get(Config::MAIN_CPU_CORE) != PowerPC::CPUCore::AOT;
   if (exception_handler)
     EMM::InstallExceptionHandler();
 

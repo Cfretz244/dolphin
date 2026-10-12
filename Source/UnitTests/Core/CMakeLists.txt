@@ -46,6 +46,7 @@ endif()
 
 target_sources(PowerPCTest PRIVATE
   PowerPC/AotCodeGuardTest.cpp
+  PowerPC/AotFastmemDecodeTest.cpp
   PowerPC/AotFpFastPathTest.cpp
   PowerPC/AotFpFastPathFprfOffTest.cpp
   PowerPC/TestValues.h

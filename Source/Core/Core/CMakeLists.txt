@@ -879,6 +879,8 @@ if(ALL_AOT_LIBS)
     PowerPC/AOT/AOTCore.cpp
     PowerPC/AOT/AOTCore.h
     PowerPC/AOT/AotEmbedding.h
+    PowerPC/AOT/AotFastmem.cpp
+    PowerPC/AOT/AotFastmem.h
     PowerPC/AOT/AotImageTracker.cpp
     PowerPC/AOT/AotImageTracker.h
     PowerPC/AOT/AotModuleTracker.cpp

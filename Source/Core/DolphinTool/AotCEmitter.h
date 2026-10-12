@@ -62,8 +62,14 @@ struct ModuleMode
 // paths (default), "0" = JIT parity (the fast paths skip FPRF/FI/FR). Any other
 // value is a fatal error (exits).
 int AotFprfMode();
+// AOT_FASTMEM translate mode (fastmem1, 2026-10-12; see aot_runtime.h `_fmw`).
+// Environment AOT_FASTMEM unset or "0" = the `_fm` range-verdict memory helpers
+// (default), "1" = the `_fmw` window helpers (one host load/store per guest
+// access; the library registers AOT_GAME_FLAG_FASTMEM and needs the runtime's
+// fastmem window). Any other value is a fatal error (exits).
+int AotFastmemMode();
 // The extra C flags every compile of the generated code must use
-// ("-DAOT_FPRF=<n>"): baked into build.sh and written to <dir>/aot_flags.txt,
+// ("-DAOT_FPRF=<n> -DAOT_FASTMEM=<m>"): baked into build.sh and written to <dir>/aot_flags.txt,
 // which build-aot-ios.sh and build_vtx.sh append to their flags.
 std::string AotExtraCFlags();
 void WriteAotFlagsFile(const std::string& dir);
@@ -270,6 +276,11 @@ private:
   {
     return m_real_mode ? "(AotFastMem){.dbat=aot_fast_mem.dbat}" : "aot_fast_mem";
   }
+  // Suffix of the integer/float memory helpers: "_fmw" (fastmem window) under
+  // AOT_FASTMEM=1 except in real-mode images (physical addresses, no window),
+  // "_fm" otherwise.
+  bool m_fastmem = false;
+  const char* MemSuffix() const { return m_fastmem && !m_real_mode ? "_fmw" : "_fm"; }
   u32 m_guarded_inline_end = 0;
   const PPCMemoryImage& m_memory;
   std::set<u32> m_known_blocks;

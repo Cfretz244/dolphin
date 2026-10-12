@@ -108,6 +108,15 @@ typedef struct {
        `(addr >> 28) == 0xE && addr + 8 <= 0xE0000000 + l1_size`, in one
        compare (0 = no L1 buffer: never). Set by aot_init_fast_mem. */
     uint32_t l1_lim;
+    /* fastmem1 (2026-10-12): base of the runtime's private 4 GiB guest window
+       (AotFastmem.cpp), NULL = none. MEM1 is mapped at +0x80000000 and
+       +0xC0000000, MEM2 at +0x90000000 and +0xD0000000 (Wii), the locked L1
+       at +0xE0000000 -- the same accept set as aot_fm_resolve -- and
+       everything else is PROT_NONE: an access there faults and the runtime's
+       signal handler emulates it through the aot_*_slow helpers, then resumes
+       after the faulting instruction. Used only by the `_fmw` helpers below,
+       which only libraries translated with AOT_FASTMEM=1 emit. */
+    uint8_t* base;
 } AotFastMem;
 extern AotFastMem aot_fast_mem;  // filled by aot_init_fast_mem() before any block runs
 
@@ -513,6 +522,116 @@ static inline __attribute__((always_inline)) void aot_write_u64_fm(AOTState* s, 
     aot_write_u64_gp(s, val, addr);
 }
 
+// ----------------------------------------------------------------------------
+// `_fmw` memory helpers (fastmem1, translate-time AOT_FASTMEM=1).
+//
+// A guest access is ONE host load/store into the runtime's 4 GiB window
+// (AotFastMem.base, see above): `base + (uint64_t)(uint32_t)ea` can never leave
+// the window, so RAM, MEM2 and the locked L1 need no range test at all, and any
+// other address (MMIO, EFB, low memory, unmapped) faults. The fault handler
+// (AotFastmem.cpp) recognises exactly the eight instruction forms below
+// (register offset, `uxtw`, no shift: ldrb/ldrh/ldr w/ldr x, strb/strh/str w/
+// str x), performs the access with the matching aot_*_slow helper -- which is
+// what the range miss of the `_fm` helpers calls today -- writes a load's raw
+// big-endian value into the destination register and resumes at the next
+// instruction. A DSI the helper raises is observed at the next block edge,
+// exactly as on the `_fm` slow path.
+//
+// Inline asm, not volatile C: (a) it pins the instruction form the handler
+// decodes (no ldp/ldur/immediate forms), (b) its "memory" clobber is the
+// compiler barrier the handler needs -- a faulting access may write AOTState
+// (exceptions, DAR/DSISR, the gather pipe) or any emulator memory, so nothing
+// may be cached in registers across it. Locals whose address never escapes
+// (the superblock register cache, the aot_fm copy) are unaffected.
+//
+// Loads and stores keep an MMIO page test inline (one shift + compare):
+// 0xCC000000-0xCDFFFFFF (GC MMIO + write-gather pipe + Hollywood) goes straight
+// to the slow helper (loads) or to the same noinline aot_write_*_gp helpers as
+// the `_fm` stores (the pipe sees millions of stores a second and must stay off
+// the fault path); everything else is one plain load/store. The first version
+// let MMIO loads fault: MP2 then polled MMIO at ~18k faults/s (~13% of the CPU
+// thread at ~7 us per fault) and the MP1/MP3 shutdown paths busy-poll an MMIO
+// register at ~3% speed. EFB peeks (0xC8), low memory and unmapped addresses
+// still fault.
+//
+// Real-mode images never use these (their blocks run with physical addresses).
+// ----------------------------------------------------------------------------
+#define AOT_FMW_IS_IO(ea) (((ea) >> 25) == (0xCC000000u >> 25))
+#if defined(__aarch64__)
+#define AOT_FMW_LD(name, T, insn, r)                                                   \
+    static inline __attribute__((always_inline)) T name(const uint8_t* base, uint32_t ea) { \
+        T v;                                                                            \
+        __asm__ volatile(insn " %" r "0, [%1, %w2, uxtw]" : "=r"(v) : "r"(base), "r"(ea) : "memory"); \
+        return v;                                                                       \
+    }
+#define AOT_FMW_ST(name, T, insn, r)                                                   \
+    static inline __attribute__((always_inline)) void name(uint8_t* base, T v, uint32_t ea) { \
+        __asm__ volatile(insn " %" r "0, [%1, %w2, uxtw]" : : "r"(v), "r"(base), "r"(ea) : "memory"); \
+    }
+AOT_FMW_LD(aot_fmw_ld8, uint32_t, "ldrb", "w")
+AOT_FMW_LD(aot_fmw_ld16, uint32_t, "ldrh", "w")
+AOT_FMW_LD(aot_fmw_ld32, uint32_t, "ldr", "w")
+AOT_FMW_LD(aot_fmw_ld64, uint64_t, "ldr", "x")
+AOT_FMW_ST(aot_fmw_st8, uint32_t, "strb", "w")
+AOT_FMW_ST(aot_fmw_st16, uint32_t, "strh", "w")
+AOT_FMW_ST(aot_fmw_st32, uint32_t, "str", "w")
+AOT_FMW_ST(aot_fmw_st64, uint64_t, "str", "x")
+#undef AOT_FMW_LD
+#undef AOT_FMW_ST
+
+static inline __attribute__((always_inline)) uint32_t aot_read_u8_fmw(AOTState* s, const AotFastMem* fm, uint32_t ea) {
+    if (__builtin_expect(AOT_FMW_IS_IO(ea), 0)) return aot_read_u8_slow(s, ea);
+    return aot_fmw_ld8(fm->base, ea);
+}
+static inline __attribute__((always_inline)) uint32_t aot_read_u16_fmw(AOTState* s, const AotFastMem* fm, uint32_t ea) {
+    if (__builtin_expect(AOT_FMW_IS_IO(ea), 0)) return aot_read_u16_slow(s, ea);
+    return __builtin_bswap16((uint16_t)aot_fmw_ld16(fm->base, ea));
+}
+static inline __attribute__((always_inline)) uint32_t aot_read_u16_se_fmw(AOTState* s, const AotFastMem* fm, uint32_t ea) {
+    return (uint32_t)(int32_t)(int16_t)aot_read_u16_fmw(s, fm, ea);
+}
+static inline __attribute__((always_inline)) uint32_t aot_read_u32_fmw(AOTState* s, const AotFastMem* fm, uint32_t ea) {
+    if (__builtin_expect(AOT_FMW_IS_IO(ea), 0)) return aot_read_u32_slow(s, ea);
+    return __builtin_bswap32(aot_fmw_ld32(fm->base, ea));
+}
+static inline __attribute__((always_inline)) uint64_t aot_read_u64_fmw(AOTState* s, const AotFastMem* fm, uint32_t ea) {
+    if (__builtin_expect(AOT_FMW_IS_IO(ea), 0)) return aot_read_u64_slow(s, ea);
+    return __builtin_bswap64(aot_fmw_ld64(fm->base, ea));
+}
+static inline __attribute__((always_inline)) void aot_write_u8_fmw(AOTState* s, const AotFastMem* fm, uint32_t val, uint32_t ea) {
+    if (__builtin_expect(AOT_FMW_IS_IO(ea), 0)) { aot_write_u8_gp(s, val, ea); return; }
+    aot_fmw_st8(fm->base, val, ea);
+}
+static inline __attribute__((always_inline)) void aot_write_u16_fmw(AOTState* s, const AotFastMem* fm, uint32_t val, uint32_t ea) {
+    if (__builtin_expect(AOT_FMW_IS_IO(ea), 0)) { aot_write_u16_gp(s, val, ea); return; }
+    aot_fmw_st16(fm->base, __builtin_bswap16((uint16_t)val), ea);
+}
+static inline __attribute__((always_inline)) void aot_write_u16_br_fmw(AOTState* s, const AotFastMem* fm, uint32_t val, uint32_t ea) {
+    if (__builtin_expect(AOT_FMW_IS_IO(ea), 0)) { aot_write_u16_br_slow(s, val, ea); return; }
+    aot_fmw_st16(fm->base, val & 0xFFFFu, ea);  /* no swap -- byte-reversed store */
+}
+static inline __attribute__((always_inline)) void aot_write_u32_fmw(AOTState* s, const AotFastMem* fm, uint32_t val, uint32_t ea) {
+    if (__builtin_expect(AOT_FMW_IS_IO(ea), 0)) { aot_write_u32_gp(s, val, ea); return; }
+    aot_fmw_st32(fm->base, __builtin_bswap32(val), ea);
+}
+static inline __attribute__((always_inline)) void aot_write_u64_fmw(AOTState* s, const AotFastMem* fm, uint64_t val, uint32_t ea) {
+    if (__builtin_expect(AOT_FMW_IS_IO(ea), 0)) { aot_write_u64_gp(s, val, ea); return; }
+    aot_fmw_st64(fm->base, __builtin_bswap64(val), ea);
+}
+#else
+/* No fastmem window off arm64: the `_fmw` names are the `_fm` helpers. */
+#define aot_read_u8_fmw aot_read_u8_fm
+#define aot_read_u16_fmw aot_read_u16_fm
+#define aot_read_u16_se_fmw aot_read_u16_se_fm
+#define aot_read_u32_fmw aot_read_u32_fm
+#define aot_read_u64_fmw aot_read_u64_fm
+#define aot_write_u8_fmw aot_write_u8_fm
+#define aot_write_u16_fmw aot_write_u16_fm
+#define aot_write_u16_br_fmw aot_write_u16_br_fm
+#define aot_write_u32_fmw aot_write_u32_fm
+#define aot_write_u64_fmw aot_write_u64_fm
+#endif
+
 // ============================================================================
 // Registration — each game's dispatch.c registers itself from an
 // __attribute__((constructor)) before main(). The abi_version argument is
@@ -566,6 +685,13 @@ extern void aot_register_block_sizes(const char* game_id, const AotBlockSize* bl
  * pre-existing libraries that never call this must keep registering (they get
  * a cannot-verify warning instead of the hard gate). */
 extern void aot_register_game_image(const char* game_id, const char* dol_sha256_hex);
+/* Per-library requirements (fastmem1; additive like aot_register_game_image,
+ * no AOT_ABI_VERSION bump). AOT_GAME_FLAG_FASTMEM: the blocks use the `_fmw`
+ * helpers, so the runtime must set up its fastmem window (AotFastMem.base)
+ * before any block runs, or refuse to run the library. Emitted only by
+ * translations with AOT_FASTMEM=1; libraries that never call it need nothing. */
+#define AOT_GAME_FLAG_FASTMEM 1u
+extern void aot_register_game_flags(const char* game_id, uint32_t flags);
 
 // Runtime helpers (implemented in the Dolphin runtime harness)
 extern void aot_interpreter_single_step(AOTState* s);

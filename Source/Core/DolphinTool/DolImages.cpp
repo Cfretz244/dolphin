@@ -761,8 +761,13 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
         "__attribute__((constructor)) static void register_images(void) {{\n"
         "  aot_register_game(\"{}\",{}_dispatch,{}_lookup_block,AOT_ABI_VERSION);\n"
         "  aot_register_game_image(\"{}\",\"{}\");\n"
+        "{}"
         "  aot_register_image_block_sizes(\"{}\",image_block_size);\n}}\n",
-        prefix, prefix, prefix, prefix, boot_hash, prefix);
+        prefix, prefix, prefix, prefix, boot_hash,
+        AotFastmemMode() ?
+            fmt::format("  aot_register_game_flags(\"{}\",AOT_GAME_FLAG_FASTMEM);\n", prefix) :
+            std::string(),
+        prefix);
     dispatch.close();
     auto script = Output(output + "/build.sh");
     script << "#!/bin/bash\nset -euo pipefail\ncd \"$(dirname \"$0\")\"\n";
@@ -1946,6 +1951,8 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
           "    aot_register_game(\"{}\", {}_dispatch, {}_lookup_block, AOT_ABI_VERSION);\n",
           prefix, prefix, prefix);
       file << fmt::format("    aot_register_game_image(\"{}\", \"{}\");\n", prefix, boot_hash);
+      if (AotFastmemMode())
+        file << fmt::format("    aot_register_game_flags(\"{}\", AOT_GAME_FLAG_FASTMEM);\n", prefix);
       file << fmt::format(
           "    aot_register_game_images(\"{}\", {}_images, {}u, AOT_IMAGES_VERSION);\n", prefix,
           prefix, outs.size());

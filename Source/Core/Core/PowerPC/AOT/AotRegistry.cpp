@@ -83,6 +83,16 @@ void AotRegistry::RegisterImageHash(const std::string& game_id, const char* dol_
   entry.dol_sha256 = dol_sha256_hex != nullptr ? dol_sha256_hex : "";
 }
 
+void AotRegistry::RegisterFlags(const std::string& game_id, uint32_t flags)
+{
+  if (IsRejected(game_id))
+    return;
+  auto& entry = m_games[game_id];
+  if (entry.game_id.empty())
+    entry.game_id = game_id;
+  entry.flags |= flags;
+}
+
 std::optional<AotGameEntry> AotRegistry::Find(const std::string& game_id) const
 {
   auto it = m_games.find(game_id);
@@ -122,6 +132,11 @@ extern "C" void aot_register_block_sizes(const char* game_id, const AotBlockSize
 extern "C" void aot_register_game_image(const char* game_id, const char* dol_sha256_hex)
 {
   AotRegistry::Instance().RegisterImageHash(game_id, dol_sha256_hex);
+}
+
+extern "C" void aot_register_game_flags(const char* game_id, uint32_t flags)
+{
+  AotRegistry::Instance().RegisterFlags(game_id, flags);
 }
 
 void AotRegistry::RegisterImageBlockSizes(const std::string& game_id, uint32_t (*lookup)(uint32_t))

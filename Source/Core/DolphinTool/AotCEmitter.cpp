@@ -45,9 +45,20 @@ int AotFprfMode()
   std::exit(EXIT_FAILURE);
 }
 
+int AotFastmemMode()
+{
+  const char* v = std::getenv("AOT_FASTMEM");
+  if (!v || std::strcmp(v, "0") == 0)
+    return 0;
+  if (std::strcmp(v, "1") == 0)
+    return 1;
+  fmt::println(stderr, "Error: AOT_FASTMEM must be unset, 0 or 1 (got '{}')", v);
+  std::exit(EXIT_FAILURE);
+}
+
 std::string AotExtraCFlags()
 {
-  return fmt::format("-DAOT_FPRF={}", AotFprfMode());
+  return fmt::format("-DAOT_FPRF={} -DAOT_FASTMEM={}", AotFprfMode(), AotFastmemMode());
 }
 
 void WriteAotFlagsFile(const std::string& dir)
@@ -63,6 +74,9 @@ void WriteAotFlagsFile(const std::string& dir)
   std::fclose(f);
   fmt::println(stderr, "  FPSCR status (AOT_FPRF): {} ({})", AotFprfMode(),
                AotFprfMode() ? "exact" : "JIT parity: fast paths skip FPRF/FI/FR");
+  fmt::println(stderr, "  Memory ops (AOT_FASTMEM): {} ({})", AotFastmemMode(),
+               AotFastmemMode() ? "fastmem window, _fmw helpers; needs the runtime window" :
+                                  "_fm range-verdict helpers");
 }
 
 AOTCEmitter::AOTCEmitter(const PPCMemoryImage& memory, std::set<u32> known_blocks,
@@ -71,6 +85,7 @@ AOTCEmitter::AOTCEmitter(const PPCMemoryImage& memory, std::set<u32> known_block
 {
   m_superblocks = std::getenv("AOT_NO_SUPERBLOCKS") == nullptr;
   m_fprf_exact = AotFprfMode() != 0;
+  m_fastmem = AotFastmemMode() != 0;
 }
 
 void AOTCEmitter::SetModuleMode(const ModuleMode* mode, std::set<u32> module_blocks)
@@ -320,7 +335,8 @@ SbHelperKind ClassifyHelper(const std::string& name, bool psq_protocol_segment)
     return SbHelperKind::Barrier;
   // Memory helpers take values; FP/PS helpers only touch ps[]/fpscr (their
   // interpreter instructions are built with Rc=0, so no CR1 update).
-  if (EndsWith(name, "_fm") || name.starts_with("aot_f") || name.starts_with("aot_ps_"))
+  if (EndsWith(name, "_fm") || EndsWith(name, "_fmw") || name.starts_with("aot_f") ||
+      name.starts_with("aot_ps_"))
     return SbHelperKind::Safe;
   return SbHelperKind::Barrier;
 }
@@ -399,7 +415,7 @@ SbFpKind ClassifyFpHelper(const std::string& name, bool bracketed_segment)
     return SbFpKind::Mtfsf;
   if (name == "aot_mtfsfi" || name == "aot_mcrfs")
     return SbFpKind::Fpscr;
-  if (none.contains(name) || EndsWith(name, "_fm") ||
+  if (none.contains(name) || EndsWith(name, "_fm") || EndsWith(name, "_fmw") ||
       (EndsWith(name, "_v") && !name.starts_with("aot_psq")) || name == "aot_psq_l_try_v" ||
       name == "aot_psq_st_try_v")
     return SbFpKind::None;
@@ -1805,11 +1821,11 @@ bool AOTCEmitter::EmitTable31(std::string& out, UGeckoInstruction inst, u32 pc)
   case 983:
     EmitFpuCheck(out, pc);
     if (I(inst.RA))
-      out += fmt::format("    aot_write_u32_fm(s,&aot_fm,(uint32_t)s->ps[{}].ps0,s->gpr[{}]+s->gpr[{}]);\n",
-                         I(inst.RS), I(inst.RA), I(inst.RB));
+      out += fmt::format("    aot_write_u32{}(s,&aot_fm,(uint32_t)s->ps[{}].ps0,s->gpr[{}]+s->gpr[{}]);\n",
+                         MemSuffix(), I(inst.RS), I(inst.RA), I(inst.RB));
     else
-      out += fmt::format("    aot_write_u32_fm(s,&aot_fm,(uint32_t)s->ps[{}].ps0,s->gpr[{}]);\n",
-                         I(inst.RS), I(inst.RB));
+      out += fmt::format("    aot_write_u32{}(s,&aot_fm,(uint32_t)s->ps[{}].ps0,s->gpr[{}]);\n",
+                         MemSuffix(), I(inst.RS), I(inst.RB));
     return true;
   default:  return false;
   }
@@ -2316,7 +2332,7 @@ void AOTCEmitter::EmitLoadInt(std::string& out, UGeckoInstruction inst, const ch
     else
       out += fmt::format("        uint32_t ea=(uint32_t){};\n", DispExpr(offset));
   }
-  out += fmt::format("        uint32_t val={}_fm(s,&aot_fm,ea);\n", helper);
+  out += fmt::format("        uint32_t val={}{}(s,&aot_fm,ea);\n", helper, MemSuffix());
   out += fmt::format("        s->gpr[{}]=val;\n", rd);
   if (update && ra)
     out += fmt::format("        s->gpr[{}]=ea;\n", ra);
@@ -2344,7 +2360,7 @@ void AOTCEmitter::EmitStoreInt(std::string& out, UGeckoInstruction inst, const c
     else
       out += fmt::format("        uint32_t ea=(uint32_t){};\n", DispExpr(offset));
   }
-  out += fmt::format("        {}_fm(s,&aot_fm,s->gpr[{}],ea);\n", helper, rs);
+  out += fmt::format("        {}{}(s,&aot_fm,s->gpr[{}],ea);\n", helper, MemSuffix(), rs);
   if (update && ra)
     out += fmt::format("        s->gpr[{}]=ea;\n", ra);
   out += "    }\n";
@@ -2364,6 +2380,14 @@ void AOTCEmitter::EmitLmw(std::string& out, UGeckoInstruction inst)
   // loads. Falls back to the per-word helper for anything else.
   // AOT_ASSUME_SEPARATE: the span is guest RAM, never the AOTState (see the
   // `_fm` helpers in aot_runtime.h), so clang may keep state in registers.
+  if (m_fastmem && !m_real_mode)
+  {
+    // Fastmem window: one load per word, no range checks (a word that faults
+    // takes the slow helper, exactly as the per-word `_fm` fallback loop did).
+    out += fmt::format("        for(int r={};r<32;r++,ea+=4) s->gpr[r]=aot_read_u32_fmw(s,&aot_fm,ea);\n", rd);
+    out += "    }\n";
+    return;
+  }
   const u32 count = 32 - rd;
   out += fmt::format("        uint8_t* p=aot_host_ptr_fm(&aot_fm,ea); uint8_t* q=aot_host_ptr_fm(&aot_fm,ea+{}u);\n",
                      (count - 1) * 4);
@@ -2386,6 +2410,12 @@ void AOTCEmitter::EmitStmw(std::string& out, UGeckoInstruction inst)
     out += fmt::format("        uint32_t ea=s->gpr[{}]+{};\n", ra, DispExpr(offset));
   else
     out += fmt::format("        uint32_t ea=(uint32_t){};\n", DispExpr(offset));
+  if (m_fastmem && !m_real_mode)
+  {
+    out += fmt::format("        for(int r={};r<32;r++,ea+=4) aot_write_u32_fmw(s,&aot_fm,s->gpr[r],ea);\n", rs);
+    out += "    }\n";
+    return;
+  }
   const u32 count = 32 - rs;
   out += fmt::format("        uint8_t* p=aot_host_ptr_fm(&aot_fm,ea); uint8_t* q=aot_host_ptr_fm(&aot_fm,ea+{}u);\n",
                      (count - 1) * 4);
@@ -2419,7 +2449,7 @@ void AOTCEmitter::EmitLfs(std::string& out, UGeckoInstruction inst, bool update,
     out += fmt::format("        uint32_t ea={}+{};\n",
                        ra ? fmt::format("s->gpr[{}]", ra) : "0", DispExpr(offset));
   }
-  out += "        uint32_t raw=aot_read_u32_fm(s,&aot_fm,ea);\n";
+  out += fmt::format("        uint32_t raw=aot_read_u32{}(s,&aot_fm,ea);\n", MemSuffix());
   out += fmt::format("        uint64_t dv=aot_convert_to_double_fast(raw); "
                      "s->ps[{}].ps0=dv; s->ps[{}].ps1=dv;\n", fd, fd);
   if (update && ra)
@@ -2491,7 +2521,7 @@ void AOTCEmitter::EmitLfd(std::string& out, UGeckoInstruction inst, bool update,
     out += fmt::format("        uint32_t ea={}+{};\n",
                        ra ? fmt::format("s->gpr[{}]", ra) : "0", DispExpr(offset));
   }
-  out += fmt::format("        s->ps[{}].ps0=aot_read_u64_fm(s,&aot_fm,ea);\n", fd);
+  out += fmt::format("        s->ps[{}].ps0=aot_read_u64{}(s,&aot_fm,ea);\n", fd, MemSuffix());
   if (update && ra)
     out += fmt::format("        s->gpr[{}]=ea;\n", ra);
   out += "    }\n";
@@ -2513,7 +2543,8 @@ void AOTCEmitter::EmitStfs(std::string& out, UGeckoInstruction inst, bool update
     out += fmt::format("        uint32_t ea={}+{};\n",
                        ra ? fmt::format("s->gpr[{}]", ra) : "0", DispExpr(offset));
   }
-  out += fmt::format("        aot_write_u32_fm(s,&aot_fm,aot_convert_to_single_fast(s->ps[{}].ps0),ea);\n", fs);
+  out += fmt::format("        aot_write_u32{}(s,&aot_fm,aot_convert_to_single_fast(s->ps[{}].ps0),ea);\n",
+                     MemSuffix(), fs);
   if (update && ra)
     out += fmt::format("        s->gpr[{}]=ea;\n", ra);
   out += "    }\n";
@@ -2535,7 +2566,7 @@ void AOTCEmitter::EmitStfd(std::string& out, UGeckoInstruction inst, bool update
     out += fmt::format("        uint32_t ea={}+{};\n",
                        ra ? fmt::format("s->gpr[{}]", ra) : "0", DispExpr(offset));
   }
-  out += fmt::format("        aot_write_u64_fm(s,&aot_fm,s->ps[{}].ps0,ea);\n", fs);
+  out += fmt::format("        aot_write_u64{}(s,&aot_fm,s->ps[{}].ps0,ea);\n", MemSuffix(), fs);
   if (update && ra)
     out += fmt::format("        s->gpr[{}]=ea;\n", ra);
   out += "    }\n";
