@@ -58,9 +58,11 @@ struct ModuleMode
 };
 
 // AOT_FPRF translate mode (fprf1, 2026-10-12; see aot_runtime.h AOT_FPRF).
-// Environment AOT_FPRF unset or "1" = exact FPSCR status bits on the FP fast
-// paths (default), "0" = JIT parity (the fast paths skip FPRF/FI/FR). Any other
-// value is a fatal error (exits).
+// Environment AOT_FPRF unset or "0" = JIT parity (the fast paths skip
+// FPRF/FI/FR; the DEFAULT since the operator's fprf1 decision, 2026-10-12),
+// "1" = exact FPSCR status bits on the FP fast paths. Any other value is a
+// fatal error (exits). The mode always reaches the compiler explicitly
+// (-DAOT_FPRF=<n> in build.sh / aot_flags.txt).
 int AotFprfMode();
 // AOT_FASTMEM translate mode (fastmem1, 2026-10-12; see aot_runtime.h `_fmw`).
 // Environment AOT_FASTMEM unset or "0" = the `_fm` range-verdict memory helpers
@@ -314,7 +316,7 @@ private:
   bool m_superblocks = true;
   // AOT_FPRF=0 (fprf1): the _v value forms do not define _fpscr (the runtime
   // skips their FPSCR status store), so they no longer mark it dirty.
-  bool m_fprf_exact = true;
+  bool m_fprf_exact = false;
   std::bitset<32> m_sb_gpr_used, m_sb_gpr_dirty;
   std::bitset<8> m_sb_cr_used, m_sb_cr_dirty;
   bool m_sb_lr_used = false, m_sb_lr_dirty = false;

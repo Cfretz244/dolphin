@@ -6,6 +6,7 @@
 #include "Core/PowerPC/AOT/AotFastmem.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -228,23 +229,25 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context)
   sigaction(sig, &old, nullptr);
 }
 
-bool InstallHandler()
+// Returns 0, or the errno of the failing sigaction.
+int InstallHandler()
 {
   if (s_handler_installed)
-    return true;
+    return 0;
   struct sigaction sa{};
   sa.sa_sigaction = &SignalHandler;
   sa.sa_flags = SA_SIGINFO;
   sigemptyset(&sa.sa_mask);
   if (sigaction(SIGBUS, &sa, &s_old_bus) != 0)
-    return false;
+    return errno ? errno : -1;
   if (sigaction(SIGSEGV, &sa, &s_old_segv) != 0)
   {
+    const int err = errno ? errno : -1;
     sigaction(SIGBUS, &s_old_bus, nullptr);
-    return false;
+    return err;
   }
   s_handler_installed = true;
-  return true;
+  return 0;
 }
 
 void UninstallHandler()
@@ -256,9 +259,48 @@ void UninstallHandler()
   s_handler_installed = false;
 }
 
+// The disposition now installed for `sig` is `old` (same handler, same
+// SA_SIGINFO-ness).
+bool DispositionIs(int sig, const struct sigaction& old)
+{
+  struct sigaction cur{};
+  if (sigaction(sig, nullptr, &cur) != 0)
+    return false;
+  return cur.sa_handler == old.sa_handler &&
+         (cur.sa_flags & SA_SIGINFO) == (old.sa_flags & SA_SIGINFO);
+}
+
+using Clock = std::chrono::steady_clock;
+double MicrosSince(Clock::time_point t0)
+{
+  return std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+}
+
+// Deallocates the window and restores the previous dispositions, recording
+// the outcome (probe teardown, and cleanup after a failed step).
+void Teardown(AotFastmemProbeResult* out)
+{
+  const auto t0 = Clock::now();
+  int kr = KERN_SUCCESS;
+  if (s_base)
+    kr = vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(s_base), kReserveSize);
+  s_base = nullptr;
+  s_state = nullptr;
+  const bool had_handler = s_handler_installed;
+  UninstallHandler();
+  const bool restored =
+      !had_handler || (DispositionIs(SIGBUS, s_old_bus) && DispositionIs(SIGSEGV, s_old_segv));
+  out->dealloc_kr = kr;
+  out->handler_restored = restored ? 1 : 0;
+  out->teardown = kr == KERN_SUCCESS && restored ? 1 : 0;
+  out->teardown_us = MicrosSince(t0);
+}
+
 // Maps [src, src+size) at base+ea (shared pages, not a copy) and checks the
-// alias both ways with a saved/restored word. Returns 1 / 0.
-int MapAlias(uint8_t* base, uint32_t ea, uint8_t* src, uint32_t size)
+// alias both ways with a saved/restored word. Returns 0 on success, else the
+// vm_remap kern_return, -2 (wrong address / no read-write) or -3 (verify
+// mismatch). *kr_out = the raw vm_remap result.
+int MapAlias(uint8_t* base, uint32_t ea, uint8_t* src, uint32_t size, int* kr_out)
 {
   vm_address_t target = reinterpret_cast<vm_address_t>(base) + ea;
   vm_prot_t cur = 0, max = 0;
@@ -266,10 +308,13 @@ int MapAlias(uint8_t* base, uint32_t ea, uint8_t* src, uint32_t size)
       vm_remap(mach_task_self(), &target, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
                mach_task_self(), reinterpret_cast<vm_address_t>(src), FALSE, &cur, &max,
                VM_INHERIT_NONE);
-  if (kr != KERN_SUCCESS || target != reinterpret_cast<vm_address_t>(base) + ea)
-    return 0;
+  *kr_out = kr;
+  if (kr != KERN_SUCCESS)
+    return kr;
+  if (target != reinterpret_cast<vm_address_t>(base) + ea)
+    return -2;
   if ((cur & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE))
-    return 0;
+    return -2;
   volatile uint32_t* orig = reinterpret_cast<volatile uint32_t*>(src + size - 4);
   volatile uint32_t* alias = reinterpret_cast<volatile uint32_t*>(base + ea + size - 4);
   const uint32_t saved = *orig;
@@ -278,7 +323,7 @@ int MapAlias(uint8_t* base, uint32_t ea, uint8_t* src, uint32_t size)
   *alias = 0x5E1A5F0Au;
   const bool back = *orig == 0x5E1A5F0Au;
   *orig = saved;
-  return fwd && back ? 1 : 0;
+  return fwd && back ? 0 : -3;
 }
 
 // Every template once, through the window's PROT_NONE low page. Uses the
@@ -329,69 +374,187 @@ int aot_fastmem_decode(uint32_t insn, AotFastmemAccess* out)
   return 1;
 }
 
-int aot_fastmem_window_create(AOTState* s, uint8_t* ram, uint32_t ram_size, uint8_t* exram,
-                              uint32_t exram_size, uint8_t* l1, uint32_t l1_size,
-                              AotFastmemInit* out)
+namespace
+{
+constexpr const char* kAliasNames[5] = {"MEM1@80", "MEM1@C0", "MEM2@90", "MEM2@D0", "L1@E0"};
+}
+
+const char* aot_fastmem_alias_name(int index)
+{
+  return index >= 0 && index < 5 ? kAliasNames[index] : "?";
+}
+
+const char* aot_fastmem_probe_step_name(const AotFastmemProbeResult* r)
+{
+  static const char* const kAliasSteps[5] = {"alias_MEM1@80", "alias_MEM1@C0", "alias_MEM2@90",
+                                             "alias_MEM2@D0", "alias_L1@E0"};
+  switch (r->failed_step)
+  {
+  case AOT_FMP_STEP_NONE:
+    return "none";
+  case AOT_FMP_STEP_ARGS:
+    return "args";
+  case AOT_FMP_STEP_RESERVE:
+    return "reserve";
+  case AOT_FMP_STEP_PROTECT:
+    return "protect";
+  case AOT_FMP_STEP_ALIAS:
+    return r->failed_alias >= 0 && r->failed_alias < 5 ? kAliasSteps[r->failed_alias] : "alias";
+  case AOT_FMP_STEP_HANDLER:
+    return "handler";
+  case AOT_FMP_STEP_SELFTEST:
+    return "selftest";
+  default:
+    return "unsupported";
+  }
+}
+
+int aot_fastmem_probe_format(const AotFastmemProbeResult* r, char* out, unsigned long out_len)
+{
+  char window[96];
+  if (r->failed_step == AOT_FMP_STEP_NONE)
+  {
+    std::snprintf(window, sizeof window, "UP");
+  }
+  else
+  {
+    const bool kr_step = r->failed_step == AOT_FMP_STEP_RESERVE ||
+                         r->failed_step == AOT_FMP_STEP_PROTECT ||
+                         (r->failed_step == AOT_FMP_STEP_ALIAS && r->failed_code >= 0);
+    if (kr_step)
+      std::snprintf(window, sizeof window, "FAIL(%s,%#x)", aot_fastmem_probe_step_name(r),
+                    static_cast<unsigned>(r->failed_code));
+    else
+      std::snprintf(window, sizeof window, "FAIL(%s,%d)", aot_fastmem_probe_step_name(r),
+                    r->failed_code);
+  }
+  int ok = 0, mapped = 0;
+  for (int a : r->init.alias)
+  {
+    mapped += a != -1;
+    ok += a == 1;
+  }
+  const char* handler = "-";
+  if (r->init.handler_installed)
+    handler = "OK";
+  else if (r->failed_step == AOT_FMP_STEP_HANDLER)
+    handler = "FAIL";
+  const char* teardown = r->teardown == 1 ? "OK" : r->teardown == 0 ? "FAIL" : "-";
+  return std::snprintf(out, out_len,
+                       "window=%s aliases=%d/%d handler=%s selftest=%d/8 fault_us=%.1f mode=%s "
+                       "teardown=%s total_us=%.0f",
+                       window, ok, mapped, handler, r->init.selftest_faults, r->init.fault_us,
+                       r->keep ? "keep" : "teardown", teardown, r->total_us);
+}
+
+int aot_fastmem_probe(AOTState* s, uint8_t* ram, uint32_t ram_size, uint8_t* exram,
+                      uint32_t exram_size, uint8_t* l1, uint32_t l1_size, int keep,
+                      AotFastmemProbeResult* out)
 {
   std::memset(out, 0, sizeof(*out));
-  for (int& a : out->alias)
+  AotFastmemInit* const init = &out->init;
+  for (int& a : init->alias)
     a = -1;
+  out->keep = keep ? 1 : 0;
+  out->failed_alias = -1;
+  out->teardown = -1;
   aot_fastmem_window_destroy();
 #if !AOT_FASTMEM_SUPPORTED
   (void)s, (void)ram, (void)ram_size, (void)exram, (void)exram_size, (void)l1, (void)l1_size;
-  std::snprintf(out->error, sizeof out->error, "unsupported platform (Apple arm64 only)");
+  out->failed_step = AOT_FMP_STEP_UNSUPPORTED;
+  std::snprintf(init->error, sizeof init->error, "unsupported platform (Apple arm64 only)");
   return 0;
 #else
-  const auto fail = [&](const char* what) {
-    std::snprintf(out->error, sizeof out->error, "%s", what);
-    if (s_base)
-      vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(s_base), kReserveSize);
-    s_base = nullptr;
-    s_state = nullptr;
-    UninstallHandler();
-    out->base = nullptr;
+  const auto t_start = Clock::now();
+  const auto fail = [&](int step, int code, const char* what) {
+    out->failed_step = step;
+    out->failed_code = code;
+    std::snprintf(init->error, sizeof init->error, "%s", what);
+    Teardown(out);
+    init->base = nullptr;
+    out->total_us = MicrosSince(t_start);
     return 0;
   };
   const vm_size_t page = vm_page_size;
   if (ram == nullptr || ram_size == 0 || ram_size % page || exram_size % page || l1_size % page)
-    return fail("guest buffer missing or not page-sized");
+    return fail(AOT_FMP_STEP_ARGS, 0, "guest buffer missing or not page-sized");
 
+  auto t = Clock::now();
   vm_address_t win = 0;
-  out->reserve_kr = vm_allocate(mach_task_self(), &win, kReserveSize, VM_FLAGS_ANYWHERE);
-  if (out->reserve_kr != KERN_SUCCESS)
-    return fail("vm_allocate(4 GiB + guard) failed");
+  init->reserve_kr = vm_allocate(mach_task_self(), &win, kReserveSize, VM_FLAGS_ANYWHERE);
+  out->reserve_us = MicrosSince(t);
+  if (init->reserve_kr != KERN_SUCCESS)
+    return fail(AOT_FMP_STEP_RESERVE, init->reserve_kr, "vm_allocate(4 GiB + guard) failed");
   s_base = reinterpret_cast<uint8_t*>(win);
-  out->protect_kr = vm_protect(mach_task_self(), win, kReserveSize, TRUE, VM_PROT_NONE);
-  if (out->protect_kr != KERN_SUCCESS)
-    return fail("vm_protect(PROT_NONE) failed");
+  out->window_addr = static_cast<uintptr_t>(win);
 
-  out->alias[0] = MapAlias(s_base, 0x80000000u, ram, ram_size);
-  out->alias[1] = MapAlias(s_base, 0xC0000000u, ram, ram_size);
-  if (exram != nullptr && exram_size != 0)
+  t = Clock::now();
+  init->protect_kr = vm_protect(mach_task_self(), win, kReserveSize, TRUE, VM_PROT_NONE);
+  out->protect_us = MicrosSince(t);
+  if (init->protect_kr != KERN_SUCCESS)
+    return fail(AOT_FMP_STEP_PROTECT, init->protect_kr, "vm_protect(PROT_NONE) failed");
+
+  struct AliasSpec
   {
-    out->alias[2] = MapAlias(s_base, 0x90000000u, exram, exram_size);
-    out->alias[3] = MapAlias(s_base, 0xD0000000u, exram, exram_size);
-  }
-  if (l1 != nullptr && l1_size != 0)
-    out->alias[4] = MapAlias(s_base, 0xE0000000u, l1, l1_size);
-  for (int a : out->alias)
+    uint32_t ea;
+    uint8_t* src;
+    uint32_t size;
+  };
+  const AliasSpec specs[5] = {{0x80000000u, ram, ram_size},
+                              {0xC0000000u, ram, ram_size},
+                              {0x90000000u, exram, exram_size},
+                              {0xD0000000u, exram, exram_size},
+                              {0xE0000000u, l1, l1_size}};
+  for (int i = 0; i < 5; i++)
   {
-    if (a == 0)
-      return fail("vm_remap alias failed or did not verify");
+    if (specs[i].src == nullptr || specs[i].size == 0)
+      continue;  // stays -1 (GC: no MEM2; no L1 buffer)
+    t = Clock::now();
+    const int code = MapAlias(s_base, specs[i].ea, specs[i].src, specs[i].size, &out->alias_kr[i]);
+    out->alias_us[i] = MicrosSince(t);
+    init->alias[i] = code == 0 ? 1 : 0;
+    if (code != 0)
+    {
+      out->failed_alias = i;
+      return fail(AOT_FMP_STEP_ALIAS, code, "vm_remap alias failed or did not verify");
+    }
   }
 
   s_state = s;
-  if (!InstallHandler())
-    return fail("sigaction(SIGBUS/SIGSEGV) failed");
-  out->handler_installed = 1;
+  t = Clock::now();
+  out->handler_errno = InstallHandler();
+  out->handler_us = MicrosSince(t);
+  if (out->handler_errno != 0)
+    return fail(AOT_FMP_STEP_HANDLER, out->handler_errno, "sigaction(SIGBUS/SIGSEGV) failed");
+  init->handler_installed = 1;
+
   s_stats = {};
-  out->selftest_ok = SelfTest(s_base, out) ? 1 : 0;
-  if (!out->selftest_ok)
-    return fail("self-test did not round-trip through the fault handler");
+  t = Clock::now();
+  init->selftest_ok = SelfTest(s_base, init) ? 1 : 0;
+  out->selftest_us = MicrosSince(t);
+  if (!init->selftest_ok)
+  {
+    return fail(AOT_FMP_STEP_SELFTEST, init->selftest_faults,
+                "self-test did not round-trip through the fault handler");
+  }
   s_stats = {};
-  out->base = s_base;
+  if (keep)
+    init->base = s_base;
+  else
+    Teardown(out);
+  out->total_us = MicrosSince(t_start);
   return 1;
 #endif
+}
+
+int aot_fastmem_window_create(AOTState* s, uint8_t* ram, uint32_t ram_size, uint8_t* exram,
+                              uint32_t exram_size, uint8_t* l1, uint32_t l1_size,
+                              AotFastmemInit* out)
+{
+  AotFastmemProbeResult r;
+  const int ok = aot_fastmem_probe(s, ram, ram_size, exram, exram_size, l1, l1_size, 1, &r);
+  *out = r.init;
+  return ok;
 }
 
 void aot_fastmem_window_destroy(void)

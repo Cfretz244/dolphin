@@ -41,6 +41,8 @@ extern "C" const int kDolphinCPUCoreAOT = static_cast<int>(PowerPC::CPUCore::AOT
 
 extern "C" void aot_init_fast_mem();
 extern "C" int aot_fastmem_session_init();
+extern "C" int aot_fastmem_session_probe();
+extern "C" int aot_fastmem_probe_requested();
 extern "C" void aot_shutdown();
 extern "C" void aot_dump_fallback_stats();
 extern "C" int aot_stats_enabled;
@@ -103,11 +105,18 @@ void AOTCore::Init()
   // aot_fast_mem.base + ea on every guest access, so it must not run without
   // the window. AOT_FASTMEM_WINDOW=1 brings the window up for any library
   // (exercises reservation, aliases and the handler; non-fastmem code never
-  // touches it).
+  // touches it) and keeps it for the session.
+  // Phase B probe (env AOT_FASTMEM_PROBE=1, or the frontend's
+  // aot_set_fastmem_probe: iOS default on): for a library that does NOT need
+  // the window, the same steps run and the window is torn down again before
+  // any block runs. A library that needs it gets the same per-step log from
+  // its init (the probe IS the init: one reservation).
   const bool fastmem_required = entry && (entry->flags & AOT_GAME_FLAG_FASTMEM) != 0;
   const char* fastmem_env = std::getenv("AOT_FASTMEM_WINDOW");
-  const bool fastmem_probe = fastmem_env && std::strcmp(fastmem_env, "1") == 0;
-  if ((fastmem_required || fastmem_probe) && !aot_fastmem_session_init() && fastmem_required)
+  const bool fastmem_window = fastmem_env && std::strcmp(fastmem_env, "1") == 0;
+  if (!fastmem_required && !fastmem_window && aot_fastmem_probe_requested())
+    aot_fastmem_session_probe();
+  if ((fastmem_required || fastmem_window) && !aot_fastmem_session_init() && fastmem_required)
   {
     ERROR_LOG_FMT(AOT, "AOTCore: the AOT library for {} needs the fastmem window, which could "
                        "not be set up -- running the interpreter for this session.",

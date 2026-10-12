@@ -66,6 +66,62 @@ typedef struct AotFastmemInit
 int aot_fastmem_window_create(AOTState* s, uint8_t* ram, uint32_t ram_size, uint8_t* exram,
                               uint32_t exram_size, uint8_t* l1, uint32_t l1_size,
                               AotFastmemInit* out);
+// fastmem probe (Phase B): the steps of aot_fastmem_window_create, each with
+// its kern_return/errno and wall time, then either keeping the window (keep=1:
+// the loaded library needs it; the probe IS the init) or tearing it down
+// again (keep=0: deallocate + restore the previous SIGBUS/SIGSEGV dispositions,
+// so a session whose library never touches the window keeps today's process
+// state). Answers on a device: can this process reserve 4 GiB + guard, do the
+// vm_remap aliases work, is the signal handler invoked and does it resume.
+enum
+{
+  AOT_FMP_STEP_NONE = 0,
+  AOT_FMP_STEP_ARGS = 1,      // guest buffers missing / not page-sized
+  AOT_FMP_STEP_RESERVE = 2,   // vm_allocate(4 GiB + guard)
+  AOT_FMP_STEP_PROTECT = 3,   // vm_protect(PROT_NONE)
+  AOT_FMP_STEP_ALIAS = 4,     // vm_remap + both-way verify (failed_alias says which)
+  AOT_FMP_STEP_HANDLER = 5,   // sigaction(SIGBUS/SIGSEGV)
+  AOT_FMP_STEP_SELFTEST = 6,  // the eight templates through the fault handler
+  AOT_FMP_STEP_UNSUPPORTED = 7
+};
+typedef struct AotFastmemProbeResult
+{
+  AotFastmemInit init;  // as aot_fastmem_window_create fills it (base NULL unless kept)
+  uintptr_t window_addr;  // where the window was reserved (0 = never), also after teardown
+  int keep;             // requested mode: 1 = keep the window, 0 = tear it down
+  int failed_step;      // AOT_FMP_STEP_* of the first failure, 0 = window came up
+  // kern_return (reserve/protect/alias), errno (handler), faults resumed
+  // (selftest). Alias failures that are not a kern_return: -2 = remapped at
+  // the wrong address or without read/write, -3 = both-way verify mismatch.
+  int failed_code;
+  int failed_alias;  // index into init.alias when failed_step == ALIAS, else -1
+  int alias_kr[5];   // vm_remap result per alias (0 also when not mapped)
+  int handler_errno;
+  double reserve_us, protect_us, alias_us[5], handler_us, selftest_us;
+  // Teardown (keep=0, or cleanup after a failure): -1 = not done (window
+  // kept), 1 = window deallocated and both previous dispositions back in
+  // place, 0 = something did not come back (dealloc_kr / handler_restored).
+  int teardown;
+  int dealloc_kr;
+  int handler_restored;
+  double teardown_us, total_us;
+} AotFastmemProbeResult;
+
+// Runs the probe (see AotFastmemProbeResult). Arguments as for
+// aot_fastmem_window_create. Returns 1 when the window came up (and, with
+// keep=0, was torn down again).
+int aot_fastmem_probe(AOTState* s, uint8_t* ram, uint32_t ram_size, uint8_t* exram,
+                      uint32_t exram_size, uint8_t* l1, uint32_t l1_size, int keep,
+                      AotFastmemProbeResult* out);
+// Step / alias names for logs ("reserve", "alias_MEM2@90", ...).
+const char* aot_fastmem_probe_step_name(const AotFastmemProbeResult* r);
+const char* aot_fastmem_alias_name(int index);
+// The one-line summary WITHOUT the "AOT fastmem probe: " prefix:
+//   window=UP|FAIL(<step>,<code>) aliases=<ok>/<mapped> handler=OK|FAIL|-
+//   selftest=<n>/8 fault_us=<f> mode=keep|teardown teardown=OK|FAIL|- total_us=<n>
+// Returns the length written (snprintf semantics).
+int aot_fastmem_probe_format(const AotFastmemProbeResult* r, char* out, unsigned long out_len);
+
 // Unmaps the window, restores the previous signal handlers. Idempotent.
 void aot_fastmem_window_destroy(void);
 uint8_t* aot_fastmem_window_base(void);

@@ -322,6 +322,14 @@ void AotHarness::Run()
   // AOT_COMPARE_EVERY_VISIT=1 restores the original compare-every-visit behavior and
   // forces full RAM each time unless AOT_COMPARE_RAM_INTERVAL overrides it.
   const bool compare_every_visit = std::getenv("AOT_COMPARE_EVERY_VISIT") != nullptr;
+  // FPSCR status bits (FPRF|FI|FR) are masked like `dolphin-tool diff --fprf-off`:
+  // libraries are translated with AOT_FPRF=0 (JIT parity) by default since
+  // fprf1. AOT_COMPARE_EXACT_FPSCR=1 compares them (AOT_FPRF=1 libraries).
+  const char* exact_fpscr = std::getenv("AOT_COMPARE_EXACT_FPSCR");
+  const bool compare_fprf_off = !(exact_fpscr && std::strcmp(exact_fpscr, "1") == 0);
+  const u32 compare_fpscr_ignore = compare_fprf_off ? kFpscrStatusMask : 0u;
+  if (compare_mode)
+    m_fprf_off = compare_fprf_off;  // LogDivergence annotates masked FPSCR diffs
   u64 compare_ram_interval = compare_every_visit ? 1 : 16;
   if (const char* iv = std::getenv("AOT_COMPARE_RAM_INTERVAL"))
     compare_ram_interval = std::max<u64>(1, std::strtoull(iv, nullptr, 10));
@@ -332,9 +340,11 @@ void AotHarness::Run()
     compare_ram_aot = static_cast<u8*>(std::malloc(shadow_size));
     fmt::print(stderr,
                "AOT_COMPARE: Active, {} block sizes loaded, {}MB RAM shadow x2, "
-               "{} visits, full-RAM every {} comparison(s)\n",
+               "{} visits, full-RAM every {} comparison(s), FPSCR status bits {}\n",
                m_block_sizes.size(), shadow_size / (1024 * 1024),
-               compare_every_visit ? "all" : "first", compare_ram_interval);
+               compare_every_visit ? "all" : "first", compare_ram_interval,
+               compare_fprf_off ? "MASKED (JIT parity; AOT_COMPARE_EXACT_FPSCR=1 compares)" :
+                                  "compared (exact)");
   }
 
   while (cpu.GetState() == CPU::State::Running)
@@ -480,7 +490,8 @@ void AotHarness::Run()
           // Now live RAM = interpreter's result
 
           // Compare registers
-          bool regs_match = CompareSnapshots(aot_result, interp_result, block_pc, nullptr);
+          bool regs_match = CompareSnapshots(aot_result, interp_result, block_pc, nullptr,
+                                             compare_fpscr_ignore);
 
           // Compare RAM (AOT result vs interpreter result, now live)
           bool ram_match = true;

@@ -911,7 +911,7 @@ static inline double aot_force_25bit(double d) {
 #define AOT_FP_V static inline __attribute__((always_inline)) int
 
 // AOT_FPRF (fprf1, 2026-10-12): FPSCR status bits on the value-form fast paths.
-// 1 (default) = exact: every fast path classifies its result and rewrites
+// 1 = exact: every fast path classifies its result and rewrites
 // FPRF (bits 12-16), clearing FI/FR where the interpreter does -- bit-identical
 // to the interpreter. 0 = JIT parity: the fast paths leave FPSCR untouched (the
 // NI read for ForceSingle stays). Dolphin's own JIT never computes these bits
@@ -927,6 +927,10 @@ static inline double aot_force_25bit(double d) {
 // aot_flags.txt), and the emitter then stops treating the value forms as
 // definitions of the _fpscr local. The diff harness compares FPSCR modulo
 // FPRF|FI|FR with `dolphin-tool diff --fprf-off`. Header-only: no ABI change.
+// Translate default: 0 since the operator's fprf1 decision (2026-10-12; env
+// AOT_FPRF=1 selects exact). Translated libraries always get an explicit
+// -DAOT_FPRF; the fallback below (1) only applies to code compiled without it
+// (Dolphin's own TUs, the exact-mode unit tests).
 #ifndef AOT_FPRF
 #define AOT_FPRF 1
 #endif

@@ -13,6 +13,8 @@
 //   AOT_COMPARE=1                per-block AOT-vs-interpreter comparison
 //   AOT_COMPARE_EVERY_VISIT=1    compare every visit, not just first per block
 //   AOT_COMPARE_RAM_INTERVAL=N   full-RAM compare every Nth comparison (default 16)
+//   AOT_COMPARE_EXACT_FPSCR=1    also compare FPSCR FPRF|FI|FR (masked by default:
+//                                AOT_FPRF=0 is the translate default since fprf1)
 //   AOT_INTERP_ONLY=1            bypass AOT blocks entirely
 //   AOT_SWITCH_AT=N              interpreter for N dispatches, then AOT
 //   AOT_LOAD_STATE=<file>        load a savestate after boot warmup

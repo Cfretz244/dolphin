@@ -15,7 +15,10 @@ up over a small RAM buffer and runs one block that does
   lwz r12,0x3000(r8)                0xCC00B000: inline MMIO test -> aot_read_u32_slow (no fault)
   blr
 and checks registers, RAM, the pipe and the handler's fault counters (exactly one
-read and one write fault), in plain and harness builds.
+read and one write fault), in plain and harness builds. Before that, the Phase B
+probe (aot_fastmem_probe keep=0) must bring the window up, pass the self-test and
+tear it down again (window gone, previous SIGBUS/SIGSEGV dispositions back), and a
+bad argument must report FAIL(args,0) without leaving anything behind.
 Usage: python3 Tools/aot/test-fastmem.py /absolute/path/to/dolphin-tool
 """
 import os
@@ -54,10 +57,12 @@ def make_dol(k):
 
 HARNESS = r'''
 #include <assert.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include "aot_images.h"
 #include "AotFastmemTest.h"
+#define STARTS(str, lit) (strncmp((str), (lit), strlen(lit)) == 0)
 extern void TSTE01_dispatch(AOTState*);
 static uint32_t words[NWORDS];
 static uint64_t generation = 1;
@@ -115,6 +120,29 @@ int main(void) {
   assert(images && image_count == 2 && flags_registered == 1);
   uint8_t* ram = 0; assert(posix_memalign((void**)&ram, 16384, 0x8000) == 0); memset(ram, 0, 0x8000);
   static AOTState s;
+  /* Phase B probe, teardown mode: up, self-test, down; dispositions restored. */
+  struct sigaction bus0, segv0, now;
+  assert(sigaction(SIGBUS, 0, &bus0) == 0 && sigaction(SIGSEGV, 0, &segv0) == 0);
+  AotFastmemProbeResult pr;
+  char line[256];
+  for (int round = 0; round < 2; round++) {
+    assert(aot_fastmem_probe(&s, ram, 0x8000, 0, 0, 0, 0, 0, &pr));
+    assert(pr.failed_step == AOT_FMP_STEP_NONE && pr.window_addr != 0 && pr.init.base == 0);
+    assert(aot_fastmem_window_base() == 0);
+    assert(pr.init.alias[0] == 1 && pr.init.alias[1] == 1 && pr.init.alias[2] == -1 && pr.init.alias[4] == -1);
+    assert(pr.init.handler_installed && pr.init.selftest_ok && pr.init.selftest_faults == 8);
+    assert(pr.teardown == 1 && pr.dealloc_kr == 0 && pr.handler_restored == 1 && !pr.keep);
+    assert(sigaction(SIGBUS, 0, &now) == 0 && now.sa_handler == bus0.sa_handler);
+    assert(sigaction(SIGSEGV, 0, &now) == 0 && now.sa_handler == segv0.sa_handler);
+    aot_fastmem_probe_format(&pr, line, sizeof line);
+    assert(STARTS(line, "window=UP aliases=2/2 handler=OK selftest=8/8 fault_us="));
+    assert(strstr(line, " mode=teardown teardown=OK total_us=") != 0);
+  }
+  /* A failed step reports itself and leaves nothing behind. */
+  assert(!aot_fastmem_probe(&s, ram, 0x1001, 0, 0, 0, 0, 0, &pr));
+  assert(pr.failed_step == AOT_FMP_STEP_ARGS && pr.window_addr == 0 && aot_fastmem_window_base() == 0);
+  aot_fastmem_probe_format(&pr, line, sizeof line);
+  assert(STARTS(line, "window=FAIL(args,0) aliases=0/0 handler=- selftest=0/8 "));
   AotFastmemInit r;
   assert(aot_fastmem_window_create(&s, ram, 0x8000, 0, 0, 0, 0, &r));
   assert(r.base && r.alias[0] == 1 && r.alias[1] == 1 && r.alias[2] == -1 && r.alias[4] == -1);
@@ -160,6 +188,7 @@ int main(void) {
   }
   aot_fastmem_window_destroy();
   assert(aot_fastmem_window_base() == 0);
+  assert(sigaction(SIGSEGV, 0, &now) == 0 && now.sa_handler == segv0.sa_handler);
   return 0;
 }
 '''
@@ -227,7 +256,7 @@ def main():
             run(str(root / 'test'))
         print('PASS: fastmem window: _fmw emission + flag registration, RAM through the window, '
               'read/write faults -> slow helpers (handler counters), inline pipe + MMIO store/load tests, '
-              '8/16/32/64-bit forms, harness and plain builds')
+              '8/16/32/64-bit forms, harness and plain builds; probe teardown restores the process state')
 
 
 if __name__ == '__main__':

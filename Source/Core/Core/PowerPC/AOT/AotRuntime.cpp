@@ -285,6 +285,14 @@ static inline const u8* StatsCodePtr(u32 pc)
 }
 
 static std::chrono::steady_clock::time_point s_fastmem_since;
+// fastmem probe (Phase B): frontend request (aot_set_fastmem_probe) -1 = not
+// set (env AOT_FASTMEM_PROBE=1 decides), 0 = off, 1 = on. iOS cannot set env
+// vars, so the bridge sets this before boot. Survives aot_shutdown.
+static int s_fastmem_probe_request = -1;
+// Summary of the last probe/init this session (no "AOT fastmem probe: "
+// prefix), empty when none ran. Written on the CPU thread during
+// AOTCore::Init, read by the frontend after the first frame.
+static char s_fastmem_probe_summary[256];
 
 // Fault counters of the window, as one log fragment (empty without a window).
 static std::string FastmemStatsLine()
@@ -318,6 +326,7 @@ AotFastMem aot_fast_mem = {nullptr, 0, nullptr, 0, nullptr, nullptr, 0, 0, nullp
 
 void aot_init_fast_mem()
 {
+  s_fastmem_probe_summary[0] = '\0';
   s_guard_memos.fill({});
   s_trusted_code_memos.fill({});
   s_guard_checks = s_guard_reuses = 0;
@@ -361,31 +370,133 @@ void aot_init_fast_mem()
   aot_fast_mem.l1_lim = (s_l1_ptr != nullptr && s_l1_size >= 8) ? s_l1_size - 7 : 0;
 }
 
-// fastmem1: the 4 GiB guest window (AotFastmem.cpp) for libraries translated
-// with AOT_FASTMEM=1 (or every session under AOT_FASTMEM_WINDOW=1, to exercise
-// the window with any library). Called by AOTCore::Init after
-// aot_init_fast_mem (needs the cached buffer pointers). Returns 1 when the
-// window is up (aot_fast_mem.base set), 0 otherwise (base stays NULL).
+// fastmem1: the 4 GiB guest window (AotFastmem.cpp). keep=1 for libraries
+// translated with AOT_FASTMEM=1 (or every session under AOT_FASTMEM_WINDOW=1):
+// the window stays up for the session (aot_fast_mem.base set). keep=0 is the
+// Phase B probe for libraries that never touch the window: same steps, then
+// torn down again (process state as before). Either way one NOTICE per step
+// plus the summary line "AOT fastmem probe: ..." (stderr too). Called by
+// AOTCore::Init after aot_init_fast_mem (needs the cached buffer pointers).
+// Returns 1 when the window came up.
+static int FastmemProbe(bool keep)
+{
+  AotFastmemProbeResult p;
+  const int ok = aot_fastmem_probe(ToAot(s_system->GetPPCState()), s_ram_ptr, s_ram_size,
+                                   s_exram_ptr, s_exram_size, s_l1_ptr, s_l1_size, keep ? 1 : 0,
+                                   &p);
+  const AotFastmemInit& r = p.init;
+  const auto step = [](const std::string& line) {
+    std::fprintf(stderr, "AOT fastmem probe step %s\n", line.c_str());
+    NOTICE_LOG_FMT(CORE, "AOT fastmem probe step {}", line);
+  };
+  // Steps not reached are not logged (the summary names the failed one).
+  const int reached = p.failed_step == AOT_FMP_STEP_NONE        ? AOT_FMP_STEP_SELFTEST :
+                      p.failed_step == AOT_FMP_STEP_UNSUPPORTED ? AOT_FMP_STEP_NONE :
+                                                                  p.failed_step;
+  if (reached >= AOT_FMP_STEP_RESERVE)
+  {
+    step(fmt::format("reserve: kr={:#x} size={:#x} addr={:#x} {:.1f}us", r.reserve_kr,
+                     0x1'0001'0000ull, p.window_addr, p.reserve_us));
+  }
+  if (reached >= AOT_FMP_STEP_PROTECT)
+    step(fmt::format("protect: kr={:#x} {:.1f}us", r.protect_kr, p.protect_us));
+  if (reached >= AOT_FMP_STEP_ALIAS)
+  {
+    for (int i = 0; i < 5; i++)
+    {
+      if (r.alias[i] == -1)
+      {
+        step(fmt::format("alias {}: not mapped (no buffer)", aot_fastmem_alias_name(i)));
+        continue;
+      }
+      step(fmt::format("alias {}: kr={:#x} verify={} {:.1f}us", aot_fastmem_alias_name(i),
+                       p.alias_kr[i], r.alias[i] == 1 ? "ok" : "FAIL", p.alias_us[i]));
+      if (p.failed_alias == i)
+        break;
+    }
+  }
+  if (reached >= AOT_FMP_STEP_HANDLER)
+    step(fmt::format("handler: errno={} {:.1f}us", p.handler_errno, p.handler_us));
+  if (reached >= AOT_FMP_STEP_SELFTEST)
+  {
+    step(fmt::format("selftest: faults={}/8 {} fault_us={:.1f} {:.1f}us", r.selftest_faults,
+                     r.selftest_ok ? "ok" : "FAIL", r.fault_us, p.selftest_us));
+  }
+  if (p.teardown == -1 && ok)
+  {
+    step("teardown: none (window kept for this session)");
+  }
+  else if (p.teardown != -1)
+  {
+    step(fmt::format("teardown: {} dealloc_kr={:#x} handler_restored={} {:.1f}us",
+                     p.teardown ? "ok" : "FAIL", p.dealloc_kr, p.handler_restored,
+                     p.teardown_us));
+  }
+  aot_fastmem_probe_format(&p, s_fastmem_probe_summary, sizeof(s_fastmem_probe_summary));
+  std::fprintf(stderr, "AOT fastmem probe: %s%s%s\n", s_fastmem_probe_summary,
+               r.error[0] ? " error: " : "", r.error);
+  NOTICE_LOG_FMT(CORE, "AOT fastmem probe: {}{}{}", s_fastmem_probe_summary,
+                 r.error[0] ? " error: " : "", r.error);
+  if (keep)
+  {
+    // The Phase A line (kept for the existing log greps).
+    const auto alias = [](int a) { return a < 0 ? "-" : a ? "ok" : "FAIL"; };
+    const std::string line = fmt::format(
+        "AOT fastmem window: {} base={} reserve_kr={:#x} protect_kr={:#x} alias MEM1@80={} "
+        "MEM1@C0={} MEM2@90={} MEM2@D0={} L1@E0={} handler={} selftest={}/8 {} "
+        "fault={:.1f}us{}{}",
+        ok ? "UP" : "FAILED", fmt::ptr(r.base), r.reserve_kr, r.protect_kr, alias(r.alias[0]),
+        alias(r.alias[1]), alias(r.alias[2]), alias(r.alias[3]), alias(r.alias[4]),
+        r.handler_installed, r.selftest_faults, r.selftest_ok ? "ok" : "FAIL", r.fault_us,
+        r.error[0] ? " error: " : "", r.error);
+    std::fprintf(stderr, "%s\n", line.c_str());
+    NOTICE_LOG_FMT(CORE, "{}", line);
+    aot_fast_mem.base = ok ? r.base : nullptr;
+    s_fastmem_since = std::chrono::steady_clock::now();
+  }
+  return ok;
+}
+
+// The window for the session (library needs it, or AOT_FASTMEM_WINDOW=1).
 int aot_fastmem_session_init()
 {
-  AotFastmemInit r;
-  const int ok =
-      aot_fastmem_window_create(ToAot(s_system->GetPPCState()), s_ram_ptr, s_ram_size,
-                                s_exram_ptr, s_exram_size, s_l1_ptr, s_l1_size, &r);
-  const auto alias = [](int a) { return a < 0 ? "-" : a ? "ok" : "FAIL"; };
-  const std::string line = fmt::format(
-      "AOT fastmem window: {} base={} reserve_kr={:#x} protect_kr={:#x} alias MEM1@80={} "
-      "MEM1@C0={} MEM2@90={} MEM2@D0={} L1@E0={} handler={} selftest={}/8 {} "
-      "fault={:.1f}us{}{}",
-      ok ? "UP" : "FAILED", fmt::ptr(r.base), r.reserve_kr, r.protect_kr, alias(r.alias[0]),
-      alias(r.alias[1]), alias(r.alias[2]), alias(r.alias[3]), alias(r.alias[4]),
-      r.handler_installed, r.selftest_faults, r.selftest_ok ? "ok" : "FAIL", r.fault_us,
-      r.error[0] ? " error: " : "", r.error);
-  std::fprintf(stderr, "%s\n", line.c_str());
-  NOTICE_LOG_FMT(CORE, "{}", line);
-  aot_fast_mem.base = ok ? r.base : nullptr;
-  s_fastmem_since = std::chrono::steady_clock::now();
-  return ok;
+  return FastmemProbe(true);
+}
+
+// The probe alone: window up, verified, torn down again (aot_fast_mem.base
+// stays NULL). For libraries that do not need the window.
+int aot_fastmem_session_probe()
+{
+  return FastmemProbe(false);
+}
+
+// Frontend switch for the probe; takes effect at the next AOTCore::Init (call
+// before boot). 1 = on, 0 = off (overrides AOT_FASTMEM_PROBE=1). Also clears
+// the previous session's summary.
+void aot_set_fastmem_probe(int enabled)
+{
+  s_fastmem_probe_request = enabled ? 1 : 0;
+  s_fastmem_probe_summary[0] = '\0';
+}
+
+// Whether AOTCore::Init should probe a library that does not need the window.
+int aot_fastmem_probe_requested()
+{
+  if (s_fastmem_probe_request != -1)
+    return s_fastmem_probe_request;
+  const char* env = std::getenv("AOT_FASTMEM_PROBE");
+  return env && std::strcmp(env, "1") == 0 ? 1 : 0;
+}
+
+// Copies the last summary (see s_fastmem_probe_summary) into out; returns its
+// length, 0 when no probe/init ran since the last aot_set_fastmem_probe /
+// aot_init_fast_mem.
+size_t aot_fastmem_probe_summary(char* out, size_t out_len)
+{
+  const size_t n = std::strlen(s_fastmem_probe_summary);
+  if (out && out_len)
+    std::snprintf(out, out_len, "%s", s_fastmem_probe_summary);
+  return n;
 }
 
 // Counterpart to aot_init_fast_mem, called from AOTCore::Shutdown. The RAM/L1

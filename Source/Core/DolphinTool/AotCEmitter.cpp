@@ -36,11 +36,12 @@ static constexpr u32 kMaxInlineTotalInsts = 192;
 
 int AotFprfMode()
 {
+  // Default 0 (JIT parity) since the fprf1 decision (operator, 2026-10-12).
   const char* v = std::getenv("AOT_FPRF");
-  if (!v || std::strcmp(v, "1") == 0)
-    return 1;
-  if (std::strcmp(v, "0") == 0)
+  if (!v || std::strcmp(v, "0") == 0)
     return 0;
+  if (std::strcmp(v, "1") == 0)
+    return 1;
   fmt::println(stderr, "Error: AOT_FPRF must be unset, 0 or 1 (got '{}')", v);
   std::exit(EXIT_FAILURE);
 }
