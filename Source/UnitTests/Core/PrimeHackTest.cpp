@@ -67,6 +67,31 @@ TEST(PrimeHackInput, ButtonsStickAndExtension)
   EXPECT_NE(state.camera_points[0].position.x, 0xffff);
 }
 
+TEST(PrimeHackInput, ExtraButtonsOneAndTwo)
+{
+  using W = WiimoteEmu::Wiimote;
+  GCPadStatus pad;
+  WiimoteEmu::DesiredWiimoteState state;
+  // Frontend extra mask (Delta: MFi options -> Wii 1) maps straight onto the Wiimote bits.
+  PrimeHack::MapPad(pad, &state, 0, 0, true,
+                    PrimeHack::EXTRA_BUTTON_ONE | PrimeHack::EXTRA_BUTTON_TWO);
+  EXPECT_EQ(state.buttons.hex, W::BUTTON_ONE | W::BUTTON_TWO);
+  PrimeHack::MapPad(pad, &state, 0, 0, true, PrimeHack::EXTRA_BUTTON_TWO);
+  EXPECT_EQ(state.buttons.hex, W::BUTTON_TWO);
+  // No extra mask: unchanged behaviour (Start alone = plus, L + Start = 1).
+  pad.button = PAD_BUTTON_START;
+  PrimeHack::MapPad(pad, &state, 0, 0, true);
+  EXPECT_EQ(state.buttons.hex, W::BUTTON_PLUS);
+  pad.button = PAD_BUTTON_START | PAD_TRIGGER_L;
+  PrimeHack::MapPad(pad, &state, 0, 0, true, 0);
+  EXPECT_EQ(state.buttons.hex, W::BUTTON_ONE);
+  // A disconnected pad releases the extra buttons as well.
+  pad.button = 0;
+  pad.isConnected = false;
+  PrimeHack::MapPad(pad, &state, 0, 0, true, PrimeHack::EXTRA_BUTTON_ONE);
+  EXPECT_EQ(state.buttons.hex, 0);
+}
+
 TEST(PrimeHackInput, DisconnectReleasesAndSensorBarOff)
 {
   GCPadStatus pad;
@@ -171,6 +196,7 @@ TEST_F(PrimeHackRuntime, ReconnectPollReadsFreshPadWithoutReports)
       {
         PrimeHack::Reset();
         Pad::ClearExternalProvider();
+        PrimeHack::ClearExtraButtonProvider();
         Pad::GetConfig()->ClearControllers();
         SConfig::Shutdown();
         Config::Shutdown();
@@ -200,6 +226,13 @@ TEST_F(PrimeHackRuntime, ReconnectPollReadsFreshPadWithoutReports)
   pad.button = 0;
   EXPECT_EQ(remote.GetCurrentlyPressedButtons().hex, 0);
   EXPECT_EQ(polls, 3);
+  u16 extra = PrimeHack::EXTRA_BUTTON_ONE;
+  PrimeHack::SetExtraButtonProvider([&] { return extra; });
+  EXPECT_EQ(remote.GetCurrentlyPressedButtons().hex, WiimoteEmu::Wiimote::BUTTON_ONE);
+  extra = 0;
+  EXPECT_EQ(remote.GetCurrentlyPressedButtons().hex, 0);
+  PrimeHack::ClearExtraButtonProvider();
+  EXPECT_EQ(polls, 5);
   // Once reports resume, the frame callback must sample a newer stick position
   // even if no further Bluetooth report has been prepared.
   Player();
@@ -211,11 +244,11 @@ TEST_F(PrimeHackRuntime, ReconnectPollReadsFreshPadWithoutReports)
   pad.substickY = 28;
   PrimeHack::Update(guard);
   EXPECT_NEAR(std::bit_cast<float>(Get(player + 0x3dc)), 0, 1e-6);
-  EXPECT_EQ(polls, 6);
+  EXPECT_EQ(polls, 8);
   PrimeHack::Reset();
   pad.button = PAD_BUTTON_A;
   EXPECT_EQ(remote.GetCurrentlyPressedButtons().hex, 0);
-  EXPECT_EQ(polls, 6);
+  EXPECT_EQ(polls, 8);
 }
 
 TEST_F(PrimeHackRuntime, PatchesInvalidateInstructionCacheAndRestore)

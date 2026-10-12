@@ -56,7 +56,15 @@ shortcut (Alt/Option + F5 by default) can also request reconnection.
 | Z | Wii minus: original visor menu |
 | Start | Wii plus: original beam menu |
 | L + Start | Wii 1: map |
+| Frontend extra button 1 / 2 | Wii 1 (map) / Wii 2 |
 | Remaining D-pad directions | Wii D-pad |
+
+Delta's default Wii mapping for MFi (standard) controllers: Options / select → Wii 1
+(map); R1 → Wii plus (beam wheel, via the GC Start cell); L1 → Wii minus (visor wheel,
+via Z). Wii 1/2 have no GameCube pad bit, so a frontend reports them through
+`PrimeHack::SetExtraButtonProvider` (mirroring `Pad::SetExternalProvider`); `MapPad`
+ORs the `EXTRA_BUTTON_ONE`/`EXTRA_BUTTON_TWO` mask into Wiimote 1. Wii 2 is unbound by
+default (MP1 does not use it).
 
 The original beam/visor wheels remain enabled. Hold minus/plus and push the
 right stick toward the desired screen quadrant, then release minus/plus. Wheel

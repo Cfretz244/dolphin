@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <functional>
 #include <mutex>
 
 #include "Common/Logging/Log.h"
@@ -35,6 +36,9 @@ constexpr auto& PATCHES = MP1_PATCHES;
 constexpr u32 STATE_MANAGER = 0x804bf420;
 std::atomic<bool> s_input_enabled{false};
 std::mutex s_input_mutex;
+// Separate from s_input_mutex: set from the frontend thread, read on the CPU thread.
+std::mutex s_extra_mutex;
+std::function<u16()> s_extra_provider;
 std::atomic<bool> s_reports_active{false};
 PointerState s_pointer;
 std::atomic<PointerMode> s_pointer_mode{PointerMode::Menu};
@@ -68,16 +72,37 @@ void WriteCode(const Core::CPUThreadGuard& guard, const Patch& patch, bool enabl
     guard.GetSystem().GetPowerPC().ScheduleInvalidateCacheThreadSafe(patch.address);
   }
 }
+
+u16 ReadExtraButtons()
+{
+  std::lock_guard lock(s_extra_mutex);
+  return s_extra_provider ? s_extra_provider() : 0;
+}
 } // namespace
 
+void SetExtraButtonProvider(std::function<u16()> provider)
+{
+  std::lock_guard lock(s_extra_mutex);
+  s_extra_provider = std::move(provider);
+}
+
+void ClearExtraButtonProvider()
+{
+  std::lock_guard lock(s_extra_mutex);
+  s_extra_provider = nullptr;
+}
+
 void MapPad(const GCPadStatus& input, WiimoteEmu::DesiredWiimoteState* state, float pointer_x,
-            float pointer_y, bool sensor_bar)
+            float pointer_y, bool sensor_bar, u16 extra_buttons)
 {
   using W = WiimoteEmu::Wiimote;
   using N = WiimoteEmu::Nunchuk;
   GCPadStatus pad = input;
   if (!pad.isConnected)
+  {
     pad = GCPadStatus{};
+    extra_buttons = 0;
+  }
   state->buttons.hex = 0;
   const auto button = [&](bool pressed, u16 mask)
   {
@@ -96,6 +121,8 @@ void MapPad(const GCPadStatus& input, WiimoteEmu::DesiredWiimoteState* state, fl
   const bool lock = pad.button & PAD_TRIGGER_L || pad.triggerLeft > 127;
   button(start && !lock, W::BUTTON_PLUS);
   button(start && lock, W::BUTTON_ONE);
+  button(extra_buttons & EXTRA_BUTTON_ONE, W::BUTTON_ONE);
+  button(extra_buttons & EXTRA_BUTTON_TWO, W::BUTTON_TWO);
   state->acceleration = WiimoteEmu::DesiredWiimoteState::DEFAULT_ACCELERATION;
   state->motion_plus.reset();
   state->camera_points = WiimoteEmu::DesiredWiimoteState::DEFAULT_CAMERA;
@@ -120,6 +147,7 @@ void PrepareInput(WiimoteEmu::DesiredWiimoteState* state, bool sensor_bar)
   if (!s_input_enabled.load() || !Pad::IsInitialized())
     return;
   const GCPadStatus pad = Pad::GetStatus(0);
+  const u16 extra = ReadExtraButtons();
   {
     // iOS bring-up diagnostics (CPU thread only).
     static u64 s_prep_calls = 0;
@@ -142,7 +170,7 @@ void PrepareInput(WiimoteEmu::DesiredWiimoteState* state, bool sensor_bar)
   if (mode != PointerMode::Menu && WheelButton(pad))
     mode = PointerMode::Wheel;
   s_pointer.Update(pad, mode);
-  MapPad(pad, state, s_pointer.x, s_pointer.y, sensor_bar);
+  MapPad(pad, state, s_pointer.x, s_pointer.y, sensor_bar, extra);
 }
 
 u16 GetCurrentlyPressedButtons()
@@ -153,11 +181,12 @@ u16 GetCurrentlyPressedButtons()
   // Bluetooth activation bypasses PrepareInput. Sampling its cached pad here would
   // prevent reconnecting, and could keep moving the camera with stale stick input.
   const GCPadStatus pad = Pad::GetStatus(0);
+  const u16 extra = ReadExtraButtons();
   std::lock_guard lock(s_input_mutex);
   s_reports_active = false;
   s_pointer = {};
   WiimoteEmu::DesiredWiimoteState state;
-  MapPad(pad, &state, 0, 0, false);
+  MapPad(pad, &state, 0, 0, false, extra);
   {
     // iOS bring-up diagnostics (CPU thread only).
     static u64 s_bt_inactive_polls = 0;
