@@ -63,7 +63,7 @@ HARNESS = r'''
 #include "aot_images.h"
 #include "AotFastmemTest.h"
 #define STARTS(str, lit) (strncmp((str), (lit), strlen(lit)) == 0)
-extern void TSTE01_dispatch(AOTState*);
+extern AOT_BLOCK_CC void TSTE01_dispatch(AOTState*);
 static uint32_t words[NWORDS];
 static uint64_t generation = 1;
 static const AotImageDesc* images; static uint32_t image_count; static uint32_t images_version;
@@ -89,8 +89,8 @@ AOTBlockFunc aot_images_lookup(uint32_t pc) {
   return idx < aot_active_image.size ? aot_active_image.table[idx] : 0;
 }
 uint32_t aot_images_block_size(uint32_t pc) { return aot_images_lookup(pc) ? NWORDS : 0; }
-void aot_interpreter_single_step(AOTState* s) { ++fallbacks; s->downcount = 0; }
-void aot_register_game(const char* id, void (*d)(AOTState*), AOTBlockFunc (*l)(uint32_t), uint32_t v) {}
+AOT_BLOCK_CC void aot_interpreter_single_step(AOTState* s) { ++fallbacks; s->downcount = 0; }
+void aot_register_game(const char* id, AOTBlockFunc d, AOTBlockFunc (*l)(uint32_t), uint32_t v) {}
 void aot_register_game_image(const char* id, const char* h) {}
 void aot_register_game_flags(const char* id, uint32_t f) { assert(f == AOT_GAME_FLAG_FASTMEM); ++flags_registered; }
 void aot_register_image_block_sizes(const char* id, uint32_t (*lookup)(uint32_t)) {}

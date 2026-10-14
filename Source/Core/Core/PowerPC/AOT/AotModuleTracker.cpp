@@ -254,7 +254,7 @@ bool LookupBlock(u32 pc, AOTBlockFunc* fn, u32* module_id, u32* section, u32* of
 }
 }  // namespace AotModuleTracker
 
-extern "C" void aot_module_dispatch(AOTState* s)
+extern "C" AOT_BLOCK_CC void aot_module_dispatch(AOTState* s)
 {
   using namespace AotModuleTracker;
   // Downcount guard mirroring <ID>_dispatch's entry check. Today every caller

@@ -469,14 +469,14 @@ int AotCommand(const std::vector<std::string>& args)
     fwd << "#include \"aot_runtime.h\"\n\n";
     fwd << fmt::format("#define {}_TABLE_BASE {:#010x}u\n", prefix, table_base);
     fwd << fmt::format("#define {}_TABLE_SIZE {}u\n", prefix, table_entries);
-    fwd << fmt::format("extern void (*{}_fast_table[])(AOTState*);\n\n", prefix);
+    fwd << fmt::format("extern AOTBlockFunc {}_fast_table[];\n\n", prefix);
     for (const auto& b : cfg_blocks)
     {
       if (b.is_translatable)
-        fwd << fmt::format("__attribute__((noinline)) void {}_block_{:08x}(AOTState* s);\n",
+        fwd << fmt::format("__attribute__((noinline)) AOT_BLOCK_CC void {}_block_{:08x}(AOTState* s);\n",
                            prefix, b.ppc_addr);
     }
-    fwd << fmt::format("__attribute__((noinline)) void {}_dispatch(AOTState* s);\n", prefix);
+    fwd << fmt::format("__attribute__((noinline)) AOT_BLOCK_CC void {}_dispatch(AOTState* s);\n", prefix);
     fwd << "#endif\n";
   }
 
@@ -721,7 +721,7 @@ int AotCommand(const std::vector<std::string>& args)
       // Forward declarations for this module's own blocks (musttail chaining).
       for (const auto& [addr, ni] : m.blocks)
       {
-        file << fmt::format("__attribute__((noinline)) void {}_s{}_{:x}(AOTState* s);\n", mp,
+        file << fmt::format("__attribute__((noinline)) AOT_BLOCK_CC void {}_s{}_{:x}(AOTState* s);\n", mp,
                             addr >> 24, addr & 0x00FFFFFF);
       }
       file << "\n";
@@ -808,7 +808,7 @@ int AotCommand(const std::vector<std::string>& args)
     file << "};\n\n";
 
     // Emit the fast dispatch function — O(1) array lookup
-    file << fmt::format("__attribute__((noinline)) void {}_dispatch(AOTState* s) {{\n", prefix);
+    file << fmt::format("__attribute__((noinline)) AOT_BLOCK_CC void {}_dispatch(AOTState* s) {{\n", prefix);
     // Single-block mode only exists in harness builds (macOS build.sh passes
     // -DAOT_HARNESS=1); production/iOS skips the global load on every dispatch.
     file << "#if AOT_HARNESS\n";

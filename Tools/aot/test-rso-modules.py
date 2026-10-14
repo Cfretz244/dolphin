@@ -195,7 +195,7 @@ def main():
 #include <assert.h>
 #include <string.h>
 #include "aot_images.h"
-extern void TSTE01_dispatch(AOTState*);
+extern AOT_BLOCK_CC void TSTE01_dispatch(AOTState*);
 static uint32_t dol[2] = {0x38600001, 0x4e800020};
 static uint64_t generation = 1;
 static const AotImageDesc* images; static uint32_t image_count;
@@ -222,17 +222,17 @@ void aot_images_rescan(void) {
 AOTBlockFunc aot_images_lookup(uint32_t pc) { return 0; }
 uint32_t aot_images_block_size(uint32_t pc) { return 0; }
 /* Stub tracker: the module is "located" at text_base with its sections after it. */
-void aot_rso_dispatch(AOTState* s) {
+AOT_BLOCK_CC void aot_rso_dispatch(AOTState* s) {
   if (s->downcount <= 0) return;
   uint32_t off = s->pc - text_base;
   if (off < rso[0].text_size && rso[0].table[off >> 2]) { rso[0].table[off >> 2](s); return; }
   ++exits; exit_pc = s->pc; s->downcount = 0;
 }
-void aot_interpreter_single_step(AOTState* s) { ++fallbacks; s->downcount = 0; }
+AOT_BLOCK_CC void aot_interpreter_single_step(AOTState* s) { ++fallbacks; s->downcount = 0; }
 AOT_SLOWPATH_CC uint32_t aot_read_u32_slow(AOTState* s, uint32_t addr) {
   ++reads; return addr == data_base ? 0x11223344u : 0xbad;
 }
-void aot_register_game(const char* id, void (*d)(AOTState*), AOTBlockFunc (*l)(uint32_t), uint32_t v) {}
+void aot_register_game(const char* id, AOTBlockFunc d, AOTBlockFunc (*l)(uint32_t), uint32_t v) {}
 void aot_register_game_image(const char* id, const char* h) {}
 void aot_register_game_flags(const char* id, uint32_t f) {}
 void aot_register_image_block_sizes(const char* id, uint32_t (*lookup)(uint32_t)) {}

@@ -55,7 +55,7 @@ struct PowerPCState;
 class AotHarness
 {
 public:
-  using DispatchFunc = void (*)(AOTState*);
+  using DispatchFunc = AOTBlockFunc;  // AOT_BLOCK_CC (preserve_none), ABI v4
 
   // Returns a harness only when a harness feature is engaged (an AOT_* env
   // switch or dolphin-tool diff's Config keys); nullptr for production runs.

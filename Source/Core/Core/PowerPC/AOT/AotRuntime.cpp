@@ -961,7 +961,7 @@ void aot_dump_fallback_stats()
 // Interpreter fallback
 // ============================================================================
 
-void aot_interpreter_single_step(AOTState* s)
+AOT_BLOCK_CC void aot_interpreter_single_step(AOTState* s)
 {
   auto& ppc_state = GetPPCState(s);
 

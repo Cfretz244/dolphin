@@ -15,7 +15,7 @@
 #include "Core/PowerPC/AOT/aot_runtime.h"
 #include "Core/PowerPC/AOT/aot_images.h"
 
-using AOTDispatchFunc = void (*)(AOTState*);
+using AOTDispatchFunc = AOTBlockFunc;  // AOT_BLOCK_CC (preserve_none), ABI v4
 using AOTLookupFunc = AOTBlockFunc (*)(uint32_t);
 
 struct AotGameEntry

@@ -1015,7 +1015,7 @@ std::string AOTCEmitter::TranslateBlock(u32 block_addr, u32 num_instructions, bo
   const char* section = from_trace ? "__TEXT,__aot_hot,regular,pure_instructions"
                                    : "__TEXT,__aot_cold,regular,pure_instructions";
   out += fmt::format("__attribute__((noinline, section(\"{}\")))"
-                     " void {}(AOTState* s) {{\n",
+                     " AOT_BLOCK_CC void {}(AOTState* s) {{\n",
                      section, own_symbol.empty() ? BlockFn(block_addr, false) : own_symbol);
 
   m_guarded_inline_end = 0;
@@ -2302,7 +2302,7 @@ void AOTCEmitter::EmitIndirectDispatch(std::string& out)
   out += "    if(s->downcount<=0){ return; }\n";
   out += fmt::format("    {{ uint32_t _idx=(s->pc-{}_TABLE_BASE)>>2;\n", m_prefix);
   out += fmt::format("    if(_idx<{}_TABLE_SIZE){{\n", m_prefix);
-  out += fmt::format("        void (*_fn)(AOTState*)={}_fast_table[_idx];\n", m_prefix);
+  out += fmt::format("        AOTBlockFunc _fn={}_fast_table[_idx];\n", m_prefix);
   out += "        if(_fn){ [[clang::musttail]] return _fn(s); }\n";
   out += "    } }\n";
   out += "#endif\n";

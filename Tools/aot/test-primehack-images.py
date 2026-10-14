@@ -92,8 +92,8 @@ int aot_match_code(uint32_t pc, const uint32_t* words, uint32_t count) {
   for(unsigned i=0;i<count;++i) if(code[(pc-0x80090000)/4+i]!=words[i]) return 0;
   return 1;
 }
-void aot_interpreter_single_step(AOTState* s) { ++fallbacks; s->downcount=0; }
-void aot_register_game(const char* id, void (*d)(AOTState*), AOTBlockFunc (*l)(uint32_t), uint32_t v) {}
+AOT_BLOCK_CC void aot_interpreter_single_step(AOTState* s) { ++fallbacks; s->downcount=0; }
+void aot_register_game(const char* id, AOTBlockFunc d, AOTBlockFunc (*l)(uint32_t), uint32_t v) {}
 void aot_register_game_image(const char* id, const char* h) {}
 void aot_register_game_flags(const char* id, uint32_t f) {}
 void aot_register_image_block_sizes(const char* id, uint32_t (*l)(uint32_t)) {}

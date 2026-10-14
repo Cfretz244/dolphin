@@ -666,7 +666,7 @@ extern "C" uint32_t aot_images_block_size(uint32_t pc)
   return 0;
 }
 
-extern "C" void aot_rso_dispatch(AOTState* s)
+extern "C" AOT_BLOCK_CC void aot_rso_dispatch(AOTState* s)
 {
   // Same entry guard as <ID>_dispatch (per-site probes can reach here).
   if (s->downcount <= 0)

@@ -68,7 +68,7 @@ def main():
 #include <assert.h>
 #include <string.h>
 #include "aot_images.h"
-extern void TSTE01_dispatch(AOTState*);
+extern AOT_BLOCK_CC void TSTE01_dispatch(AOTState*);
 extern AOTBlockFunc TSTE01_lookup_block(uint32_t);
 /* Simulated tracker: one RAM word at 0x80004000 plus the shared blr. */
 static uint32_t ram[2] = {0x38600001, 0x4e800020};
@@ -95,8 +95,8 @@ AOTBlockFunc aot_images_lookup(uint32_t pc) {
   return idx < aot_active_image.size ? aot_active_image.table[idx] : 0;
 }
 uint32_t aot_images_block_size(uint32_t pc) { return aot_images_lookup(pc) ? 2 : 0; }
-void aot_interpreter_single_step(AOTState* s) { ++fallbacks; s->downcount = 0; }
-void aot_register_game(const char* id, void (*d)(AOTState*), AOTBlockFunc (*l)(uint32_t), uint32_t v) {}
+AOT_BLOCK_CC void aot_interpreter_single_step(AOTState* s) { ++fallbacks; s->downcount = 0; }
+void aot_register_game(const char* id, AOTBlockFunc d, AOTBlockFunc (*l)(uint32_t), uint32_t v) {}
 void aot_register_game_image(const char* id, const char* h) {}
 void aot_register_game_flags(const char* id, uint32_t f) {}
 void aot_register_image_block_sizes(const char* id, uint32_t (*lookup)(uint32_t)) { block_size = lookup; }

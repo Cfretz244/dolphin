@@ -14,7 +14,7 @@
 // re-translate + rebuild every game's AOT library. AotRegistry rejects
 // libraries built against a different version (they fall back to the
 // interpreter instead of corrupting state).
-#define AOT_ABI_VERSION 3
+#define AOT_ABI_VERSION 4
 
 #include <stdint.h>
 
@@ -56,7 +56,16 @@ typedef struct AOTState {
     uint32_t spr[1024] __attribute__((aligned(8)));
 } AOTState;
 
-typedef void (*AOTBlockFunc)(AOTState*);
+// Block / dispatch calling convention (pn1, ABI v4): the musttail graph of
+// translated blocks + <ID>_dispatch + the runtime's terminal dispatchers
+// preserves no registers (s arrives in x20 and survives preserve_most slow
+// paths). Entering it from the plain-convention Run loop is a normal call.
+// Every musttail target MUST carry it: clang rejects a musttail across
+// conventions, and a mismatched declaration in another TU is a silent ABI
+// break — so every emitted declaration spells AOT_BLOCK_CC, never a bare
+// `void (*)(AOTState*)`.
+#define AOT_BLOCK_CC __attribute__((preserve_none))
+typedef AOT_BLOCK_CC void (*AOTBlockFunc)(AOTState*);
 
 // ============================================================================
 // Memory access — RAM fast path inlined into blocks; slow path (MMIO, EFB,
@@ -669,7 +678,7 @@ typedef struct AotModuleBlockSize {
     uint32_t num_instructions;
 } AotModuleBlockSize;
 
-extern void aot_register_game(const char* game_id, void (*dispatch)(AOTState*),
+extern void aot_register_game(const char* game_id, AOTBlockFunc dispatch,
                               AOTBlockFunc (*lookup)(uint32_t), uint32_t abi_version);
 extern void aot_register_game_modules(const char* game_id, const AotModuleDesc* modules,
                                       uint32_t count);
@@ -694,10 +703,10 @@ extern void aot_register_game_image(const char* game_id, const char* dol_sha256_
 extern void aot_register_game_flags(const char* game_id, uint32_t flags);
 
 // Runtime helpers (implemented in the Dolphin runtime harness)
-extern void aot_interpreter_single_step(AOTState* s);
+extern AOT_BLOCK_CC void aot_interpreter_single_step(AOTState* s);
 // Module-aware terminal dispatch — musttail-called by <ID>_dispatch when the
 // DOL fast table misses and the game has compiled REL modules.
-extern void aot_module_dispatch(AOTState* s);
+extern AOT_BLOCK_CC void aot_module_dispatch(AOTState* s);
 extern void aot_sc(AOTState* s);
 extern int aot_check_fpu(AOTState* s, uint32_t pc);
 extern void aot_rfi(AOTState* s);

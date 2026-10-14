@@ -56,7 +56,7 @@ extern "C" uint64_t aot_stat_exception_masked;
 // Init, ended by its Shutdown.
 static bool s_env_fallback_trace = false;
 
-static void interp_only_dispatch(AOTState* s)
+static AOT_BLOCK_CC void interp_only_dispatch(AOTState* s)
 {
   aot_interpreter_single_step(s);
 }

@@ -667,11 +667,11 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
     auto header = Output(output + "/" + prefix + "_images.h");
     header << "#include \"aot_runtime.h\"\nint aot_match_code(uint32_t,const uint32_t*,uint32_t);\n"
            << "int aot_match_chain(uint32_t,const uint32_t*,uint32_t);\n";
-    header << fmt::format("void {}_dispatch(AOTState*);\n", prefix);
+    header << fmt::format("AOT_BLOCK_CC void {}_dispatch(AOTState*);\n", prefix);
     for (size_t id = 0; id < images.size(); ++id)
       header << fmt::format("#define {}_d{}_dispatch {}_dispatch\n", prefix, id, prefix);
     for (const auto& b : blocks)
-      header << fmt::format("void {}(AOTState*);\nextern const uint32_t {}_words[{}];\n", b.symbol,
+      header << fmt::format("AOT_BLOCK_CC void {}(AOTState*);\nextern const uint32_t {}_words[{}];\n", b.symbol,
                             b.symbol, b.guard_count);
     header.close();
     // Chunk files fit the existing stack's *_blocks_*.c compilation convention.
@@ -751,7 +751,7 @@ bool TranslateDolImages(const DiscIO::Volume& volume, const std::string& cfg,
     dispatch << "static uint32_t image_block_size(uint32_t pc) { const Candidate* "
                 "c=find_candidate(pc); return c?c->count:0; }\n";
     dispatch << "void aot_register_image_block_sizes(const char*,uint32_t (*)(uint32_t));\n";
-    dispatch << fmt::format("void {}_dispatch(AOTState* s) {{\n", prefix);
+    dispatch << fmt::format("AOT_BLOCK_CC void {}_dispatch(AOTState* s) {{\n", prefix);
     dispatch << "#if AOT_HARNESS\n  if(aot_single_block_mode) return;\n#endif\n  "
                 "if(s->downcount<=0) return;\n";
     dispatch << fmt::format("  AOTBlockFunc fn={}_lookup_block(s->pc);\n", prefix);
@@ -1418,15 +1418,15 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
         fwd << fmt::format("#define {}_TABLE_BASE {:#010x}u\n", out.sym, out.table_base);
         fwd << fmt::format("#define {}_TABLE_SIZE {}u\n", out.sym, out.table_size);
         fwd << fmt::format("extern AOTBlockFunc {}_fast_table[];\n", out.sym);
-        fwd << fmt::format("__attribute__((noinline)) void {}_dispatch(AOTState* s);\n", prefix);
+        fwd << fmt::format("__attribute__((noinline)) AOT_BLOCK_CC void {}_dispatch(AOTState* s);\n", prefix);
         fwd << fmt::format("#define {}_dispatch {}_dispatch\n\n", out.sym, prefix);
         for (const auto& [pc, count] : blocks)
-          fwd << fmt::format("__attribute__((noinline)) void {}_block_{:08x}(AOTState* s);\n",
+          fwd << fmt::format("__attribute__((noinline)) AOT_BLOCK_CC void {}_block_{:08x}(AOTState* s);\n",
                              out.sym, pc);
         for (const auto& var : out.variants)
           for (const auto& [pc, count] : rows[var.image])
             fwd << fmt::format(
-                "__attribute__((noinline)) void {}_block_{:08x}_v{:02x}(AOTState* s);\n",
+                "__attribute__((noinline)) AOT_BLOCK_CC void {}_block_{:08x}_v{:02x}(AOTState* s);\n",
                 out.sym, pc, var.mask);
         fwd << "#endif\n";
       }
@@ -1757,7 +1757,7 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
       file << fmt::format("#include \"{}_forward_decls.h\"\n\n", owner->sym);
       file << fmt::format("uint32_t {}_base[{}];\n\n", ro.sym, ro.num_sections);
       for (const auto& [pc, count] : mblocks)
-        file << fmt::format("__attribute__((noinline)) void {}_s{}_{:x}(AOTState* s);\n", ro.sym,
+        file << fmt::format("__attribute__((noinline)) AOT_BLOCK_CC void {}_s{}_{:x}(AOTState* s);\n", ro.sym,
                             pc >> 24, pc & 0x00FFFFFF);
       for (const auto& [pc, count] : mblocks)
         file << emitter.TranslateBlock(pc, count, true) << "\n";
@@ -1884,7 +1884,7 @@ bool TranslateTrustedImages(const DiscIO::Volume& volume, const std::string& cfg
         file << fmt::format("#else\n     0,0u,{}u}},\n#endif\n", flags);
       }
       file << "};\n\n";
-      file << fmt::format("__attribute__((noinline)) void {}_dispatch(AOTState* s) {{\n", prefix);
+      file << fmt::format("__attribute__((noinline)) AOT_BLOCK_CC void {}_dispatch(AOTState* s) {{\n", prefix);
       file << "#if AOT_HARNESS\n    if (aot_single_block_mode) return;\n#endif\n";
       file << "    if (s->downcount <= 0) return;\n";
       file << "    if (__builtin_expect(*aot_images_generation != aot_images_seen, 0))\n"

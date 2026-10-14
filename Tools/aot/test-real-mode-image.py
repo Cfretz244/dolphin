@@ -90,7 +90,7 @@ def main():
 #include <assert.h>
 #include <string.h>
 #include "aot_images.h"
-extern void TSTE01_dispatch(AOTState*);
+extern AOT_BLOCK_CC void TSTE01_dispatch(AOTState*);
 extern AOTBlockFunc TSTE01_lookup_block(uint32_t);
 static uint32_t dol[2] = {0x38600001, 0x4e800020};
 static uint32_t vec[4] = {0x7C9043A6, 0x38600007, 0x808000C0, 0x4C000064};
@@ -122,11 +122,11 @@ void aot_images_rescan(void) {
 }
 AOTBlockFunc aot_images_lookup(uint32_t pc) { return 0; }
 uint32_t aot_images_block_size(uint32_t pc) { return 0; }
-void aot_interpreter_single_step(AOTState* s) { ++fallbacks; s->downcount = 0; }
+AOT_BLOCK_CC void aot_interpreter_single_step(AOTState* s) { ++fallbacks; s->downcount = 0; }
 AOT_SLOWPATH_CC uint32_t aot_read_u32_slow(AOTState* s, uint32_t addr) { ++reads; last_read = addr; return 0x00123450; }
 void aot_mtspr_special(AOTState* s, uint32_t spr, uint32_t val) { if (spr == 272) { ++sprg0_writes; s->spr[272] = val; } }
 void aot_rfi(AOTState* s) { ++rfis; s->pc = s->spr[26]; s->msr = s->spr[27]; s->downcount = 0; }
-void aot_register_game(const char* id, void (*d)(AOTState*), AOTBlockFunc (*l)(uint32_t), uint32_t v) {}
+void aot_register_game(const char* id, AOTBlockFunc d, AOTBlockFunc (*l)(uint32_t), uint32_t v) {}
 void aot_register_game_image(const char* id, const char* h) {}
 void aot_register_game_flags(const char* id, uint32_t f) {}
 void aot_register_image_block_sizes(const char* id, uint32_t (*lookup)(uint32_t)) {}

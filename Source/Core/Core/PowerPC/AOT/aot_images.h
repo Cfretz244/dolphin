@@ -144,7 +144,7 @@ typedef struct AotRsoModuleDesc {
 } AotRsoModuleDesc;
 
 /* Last resort of the generated dispatch when the library has RSO modules. */
-extern void aot_rso_dispatch(AOTState* s);
+extern AOT_BLOCK_CC void aot_rso_dispatch(AOTState* s);
 extern void aot_register_game_rso_modules(const char* game_id, const AotRsoModuleDesc* modules,
                                           uint32_t count, uint32_t images_version);
 

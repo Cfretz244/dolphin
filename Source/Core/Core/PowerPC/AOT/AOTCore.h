@@ -20,7 +20,13 @@ struct PowerPCState;
 }
 
 struct AOTState;
-using AOTBlockFunc = void (*)(AOTState*);
+// Must stay identical to aot_runtime.h's AOTBlockFunc (preserve_none, ABI v4);
+// a redeclaration with a different convention is a compile error where both
+// headers meet.
+#ifndef AOT_BLOCK_CC
+#define AOT_BLOCK_CC __attribute__((preserve_none))
+#endif
+typedef AOT_BLOCK_CC void (*AOTBlockFunc)(AOTState*);
 
 #ifdef DOLPHIN_AOT_HARNESS
 class AotHarness;
@@ -55,7 +61,7 @@ private:
   Core::System& m_system;
   PowerPC::PowerPCState& m_ppc_state;
 
-  using DispatchFunc = void (*)(AOTState*);
+  using DispatchFunc = AOTBlockFunc;  // preserve_none (AOT_BLOCK_CC), ABI v4
   DispatchFunc m_dispatch = nullptr;
   DispatchFunc m_interp_dispatch = nullptr;
 

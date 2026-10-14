@@ -7,7 +7,12 @@
 
 struct AOTState;
 struct AotModuleDesc;
-using AOTBlockFunc = void (*)(AOTState*);
+// Must stay identical to aot_runtime.h's AOTBlockFunc / AOT_BLOCK_CC
+// (preserve_none, ABI v4); a mismatch is a compile error where both meet.
+#ifndef AOT_BLOCK_CC
+#define AOT_BLOCK_CC __attribute__((preserve_none))
+#endif
+typedef AOT_BLOCK_CC void (*AOTBlockFunc)(AOTState*);
 
 // Tracks which REL modules the game currently has loaded and at what
 // addresses, by walking the OS module queue in emulated low memory whenever
@@ -37,4 +42,4 @@ bool LookupBlock(u32 pc, AOTBlockFunc* fn, u32* module_id, u32* section, u32* of
 // Module-aware terminal dispatch, musttail-called by generated <ID>_dispatch
 // when the DOL fast table misses. Falls back to one interpreter step when the
 // pc is not in any active module's table.
-extern "C" void aot_module_dispatch(AOTState* s);
+extern "C" AOT_BLOCK_CC void aot_module_dispatch(AOTState* s);
