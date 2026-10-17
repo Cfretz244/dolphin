@@ -802,7 +802,7 @@ void TextureCacheBase::OnFrameEnd()
     const u64 lag_u = static_cast<u64>(lag);
     // lag=1: flush copies stamped on any frame before the current one.
     if (frame + 1 > lag_u)
-      FlushEFBCopies(frame + 1 - lag_u);
+      FlushEFBCopiesOlderThan(frame + 1 - lag_u);
     m_efb_copy_stats.deferred_kept += m_pending_efb_copies.size();
   }
   m_in_frame_end_flush = false;
@@ -813,14 +813,15 @@ void TextureCacheBase::OnFrameEnd()
     const u64 waits = g_staging_texture_wait_count.load(std::memory_order_relaxed);
     NOTICE_LOG_FMT(VIDEO,
                    "efbcopy lag={} pending={} flushed=+{} discarded=+{} staging_waits=+{} kept=+{} "
-                   "early=+{} copy_waits=+{}",
+                   "early=+{} copy_waits=+{} sync_kept_xfb=+{}",
                    lag, m_pending_efb_copies.size(),
                    m_efb_copy_stats.flushed - m_efb_copy_stats_logged.flushed,
                    m_efb_copy_stats.discarded - m_efb_copy_stats_logged.discarded,
                    waits - m_staging_waits_logged,
                    m_efb_copy_stats.deferred_kept - m_efb_copy_stats_logged.deferred_kept,
                    m_efb_copy_stats.early - m_efb_copy_stats_logged.early,
-                   m_efb_copy_stats.copy_waits - m_efb_copy_stats_logged.copy_waits);
+                   m_efb_copy_stats.copy_waits - m_efb_copy_stats_logged.copy_waits,
+                   m_efb_copy_stats.sync_kept_xfb - m_efb_copy_stats_logged.sync_kept_xfb);
     m_efb_copy_stats_logged = m_efb_copy_stats;
     m_staging_waits_logged = waits;
   }
@@ -2554,7 +2555,38 @@ void TextureCacheBase::FlushEFBCopies()
   m_pending_efb_copies.clear();
 }
 
-void TextureCacheBase::FlushEFBCopies(u64 older_than_frame)
+void TextureCacheBase::FlushEFBCopies(bool keep_xfb)
+{
+  if (!keep_xfb)
+  {
+    FlushEFBCopies();
+    return;
+  }
+  if (m_pending_efb_copies.empty())
+    return;
+
+  // Flush the non-XFB copies in issue order; keep the XFB ones (in order) for OnFrameEnd.
+  std::vector<RcTcacheEntry> kept;
+  u64 n = 0;
+  for (auto& entry : m_pending_efb_copies)
+  {
+    if (entry->is_xfb_copy)
+    {
+      kept.push_back(std::move(entry));
+      continue;
+    }
+    FlushEFBCopy(entry.get());
+    n++;
+  }
+  m_efb_copy_stats.flushed += n;
+  if (!m_in_frame_end_flush)
+    m_efb_copy_stats.early += n;
+  m_efb_copy_stats.sync_kept_xfb += kept.size();
+  m_efb_copy_stats.deferred_kept += kept.size();
+  m_pending_efb_copies = std::move(kept);
+}
+
+void TextureCacheBase::FlushEFBCopiesOlderThan(u64 older_than_frame)
 {
   if (m_pending_efb_copies.empty())
     return;

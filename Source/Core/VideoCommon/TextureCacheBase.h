@@ -297,9 +297,14 @@ public:
 
   // Flushes all pending EFB copies to emulated RAM.
   void FlushEFBCopies();
+  // GPU sync points (draw-done / PE token). keep_xfb=false: flush everything, as above.
+  // keep_xfb=true (iEFBCopyFlushLag > 0): flush the pending non-XFB copies in issue order and leave
+  // XFB copies pending for OnFrameEnd's lag rule -- the CPU never reads an XFB back from RAM after
+  // draw-done; the presenter reads it through the texture cache entry.
+  void FlushEFBCopies(bool keep_xfb);
   // Flushes the pending EFB copies stamped before older_than_frame (in issue order, stopping at
   // the first newer one so overlapping copies still land in order); the rest stay pending.
-  void FlushEFBCopies(u64 older_than_frame);
+  void FlushEFBCopiesOlderThan(u64 older_than_frame);
 
   // Flush any Bound textures that can't be reused
   void FlushStaleBinds();
@@ -476,6 +481,7 @@ private:
     u64 deferred_kept = 0;
     u64 early = 0;       // flushed outside OnFrameEnd (draw-done / PE token / Invalidate / DoState)
     u64 copy_waits = 0;  // staging waits incurred inside FlushEFBCopy
+    u64 sync_kept_xfb = 0;  // XFB copies left pending at a draw-done / PE-token flush
   };
   EFBCopyStats m_efb_copy_stats;
   EFBCopyStats m_efb_copy_stats_logged;
