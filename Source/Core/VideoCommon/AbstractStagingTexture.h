@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <string>
 
@@ -11,6 +12,10 @@
 #include "VideoCommon/TextureConfig.h"
 
 class AbstractTexture;
+
+// Number of times a backend's Flush() actually had to block on the GPU (e.g. Metal
+// waitUntilCompleted). Bumped by backends that track it; read by the texture cache stats line.
+extern std::atomic<u64> g_staging_texture_wait_count;
 
 class AbstractStagingTexture
 {

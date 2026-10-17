@@ -776,7 +776,54 @@ void TextureCacheBase::OnFrameEnd()
   // Flush any outstanding EFB copies to RAM, in case the game is running at an uncapped frame
   // rate and not waiting for vblank. Otherwise, we'd end up with a huge list of pending
   // copies.
-  FlushEFBCopies();
+  //
+  // iOS (Delta): with iEFBCopyFlushLag > 0, only copies issued `lag` or more frames ago are
+  // flushed. Their GPU readback has normally completed by then, so the staging texture's Flush()
+  // doesn't block the emulation thread on this frame's command buffer (n28 stall).
+  const int lag = g_ActiveConfig.iEFBCopyFlushLag;
+  m_in_frame_end_flush = true;
+  if (lag <= 0)
+  {
+    FlushEFBCopies();
+  }
+  else if (m_pending_efb_copies.size() > 64)
+  {
+    if (!m_efb_copy_cap_logged)
+    {
+      m_efb_copy_cap_logged = true;
+      WARN_LOG_FMT(VIDEO, "efbcopy: {} pending deferred EFB copies exceed the cap of 64; flushing all",
+                   m_pending_efb_copies.size());
+    }
+    FlushEFBCopies();
+  }
+  else
+  {
+    const u64 frame = static_cast<u64>(g_presenter->FrameCount());
+    const u64 lag_u = static_cast<u64>(lag);
+    // lag=1: flush copies stamped on any frame before the current one.
+    if (frame + 1 > lag_u)
+      FlushEFBCopies(frame + 1 - lag_u);
+    m_efb_copy_stats.deferred_kept += m_pending_efb_copies.size();
+  }
+  m_in_frame_end_flush = false;
+
+  if (++m_frame_end_calls >= 600)
+  {
+    m_frame_end_calls = 0;
+    const u64 waits = g_staging_texture_wait_count.load(std::memory_order_relaxed);
+    NOTICE_LOG_FMT(VIDEO,
+                   "efbcopy lag={} pending={} flushed=+{} discarded=+{} staging_waits=+{} kept=+{} "
+                   "early=+{} copy_waits=+{}",
+                   lag, m_pending_efb_copies.size(),
+                   m_efb_copy_stats.flushed - m_efb_copy_stats_logged.flushed,
+                   m_efb_copy_stats.discarded - m_efb_copy_stats_logged.discarded,
+                   waits - m_staging_waits_logged,
+                   m_efb_copy_stats.deferred_kept - m_efb_copy_stats_logged.deferred_kept,
+                   m_efb_copy_stats.early - m_efb_copy_stats_logged.early,
+                   m_efb_copy_stats.copy_waits - m_efb_copy_stats_logged.copy_waits);
+    m_efb_copy_stats_logged = m_efb_copy_stats;
+    m_staging_waits_logged = waits;
+  }
 
   Cleanup(g_presenter->FrameCount());
 }
@@ -2392,6 +2439,7 @@ void TextureCacheBase::CopyRenderTargetToTexture(
         entry->pending_efb_copy = std::move(staging_texture);
         entry->pending_efb_copy_width = bytes_per_row / sizeof(u32);
         entry->pending_efb_copy_height = num_blocks_y;
+        entry->pending_efb_copy_frame = static_cast<u64>(g_presenter->FrameCount());
         m_pending_efb_copies.push_back(entry);
       }
     }
@@ -2500,7 +2548,27 @@ void TextureCacheBase::FlushEFBCopies()
 
   for (auto& entry : m_pending_efb_copies)
     FlushEFBCopy(entry.get());
+  m_efb_copy_stats.flushed += m_pending_efb_copies.size();
+  if (!m_in_frame_end_flush)
+    m_efb_copy_stats.early += m_pending_efb_copies.size();
   m_pending_efb_copies.clear();
+}
+
+void TextureCacheBase::FlushEFBCopies(u64 older_than_frame)
+{
+  if (m_pending_efb_copies.empty())
+    return;
+
+  // Copies are appended in issue order, so the flushable ones form a prefix. Stop at the first
+  // newer copy rather than skipping it, so overlapping copies are still written in order.
+  auto it = m_pending_efb_copies.begin();
+  for (; it != m_pending_efb_copies.end() && (*it)->pending_efb_copy_frame < older_than_frame; ++it)
+    FlushEFBCopy(it->get());
+  const u64 n = static_cast<u64>(it - m_pending_efb_copies.begin());
+  m_efb_copy_stats.flushed += n;
+  if (!m_in_frame_end_flush)
+    m_efb_copy_stats.early += n;
+  m_pending_efb_copies.erase(m_pending_efb_copies.begin(), it);
 }
 
 void TextureCacheBase::FlushStaleBinds()
@@ -2528,8 +2596,11 @@ void TextureCacheBase::FlushEFBCopy(TCacheEntry* entry)
   auto& system = Core::System::GetInstance();
   auto& memory = system.GetMemory();
   u8* const dst = memory.GetPointerForRange(entry->addr, covered_range);
+  const u64 waits_before = g_staging_texture_wait_count.load(std::memory_order_relaxed);
   WriteEFBCopyToRAM(dst, entry->pending_efb_copy_width, entry->pending_efb_copy_height,
                     entry->memory_stride, std::move(entry->pending_efb_copy));
+  m_efb_copy_stats.copy_waits +=
+      g_staging_texture_wait_count.load(std::memory_order_relaxed) - waits_before;
 
   // If the EFB copy was invalidated (e.g. the bloom case mentioned in InvalidateTexture), we don't
   // need to do anything more. The entry will be automatically deleted by smart pointers
@@ -2766,6 +2837,7 @@ TextureCacheBase::InvalidateTexture(TexAddrCache::iterator iter, bool discard_pe
       auto pending_it = std::ranges::find(m_pending_efb_copies, entry);
       if (pending_it != m_pending_efb_copies.end())
         m_pending_efb_copies.erase(pending_it);
+      m_efb_copy_stats.discarded++;
     }
     else
     {

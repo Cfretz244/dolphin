@@ -9,6 +9,8 @@
 #include "Common/Assert.h"
 #include "VideoCommon/AbstractTexture.h"
 
+std::atomic<u64> g_staging_texture_wait_count{0};
+
 AbstractStagingTexture::AbstractStagingTexture(StagingTextureType type, const TextureConfig& c)
     : m_type(type), m_config(c), m_texel_size(AbstractTexture::GetTexelSizeForFormat(c.format))
 {

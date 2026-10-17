@@ -289,6 +289,7 @@ struct VideoConfig final
   bool bSkipXFBCopyToRam = false;
   bool bDisableCopyToVRAM = false;
   bool bDeferEFBCopies = false;
+  int iEFBCopyFlushLag = 0;
   bool bImmediateXFB = false;
   bool bSkipPresentingDuplicateXFBs = false;
   bool bCopyEFBScaled = false;

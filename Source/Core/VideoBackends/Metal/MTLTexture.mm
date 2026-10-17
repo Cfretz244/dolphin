@@ -184,6 +184,7 @@ void Metal::StagingTexture::Flush()
     // Flush while we wait, since who knows how long we'll be sitting here
     g_state_tracker->FlushEncoders();
     g_state_tracker->NotifyOfCPUGPUSync();
+    g_staging_texture_wait_count.fetch_add(1, std::memory_order_relaxed);
     [m_wait_buffer waitUntilCompleted];
   }
   m_wait_buffer = nullptr;

@@ -165,6 +165,8 @@ struct TCacheEntry
   std::unique_ptr<AbstractStagingTexture> pending_efb_copy;
   u32 pending_efb_copy_width = 0;
   u32 pending_efb_copy_height = 0;
+  // Presenter frame count when the pending copy was issued (see iEFBCopyFlushLag).
+  u64 pending_efb_copy_frame = 0;
 
   std::string texture_info_name = "";
 
@@ -295,6 +297,9 @@ public:
 
   // Flushes all pending EFB copies to emulated RAM.
   void FlushEFBCopies();
+  // Flushes the pending EFB copies stamped before older_than_frame (in issue order, stopping at
+  // the first newer one so overlapping copies still land in order); the rest stay pending.
+  void FlushEFBCopies(u64 older_than_frame);
 
   // Flush any Bound textures that can't be reused
   void FlushStaleBinds();
@@ -462,6 +467,22 @@ private:
   std::unique_ptr<AbstractStagingTexture> m_readback_texture;
 
   void OnFrameEnd();
+
+  // Deferred EFB copy statistics (CPU/GPU thread only), logged periodically by OnFrameEnd.
+  struct EFBCopyStats
+  {
+    u64 flushed = 0;
+    u64 discarded = 0;
+    u64 deferred_kept = 0;
+    u64 early = 0;       // flushed outside OnFrameEnd (draw-done / PE token / Invalidate / DoState)
+    u64 copy_waits = 0;  // staging waits incurred inside FlushEFBCopy
+  };
+  EFBCopyStats m_efb_copy_stats;
+  EFBCopyStats m_efb_copy_stats_logged;
+  u64 m_staging_waits_logged = 0;
+  u32 m_frame_end_calls = 0;
+  bool m_efb_copy_cap_logged = false;
+  bool m_in_frame_end_flush = false;
 
   Common::EventHook m_frame_event =
       GetVideoEvents().after_frame_event.Register([this](Core::System&) { OnFrameEnd(); });
