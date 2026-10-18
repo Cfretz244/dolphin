@@ -299,6 +299,11 @@ public:
 
   void ScaleTextureCacheEntryTo(RcTcacheEntry& entry, u32 new_width, u32 new_height);
 
+  // iEFBCopyFlushLag, or 0 while g_efb_copy_flush_lag_suppressed is set (the Trilogy launcher).
+  // CPU/GPU thread only: when suppression has just turned on, flushes every pending copy first
+  // (counted as img_flush).
+  int EffectiveFlushLag();
+
   // Flushes all pending EFB copies to emulated RAM.
   void FlushEFBCopies();
   // GPU sync points (draw-done / PE token). keep_xfb=false: flush everything, as above.
@@ -476,6 +481,7 @@ private:
   std::unique_ptr<AbstractStagingTexture> m_readback_texture;
 
   void OnFrameEnd();
+  void OnVIEndField();
 
   // Deferred EFB copy statistics (CPU/GPU thread only), logged periodically by OnFrameEnd.
   struct EFBCopyStats
@@ -486,6 +492,8 @@ private:
     u64 early = 0;       // flushed outside OnFrameEnd (draw-done / PE token / Invalidate / DoState)
     u64 copy_waits = 0;  // staging waits incurred inside FlushEFBCopy
     u64 sync_kept_xfb = 0;  // XFB copies left pending at a draw-done / PE-token flush
+    u64 vi_stale = 0;       // VI-driven flushes: 2 end-fields without a frame end, copies pending
+    u64 img_flush = 0;      // flush-alls when lag suppression turned on (AOT image -> launcher)
   };
   EFBCopyStats m_efb_copy_stats;
   EFBCopyStats m_efb_copy_stats_logged;
@@ -493,9 +501,15 @@ private:
   u32 m_frame_end_calls = 0;
   bool m_efb_copy_cap_logged = false;
   bool m_in_frame_end_flush = false;
+  bool m_lag_suppressed_seen = false;
+  u64 m_frame_end_total = 0;
+  u64 m_frame_end_total_at_vi = 0;
+  u32 m_vi_fields_without_frame_end = 0;
 
   Common::EventHook m_frame_event =
       GetVideoEvents().after_frame_event.Register([this](Core::System&) { OnFrameEnd(); });
+  Common::EventHook m_vi_end_field_event =
+      GetVideoEvents().vi_end_field_event.Register([this] { OnVIEndField(); });
 
   VideoCommon::TextureUtils::TextureDumper m_texture_dumper;
 };

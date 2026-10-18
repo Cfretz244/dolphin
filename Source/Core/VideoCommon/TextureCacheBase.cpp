@@ -782,6 +782,48 @@ void TextureCacheBase::DoLoadState(PointerWrap& p)
   }
 }
 
+int TextureCacheBase::EffectiveFlushLag()
+{
+  const bool suppressed = g_efb_copy_flush_lag_suppressed.load(std::memory_order_relaxed);
+  if (suppressed != m_lag_suppressed_seen)
+  {
+    m_lag_suppressed_seen = suppressed;
+    // Back in the launcher (or a fresh session): nothing deferred from the game may survive into
+    // the synchronous regime -- the launcher CPU-reads the XFB right after copying it.
+    if (suppressed && !m_pending_efb_copies.empty())
+    {
+      FlushEFBCopies();
+      m_efb_copy_stats.img_flush++;
+    }
+  }
+  return suppressed ? 0 : g_ActiveConfig.iEFBCopyFlushLag;
+}
+
+// iOS (Delta) #32: VI-driven flush of stale deferred copies. With a lag, deferred copies are only
+// flushed by the NEXT frame end (or a sync point). When the game stops producing frames (title
+// switch, loading screen) they stay pending: RAM keeps stale content and the copies are flushed
+// much later, possibly into memory the next title already owns (Phase A: the Trilogy launcher's
+// last XFB copies landed in MP1's MEM2 ~20 s later). Two consecutive VI end-fields without a frame
+// end = the game has stopped rendering (60 fps has a frame end every field, 30 fps every other
+// one), the GPU is idle, so flushing now costs ~nothing. Single-core only: in dual-core the VI
+// event fires on the CPU thread and the texture cache belongs to the GPU thread.
+void TextureCacheBase::OnVIEndField()
+{
+  if (Core::System::GetInstance().IsDualCoreMode())
+    return;
+  const int lag = EffectiveFlushLag();
+  if (m_frame_end_total != m_frame_end_total_at_vi)
+  {
+    m_frame_end_total_at_vi = m_frame_end_total;
+    m_vi_fields_without_frame_end = 0;
+    return;
+  }
+  if (++m_vi_fields_without_frame_end < 2 || lag <= 0 || m_pending_efb_copies.empty())
+    return;
+  FlushEFBCopies();
+  m_efb_copy_stats.vi_stale++;
+}
+
 void TextureCacheBase::OnFrameEnd()
 {
   // Flush any outstanding EFB copies to RAM, in case the game is running at an uncapped frame
@@ -791,7 +833,8 @@ void TextureCacheBase::OnFrameEnd()
   // iOS (Delta): with iEFBCopyFlushLag > 0, only copies issued `lag` or more frames ago are
   // flushed. Their GPU readback has normally completed by then, so the staging texture's Flush()
   // doesn't block the emulation thread on this frame's command buffer (n28 stall).
-  const int lag = g_ActiveConfig.iEFBCopyFlushLag;
+  m_frame_end_total++;
+  const int lag = EffectiveFlushLag();
   m_in_frame_end_flush = true;
   if (lag <= 0)
   {
@@ -824,7 +867,7 @@ void TextureCacheBase::OnFrameEnd()
     const u64 waits = g_staging_texture_wait_count.load(std::memory_order_relaxed);
     NOTICE_LOG_FMT(VIDEO,
                    "efbcopy lag={} pending={} flushed=+{} discarded=+{} staging_waits=+{} kept=+{} "
-                   "early=+{} copy_waits=+{} sync_kept_xfb=+{}",
+                   "early=+{} copy_waits=+{} sync_kept_xfb=+{} vi_stale=+{} img_flush=+{}",
                    lag, m_pending_efb_copies.size(),
                    m_efb_copy_stats.flushed - m_efb_copy_stats_logged.flushed,
                    m_efb_copy_stats.discarded - m_efb_copy_stats_logged.discarded,
@@ -832,7 +875,9 @@ void TextureCacheBase::OnFrameEnd()
                    m_efb_copy_stats.deferred_kept - m_efb_copy_stats_logged.deferred_kept,
                    m_efb_copy_stats.early - m_efb_copy_stats_logged.early,
                    m_efb_copy_stats.copy_waits - m_efb_copy_stats_logged.copy_waits,
-                   m_efb_copy_stats.sync_kept_xfb - m_efb_copy_stats_logged.sync_kept_xfb);
+                   m_efb_copy_stats.sync_kept_xfb - m_efb_copy_stats_logged.sync_kept_xfb,
+                   m_efb_copy_stats.vi_stale - m_efb_copy_stats_logged.vi_stale,
+                   m_efb_copy_stats.img_flush - m_efb_copy_stats_logged.img_flush);
     m_efb_copy_stats_logged = m_efb_copy_stats;
     m_staging_waits_logged = waits;
   }

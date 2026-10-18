@@ -16,6 +16,7 @@
 #include "Core/HW/Memmap.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
+#include "VideoCommon/VideoConfig.h"
 
 extern "C" {
 AotActiveImage aot_active_image = {0, 0, nullptr};
@@ -32,6 +33,20 @@ namespace
 {
 const AotImageDesc* s_images = nullptr;
 u32 s_image_count = 0;
+// iOS (Delta) #32: more than one selectable (non-real-mode, non-auxiliary) image = a multi-DOL
+// title whose image 0 ('<boot>') is a launcher (Metroid Prime Trilogy). While that launcher is the
+// active image, deferred EFB/XFB readback lag is suppressed (g_efb_copy_flush_lag_suppressed): the
+// launcher CPU-copies the displayed XFB to MEM1 within one field of the copy at a title switch, so
+// a lagged copy leaves that buffer stale -- black loading screen on #31 (export n31-1959, Phase A
+// of research/xfb-stale-pending-brief.md). The launcher ran 60 fps with synchronous readback (#28).
+// Single-image titles (image 0 = the game) are never suppressed.
+bool s_multi_image = false;
+
+void UpdateFlushLagSuppression(const AotImageDesc* selected)
+{
+  g_efb_copy_flush_lag_suppressed.store(s_multi_image && selected == &s_images[0],
+                                        std::memory_order_relaxed);
+}
 const AotImageDesc* s_active = nullptr;
 const AotImageDesc* s_active_aux = nullptr;
 const AotImageDesc* s_active_real = nullptr;
@@ -455,6 +470,8 @@ void Rescan()
     aot_active_image = {selected->base, selected->size, selected->table};
   else
     aot_active_image = {0, 0, nullptr};
+  // Every rescan, not only on a change: savestate loads land here through MarkDirty too.
+  UpdateFlushLagSuppression(selected);
 }
 }  // namespace
 
@@ -485,6 +502,11 @@ void Init(const AotImageDesc* images, u32 count, const AotRsoModuleDesc* rso_mod
   aot_active_image = {0, 0, nullptr};
   aot_active_image_aux = {0, 0, nullptr};
   aot_active_image_real = {0, 0, nullptr};
+  s_multi_image = std::count_if(images, images + count, [](const AotImageDesc& d) {
+                    return !(d.flags & (AOT_IMAGE_REAL_MODE | AOT_IMAGE_AUXILIARY));
+                  }) > 1;
+  // Suppressed from session start until a non-boot image activates: the launcher is always lag 0.
+  g_efb_copy_flush_lag_suppressed.store(s_multi_image, std::memory_order_relaxed);
   if (count == 0)
   {
     aot_images_generation = &s_idle_generation;
@@ -520,6 +542,8 @@ void Shutdown()
   s_rso_count = 0;
   s_images = nullptr;
   s_image_count = 0;
+  s_multi_image = false;
+  g_efb_copy_flush_lag_suppressed.store(false, std::memory_order_relaxed);
   s_active = nullptr;
   s_active_aux = nullptr;
   s_active_real = nullptr;

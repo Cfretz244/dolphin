@@ -35,6 +35,7 @@
 
 VideoConfig g_Config;
 VideoConfig g_ActiveConfig;
+std::atomic<bool> g_efb_copy_flush_lag_suppressed{false};
 BackendInfo g_backend_info;
 static std::optional<CPUThreadConfigCallback::ConfigChangedCallbackID>
     s_config_changed_callback_id = std::nullopt;

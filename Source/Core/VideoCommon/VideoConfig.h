@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <optional>
 #include <string>
 #include <vector>
@@ -397,6 +398,13 @@ struct VideoConfig final
 
 extern VideoConfig g_Config;
 extern VideoConfig g_ActiveConfig;
+
+// iOS (Delta) #32: when set, the texture cache treats iEFBCopyFlushLag as 0 (synchronous XFB/EFB
+// readback). Set by the AOT image tracker while a multi-image title (Metroid Prime Trilogy) runs
+// its boot image (the launcher): the launcher CPU-copies the displayed XFB to MEM1 within one
+// field of the copy at a title switch, so a deferred copy leaves that buffer stale (black screen,
+// export n31-1959, research/xfb-stale-pending-brief.md). Read by TextureCacheBase only.
+extern std::atomic<bool> g_efb_copy_flush_lag_suppressed;
 
 // Called every frame.
 void UpdateActiveConfig();
