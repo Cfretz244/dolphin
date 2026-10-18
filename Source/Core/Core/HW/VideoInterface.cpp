@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 
@@ -862,6 +863,19 @@ void VideoInterfaceManager::OutputField(FieldType field, u64 ticks)
 
   LogField(field, xfbAddr);
 
+  // iOS (Delta) #32 xfb-stale diagnostics: tell "VI blanked" (no XFB address) from a stale XFB.
+  if (!xfbAddr)
+  {
+    static std::chrono::steady_clock::time_point s_last_blank_log;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - s_last_blank_log >= std::chrono::seconds(1))
+    {
+      s_last_blank_log = now;
+      NOTICE_LOG_FMT(VIDEO, "vi blanked: xfbAddr=0 fb={}x{} stride={}", fbWidth, fbHeight,
+                     fbStride);
+    }
+  }
+
   // Outputting the entire frame using a single set of VI register values isn't accurate, as games
   // can change the register values during scanout. To correctly emulate the scanout process, we
   // would need to collate all changes to the VI registers during scanout.
@@ -896,6 +910,25 @@ void VideoInterfaceManager::EndField(FieldType field, u64 ticks)
     m_system.GetCoreTiming().Throttle(ticks);
 
   m_system.GetPerfMetrics().CountVBlank();
+
+  // iOS (Delta) #32 xfb-stale diagnostics: wall-clock gaps between VI end-fields.
+  {
+    static std::chrono::steady_clock::time_point s_last_end_field;
+    static std::chrono::steady_clock::time_point s_last_gap_log;
+    const auto now = std::chrono::steady_clock::now();
+    if (s_last_end_field.time_since_epoch().count() != 0)
+    {
+      const auto gap_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - s_last_end_field).count();
+      if (gap_ms > 250 && now - s_last_gap_log >= std::chrono::seconds(1))
+      {
+        s_last_gap_log = now;
+        NOTICE_LOG_FMT(VIDEO, "vi end-field gap={} ms", gap_ms);
+      }
+    }
+    s_last_end_field = now;
+  }
+
   m_system.GetVideoEvents().vi_end_field_event.Trigger();
   Core::OnFrameEnd(m_system);
 }

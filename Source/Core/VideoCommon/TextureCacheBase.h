@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <fmt/format.h>
 #include <map>
@@ -167,6 +168,9 @@ struct TCacheEntry
   u32 pending_efb_copy_height = 0;
   // Presenter frame count when the pending copy was issued (see iEFBCopyFlushLag).
   u64 pending_efb_copy_frame = 0;
+  // Host time the pending copy was issued (#32 diagnostics: presenter frames stop advancing while
+  // the game shows a static or CPU-written XFB, so the frame age alone understates staleness).
+  std::chrono::steady_clock::time_point pending_efb_copy_time;
 
   std::string texture_info_name = "";
 

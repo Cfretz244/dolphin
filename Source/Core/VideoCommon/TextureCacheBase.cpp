@@ -65,6 +65,17 @@ static const int TEXTURE_POOL_KILL_THRESHOLD = 3;
 
 static int xfb_count = 0;
 
+// iOS (Delta) #32 xfb-stale diagnostics: at most one line per second per log site, so the lines
+// can stay in the tree and reach device exports.
+static bool XfbDiagRateLimit(std::chrono::steady_clock::time_point* last)
+{
+  const auto now = std::chrono::steady_clock::now();
+  if (now - *last < std::chrono::seconds(1))
+    return false;
+  *last = now;
+  return true;
+}
+
 std::unique_ptr<TextureCacheBase> g_texture_cache;
 
 TCacheEntry::TCacheEntry(std::unique_ptr<AbstractTexture> tex,
@@ -1893,6 +1904,24 @@ RcTcacheEntry TextureCacheBase::GetXFBTexture(u32 address, u32 width, u32 height
     return entry;
   }
 
+  {
+    static std::chrono::steady_clock::time_point s_last;
+    static u32 s_last_addr = 0;
+    if (address != s_last_addr || XfbDiagRateLimit(&s_last))
+    {
+      s_last_addr = address;
+      s_last = std::chrono::steady_clock::now();
+      const bool pending_here =
+          std::ranges::any_of(m_pending_efb_copies, [address](const RcTcacheEntry& e) {
+            return e->is_xfb_copy && e->addr == address;
+          });
+      NOTICE_LOG_FMT(VIDEO, "xfb ram-decode: addr={:#010x} {}x{} pending_total={} pending_here={} "
+                     "frame={}",
+                     address, width, height, m_pending_efb_copies.size(), pending_here,
+                     g_presenter->FrameCount());
+    }
+  }
+
   // Create a new VRAM texture, and fill it with the data from guest RAM.
   entry = AllocateCacheEntry(TextureConfig(width, height, 1, 1, 1, AbstractTextureFormat::RGBA8,
                                            AbstractTextureFlag_RenderTarget,
@@ -1968,6 +1997,16 @@ RcTcacheEntry TextureCacheBase::GetXFBFromCache(u32 address, u32 width, u32 heig
       }
       else
       {
+        if (entry->pending_efb_copy)
+        {
+          static std::chrono::steady_clock::time_point s_last;
+          if (XfbDiagRateLimit(&s_last))
+          {
+            NOTICE_LOG_FMT(VIDEO, "xfb stale-pending: addr={:#010x} stamp={} frame={} ({})",
+                           entry->addr, entry->pending_efb_copy_frame, g_presenter->FrameCount(),
+                           entry->reference_changed ? "reference changed" : "hash miss");
+          }
+        }
         // At this point, we either have an xfb copy that has changed its hash
         // or an xfb created by stitching or from memory that has been changed
         // we are safe to invalidate this
@@ -2441,6 +2480,7 @@ void TextureCacheBase::CopyRenderTargetToTexture(
         entry->pending_efb_copy_width = bytes_per_row / sizeof(u32);
         entry->pending_efb_copy_height = num_blocks_y;
         entry->pending_efb_copy_frame = static_cast<u64>(g_presenter->FrameCount());
+        entry->pending_efb_copy_time = std::chrono::steady_clock::now();
         m_pending_efb_copies.push_back(entry);
       }
     }
@@ -2623,6 +2663,23 @@ void TextureCacheBase::WriteEFBCopyToRAM(u8* dst_ptr, u32 width, u32 height, u32
 void TextureCacheBase::FlushEFBCopy(TCacheEntry* entry)
 {
   const u32 covered_range = entry->pending_efb_copy_height * entry->memory_stride;
+
+  {
+    // #32 diagnostics: a copy flushed 3+ presenter frames or 100+ ms after it was issued.
+    const u64 frame = static_cast<u64>(g_presenter->FrameCount());
+    const u64 age =
+        frame >= entry->pending_efb_copy_frame ? frame - entry->pending_efb_copy_frame : 0;
+    const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - entry->pending_efb_copy_time)
+                            .count();
+    static std::chrono::steady_clock::time_point s_last;
+    if ((age >= 3 || age_ms >= 100) && XfbDiagRateLimit(&s_last))
+    {
+      NOTICE_LOG_FMT(VIDEO,
+                     "efbcopy late-flush: addr={:#010x} age={} age_ms={} xfb={} in_frame_end={}",
+                     entry->addr, age, age_ms, entry->is_xfb_copy, m_in_frame_end_flush);
+    }
+  }
 
   // Copy from texture -> guest memory.
   auto& system = Core::System::GetInstance();
