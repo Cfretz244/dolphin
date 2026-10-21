@@ -47,6 +47,88 @@ void UpdateFlushLagSuppression(const AotImageDesc* selected)
   g_efb_copy_flush_lag_suppressed.store(s_multi_image && selected == &s_images[0],
                                         std::memory_order_relaxed);
 }
+// ---------------------------------------------------------------------------
+// Invalidated-range coalescing (#33, research/rso-rescan-coalesce-brief.md).
+//
+// Every invalidation event bumps iCache.invalidation_generation AND records the effective-address
+// range it covers (PPCCache: Cache::NoteInvalidation / NoteFullInvalidation). Both trackers react
+// to a generation change only as far as the accumulated range touches the RAM their checks read:
+// a launcher/loader icbi loop over a freshly loaded DOL (229,376 interpreted icbi at the Trilogy
+// title switch, export n32-1834) used to cost one full image Rescan() plus a ~115 KB RSO
+// identification scan PER ICBI, because every generation bump re-armed everything.
+//
+// Why skipping is exact: a tracker's view of RAM can only be invalidated by RAM changing, and the
+// design already depends on the game signalling code changes with icbi/dcbf over the changed
+// addresses (DMA/DVD loads do not bump the generation at all). An invalidation that does not touch
+// the addresses a check reads cannot change that check's outcome. The one input outside the
+// recorded windows is an RSO header's name string (its pointer lives in the header, which IS in
+// the window, so a moved name is caught; only an in-place edit of a far-away string is not).
+// Full ranges (reset, savestate load, MarkDirty, HID0/IBAT/config, non-BAT addresses) keep the
+// old behaviour. HID0 writes stay full on purpose: the SDK syscall vector writes HID0 twice per sc,
+// and those rescans are what notice RAM that changed without an invalidation (DMA/memset; e.g. MP1
+// reusing the launcher's auxiliary loader-stub range) -- see PPCCache.h.
+struct Range
+{
+  u32 lo = 0xFFFFFFFFu;
+  u32 hi = 0;
+  bool Empty() const { return lo >= hi; }
+  bool Full() const { return lo == 0 && hi == 0xFFFFFFFFu; }
+  void SetFull()
+  {
+    lo = 0;
+    hi = 0xFFFFFFFFu;
+  }
+  void Merge(u32 l, u32 h)
+  {
+    lo = std::min(lo, l);
+    hi = std::max(hi, h);
+  }
+  // [l, h) in the same normalised space.
+  bool Intersects(u32 l, u32 h) const { return l < hi && lo < h; }
+};
+constexpr u32 Norm(u32 addr)
+{
+  return addr & ~0x40000000u;
+}
+PowerPC::Cache* s_cache = nullptr;  // the iCache whose generation aot_images_generation reads
+u64 s_absorbed_generation = 0;
+Range s_image_range;  // accumulated since the image tracker's last look
+Range s_rso_range;    // accumulated since the RSO tracker's last look
+// Moves the cache's recorded range into both trackers' accumulators once per generation change,
+// so that either tracker can look first (aot_rso_dispatch reaches LookupRso without a rescan).
+void Absorb()
+{
+  if (!s_cache || s_cache->invalidation_generation == s_absorbed_generation)
+    return;
+  s_absorbed_generation = s_cache->invalidation_generation;
+  Range r;
+  s_cache->ConsumeInvalidatedRange(&r.lo, &r.hi);
+  if (r.Empty())
+    r.SetFull();  // a bump without a recorded range (no such site today): be safe
+  s_image_range.Merge(r.lo, r.hi);
+  s_rso_range.Merge(r.lo, r.hi);
+}
+Range TakeRange(Range* acc)
+{
+  Absorb();
+  const Range r = *acc;
+  *acc = {};
+  return r;
+}
+// Every RAM word Rescan() can read (all images' discriminator words and patch sites), normalised
+// and sorted; built at Init.
+std::vector<u32> s_rescan_addrs;
+bool RescanInputsTouched(const Range& r)
+{
+  if (r.Empty() || r.Full())  // empty: no look-worthy change recorded; be safe
+    return true;
+  // A word at a covers [a, a + 4).
+  const auto it =
+      std::lower_bound(s_rescan_addrs.begin(), s_rescan_addrs.end(), r.lo > 3 ? r.lo - 3 : 0);
+  return it != s_rescan_addrs.end() && *it < r.hi;
+}
+u64 s_stat_rescans = 0, s_stat_rescan_skipped = 0;
+
 const AotImageDesc* s_active = nullptr;
 const AotImageDesc* s_active_aux = nullptr;
 const AotImageDesc* s_active_real = nullptr;
@@ -163,10 +245,17 @@ struct ActiveRso
   u32 text_size;
   u32 module_base;
   const AotRsoModuleDesc* desc;
+  // Normalised RAM VerifyRso reads for this module: header + section table + text + identity
+  // words, and the name string the header points at.
+  u32 hull_lo, hull_hi;
+  u32 name_lo, name_hi;
 };
 const AotRsoModuleDesc* s_rso = nullptr;
 u32 s_rso_count = 0;
 u32 s_rso_max_span = 0;  // largest (header + section table + text) of any module
+// How far above a candidate header IdentifyRso/VerifyRso read: the section table (<= 40 entries)
+// and the identity words.
+u32 s_rso_read_ahead = 0x58 + 40 * 8;
 std::vector<ActiveRso> s_rso_active;
 std::unordered_set<u32> s_rso_bad_pages;  // 4 KB pages that identified nothing
 u64 s_rso_seen = 0;
@@ -174,7 +263,8 @@ u32 s_rso_scans = 0;  // scans since the last invalidation event (capped)
 constexpr u32 kMaxRsoScansPerGeneration = 16;
 // Lifetime counters (stats dumps).
 u64 s_rso_stat_scans = 0, s_rso_stat_scan_words = 0, s_rso_stat_identified = 0,
-    s_rso_stat_dropped = 0, s_rso_stat_revalidations = 0, s_rso_stat_capped = 0;
+    s_rso_stat_dropped = 0, s_rso_stat_revalidations = 0, s_rso_stat_capped = 0,
+    s_rso_stat_reval_skipped = 0, s_rso_stat_bad_pages_kept = 0;
 
 // Guest RAM as seen by the scans; fetched once per lookup slow path.
 struct MemView
@@ -280,7 +370,13 @@ void ActivateRso(const MemView& mem, const AotRsoModuleDesc& desc, u32 base, u32
     mem.Rd32(base + 0x58 + i * 8, &v);
     desc.base_slots[i] = v & ~1u;  // located address (bit 0: executable flag)
   }
-  s_rso_active.push_back({text_base, desc.text_size, base, &desc});
+  u32 hull_hi = std::max(text_base + desc.text_size, base + 0x58 + desc.num_sections * 8);
+  for (u32 i = 0; i < desc.word_count; i++)
+    hull_hi = std::max(hull_hi, base + desc.words[i].offset + 4);
+  u32 name = 0;
+  mem.Rd32(base + 0x10, &name);
+  s_rso_active.push_back({text_base, desc.text_size, base, &desc, Norm(std::min(base, text_base)),
+                          Norm(hull_hi), Norm(name), Norm(name) + 257});
   std::sort(s_rso_active.begin(), s_rso_active.end(),
             [](const ActiveRso& a, const ActiveRso& b) { return a.text_base < b.text_base; });
   ++s_rso_stat_identified;
@@ -296,23 +392,51 @@ void DeactivateRso(const ActiveRso& r)
   INFO_LOG_FMT(AOT, "AotRsoTracker: {} at {:#010x} gone", r.desc->name, r.module_base);
 }
 
-// Re-verify the active set after an invalidation event; forget bad pages.
+// After an invalidation event: re-verify the active modules and forget the bad pages whose
+// inputs the invalidated range touches (a full range: all of them, the pre-#33 behaviour).
 void RevalidateRso()
 {
   s_rso_seen = *aot_images_generation;
-  s_rso_bad_pages.clear();
+  // Every generation change re-arms the scan cap, as before #33; the retained bad pages are what
+  // stop the storm.
   s_rso_scans = 0;
+  Range range = TakeRange(&s_rso_range);
+  if (range.Empty())
+    range.SetFull();  // no range recorded (no such site today): be safe
+  const bool full = range.Full();
+  if (full)
+  {
+    s_rso_bad_pages.clear();
+  }
+  else if (!s_rso_bad_pages.empty())
+  {
+    // IdentifyRso(pc) reads [pc - s_rso_max_span, pc + s_rso_read_ahead) (+ name strings).
+    std::erase_if(s_rso_bad_pages, [&](u32 page) {
+      const u32 a = Norm(page << 12);
+      const u32 lo = a > s_rso_max_span ? a - s_rso_max_span : 0;
+      const u32 hi = a + 0x1000u + s_rso_read_ahead;
+      return range.Intersects(lo, hi < a ? 0xFFFFFFFFu : hi);
+    });
+    s_rso_stat_bad_pages_kept += s_rso_bad_pages.size();
+  }
   if (s_rso_active.empty())
     return;
-  ++s_rso_stat_revalidations;
+  bool verified = false;
   const MemView mem;
   std::erase_if(s_rso_active, [&](const ActiveRso& r) {
+    if (!full && !range.Intersects(r.hull_lo, r.hull_hi) && !range.Intersects(r.name_lo, r.name_hi))
+      return false;
+    verified = true;
     u32 text = 0;
     if (VerifyRso(mem, *r.desc, r.module_base, &text) && text == r.text_base)
       return false;
     DeactivateRso(r);
     return true;
   });
+  if (verified)
+    ++s_rso_stat_revalidations;
+  else
+    ++s_rso_stat_reval_skipped;
 }
 
 const ActiveRso* FindRso(u32 pc)
@@ -404,6 +528,7 @@ const ActiveRso* LookupRso(u32 pc)
 
 void Rescan()
 {
+  ++s_stat_rescans;
   auto& system = Core::System::GetInstance();
   auto& memory = system.GetMemory();
   const u8* ram = memory.GetRAM();
@@ -483,10 +608,27 @@ void Init(const AotImageDesc* images, u32 count, const AotRsoModuleDesc* rso_mod
   s_rso = rso_modules;
   s_rso_count = rso_count;
   s_rso_max_span = 0;
+  s_rso_read_ahead = 0x58 + 40 * 8;
   s_rso_active.clear();
   s_rso_bad_pages.clear();
+  s_rescan_addrs.clear();
+  for (u32 i = 0; i < count; i++)
+  {
+    for (u32 k = 0; k < images[i].word_count; k++)
+      s_rescan_addrs.push_back(Norm(images[i].words[k].addr));
+    for (u32 k = 0; k < images[i].patch_count; k++)
+      s_rescan_addrs.push_back(Norm(images[i].patches[k].addr));
+  }
+  std::sort(s_rescan_addrs.begin(), s_rescan_addrs.end());
+  s_rescan_addrs.erase(std::unique(s_rescan_addrs.begin(), s_rescan_addrs.end()),
+                       s_rescan_addrs.end());
+  s_image_range.SetFull();
+  s_rso_range.SetFull();
+  s_cache = nullptr;
   for (u32 m = 0; m < rso_count; m++)
   {
+    for (u32 i = 0; i < rso_modules[m].word_count; i++)
+      s_rso_read_ahead = std::max(s_rso_read_ahead, rso_modules[m].words[i].offset + 4);
     // .text starts right after the header and section table (file offset
     // 0x100-0x130 in every Trilogy module; at most 0x58 + 40 * 8 = 0x198 plus
     // section alignment), so a pc is at most this far above its module base.
@@ -515,10 +657,17 @@ void Init(const AotImageDesc* images, u32 count, const AotRsoModuleDesc* rso_mod
   }
   auto& ppc_state = Core::System::GetInstance().GetPPCState();
   aot_images_generation = &ppc_state.iCache.invalidation_generation;
+  s_cache = &ppc_state.iCache;
+  {
+    u32 lo, hi;
+    s_cache->ConsumeInvalidatedRange(&lo, &hi);  // stale; both accumulators start full
+  }
+  s_absorbed_generation = ppc_state.iCache.invalidation_generation;
   // Force the first dispatch to rescan.
   aot_images_seen = ppc_state.iCache.invalidation_generation - 1;
-  INFO_LOG_FMT(AOT, "AotImageTracker: {} trusted images, {} RSO modules registered", count,
-               rso_count);
+  INFO_LOG_FMT(AOT, "AotImageTracker: {} trusted images, {} RSO modules registered, {} rescan "
+                    "input words",
+               count, rso_count, s_rescan_addrs.size());
   s_rso_seen = aot_images_seen;
   for (u32 i = 0; i < count; i++)
   {
@@ -538,8 +687,11 @@ void Shutdown()
     for (u32 i = 0; i < r.desc->num_sections; i++)
       r.desc->base_slots[i] = 0;
   s_rso_active.clear();
+  s_rso_bad_pages.clear();
   s_rso = nullptr;
   s_rso_count = 0;
+  s_rescan_addrs.clear();
+  s_cache = nullptr;
   s_images = nullptr;
   s_image_count = 0;
   s_multi_image = false;
@@ -561,11 +713,14 @@ std::string RsoStatsLine()
   std::string active;
   for (const auto& r : s_rso_active)
     active += fmt::format(" {}@{:#010x}", r.desc->name, r.text_base);
+  // Fields after "; active:…" were appended in #33 (keep the prefix stable for log parsers).
   return fmt::format("RSO modules: {} registered, identified {}, dropped {}, scans {} ({} words), "
-                     "capped {}, revalidations {}; active:{}",
+                     "capped {}, revalidations {}; active:{}; rescans {} rescan_skipped {} "
+                     "reval_skipped {} bad_pages_kept {}",
                      s_rso_count, s_rso_stat_identified, s_rso_stat_dropped, s_rso_stat_scans,
                      s_rso_stat_scan_words, s_rso_stat_capped, s_rso_stat_revalidations,
-                     active.empty() ? " none" : active);
+                     active.empty() ? " none" : active, s_stat_rescans, s_stat_rescan_skipped,
+                     s_rso_stat_reval_skipped, s_rso_stat_bad_pages_kept);
 }
 
 std::string DescribeRsoPc(u32 pc)
@@ -601,14 +756,28 @@ void MarkDirty()
     return;
   // The counter is host-only and monotonic; bumping it is how every other
   // invalidation source signals us, so do the same rather than adding state.
-  ++Core::System::GetInstance().GetPPCState().iCache.invalidation_generation;
+  // Full range: a savestate load or a harness poke must force a complete rescan.
+  Core::System::GetInstance().GetPPCState().iCache.NoteFullInvalidation();
+}
+
+// Called on every generation change (generated dispatch, lookup, block size).
+void RescanIfTouched()
+{
+  if (!RescanInputsTouched(TakeRange(&s_image_range)))
+  {
+    // No discriminator word or patch site was invalidated: Rescan() would select the same images
+    // and mask, so keep them (UpdateFlushLagSuppression has nothing to update either).
+    ++s_stat_rescan_skipped;
+    return;
+  }
+  Rescan();
 }
 }  // namespace AotImageTracker
 
 extern "C" void aot_images_rescan(void)
 {
   aot_images_seen = *aot_images_generation;
-  AotImageTracker::Rescan();
+  AotImageTracker::RescanIfTouched();
 }
 
 // Real-mode images only serve instruction fetches with MSR.IR clear (their

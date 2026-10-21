@@ -1159,7 +1159,7 @@ void aot_mtspr_special(AOTState* s, uint32_t spr_index, uint32_t val)
 
   case SPR_HID0:
   {
-    ++ppc_state.iCache.invalidation_generation;
+    ppc_state.iCache.NoteFullInvalidation();
     UReg_HID0 old_hid0;
     old_hid0.Hex = old_value;
     if (HID0(ppc_state).ICFI)

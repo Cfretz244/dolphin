@@ -275,7 +275,7 @@ void JitInterface::InvalidateICache(u32 address, u32 size, bool forced)
   if (m_jit)
     m_jit->GetBlockCache()->InvalidateICache(address, size, forced);
   else
-    ++m_system.GetPPCState().iCache.invalidation_generation;  // AOT image tracker
+    m_system.GetPPCState().iCache.NoteInvalidation(address, size);  // AOT image tracker
 }
 
 void JitInterface::InvalidateICacheLine(u32 address)
@@ -283,7 +283,7 @@ void JitInterface::InvalidateICacheLine(u32 address)
   if (m_jit)
     m_jit->GetBlockCache()->InvalidateICacheLine(address);
   else
-    ++m_system.GetPPCState().iCache.invalidation_generation;  // AOT image tracker
+    m_system.GetPPCState().iCache.NoteInvalidation(address & ~31u, 32);  // AOT image tracker
 }
 
 void JitInterface::InvalidateICacheLines(u32 address, u32 count)

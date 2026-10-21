@@ -40,6 +40,26 @@ struct Cache
   // discard selections after explicit invalidation, writes, resets and restores.
   // Host-only, monotonic, and deliberately not serialized.
   u64 invalidation_generation = 0;
+  // Host-only companion of invalidation_generation for the AOT image/RSO trackers (#33): the
+  // union of the effective-address ranges invalidated since the last ConsumeInvalidatedRange(),
+  // half-open [invalidation_lo, invalidation_hi), normalised to the cached mirror
+  // (EA & ~0x40000000). Empty when lo >= hi; [0, 0xFFFFFFFF) = everything. Not serialized, like
+  // the generation (a restore records everything). Every bump of invalidation_generation goes
+  // through the two Note* functions below, so a bump never lacks a range.
+  u32 invalidation_lo = 0xFFFFFFFFu;
+  u32 invalidation_hi = 0;
+
+  // Bump invalidation_generation and record [addr, addr + len) as invalidated (an address outside
+  // the 0x80000000+ BAT windows records everything).
+  void NoteInvalidation(u32 addr, u32 len);
+  // Bump invalidation_generation and record everything: reset, restore, MarkDirty, and the HID0 /
+  // IBAT / config changes. Those last three change no RAM, but the frequent HID0 writes (the Wii
+  // SDK syscall vector writes HID0 twice per sc) are what make the trackers notice RAM that changed
+  // WITHOUT an invalidation (DMA, memset) -- e.g. MP1 reusing the launcher's auxiliary loader-stub
+  // range; recording nothing for them leaves that image active and stale (#33 Outcome).
+  void NoteFullInvalidation();
+  // Returns the range accumulated since the previous call (lo >= hi: empty) and resets it.
+  void ConsumeInvalidatedRange(u32* lo, u32* hi);
 
   std::array<std::array<std::array<u32, CACHE_BLOCK_SIZE>, CACHE_WAYS>, CACHE_SETS> data{};
 

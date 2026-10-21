@@ -87,10 +87,42 @@ InstructionCache::~InstructionCache()
     Config::RemoveConfigChangedCallback(*m_config_callback_id);
 }
 
+void Cache::NoteFullInvalidation()
+{
+  ++invalidation_generation;
+  invalidation_lo = 0;
+  invalidation_hi = 0xFFFFFFFFu;
+}
+
+void Cache::NoteInvalidation(u32 addr, u32 len)
+{
+  // Only the BAT-mapped windows (0x80000000+ and the 0xC0000000 mirror) are recorded precisely;
+  // anything else (real-mode or page-table EAs) may alias tracked RAM, so it counts as everything.
+  const u64 end = u64{addr} + std::max<u32>(len, 1);
+  if (addr < 0x80000000u || end > 0x1'0000'0000ull || (addr < 0xC0000000u && end > 0xC0000000u))
+  {
+    NoteFullInvalidation();
+    return;
+  }
+  ++invalidation_generation;
+  const u32 lo = addr & ~0x40000000u;
+  const u32 hi = static_cast<u32>(lo + (end - addr));
+  invalidation_lo = std::min(invalidation_lo, lo);
+  invalidation_hi = std::max(invalidation_hi, hi);
+}
+
+void Cache::ConsumeInvalidatedRange(u32* lo, u32* hi)
+{
+  *lo = invalidation_lo;
+  *hi = invalidation_hi;
+  invalidation_lo = 0xFFFFFFFFu;
+  invalidation_hi = 0;
+}
+
 void Cache::Reset()
 {
   ++content_generation;
-  ++invalidation_generation;
+  NoteFullInvalidation();
   valid.fill(0);
   plru.fill(0);
   modified.fill(0);
@@ -153,7 +185,7 @@ void Cache::FlushAll(Memory::MemoryManager& memory)
 void Cache::Invalidate(Memory::MemoryManager& memory, u32 addr)
 {
   ++content_generation;
-  ++invalidation_generation;
+  NoteInvalidation(addr & ~31u, 32);
   auto [set, way] = GetCache(memory, addr, true);
 
   if (way == 0xff)
@@ -176,7 +208,7 @@ void Cache::Invalidate(Memory::MemoryManager& memory, u32 addr)
 void Cache::Flush(Memory::MemoryManager& memory, u32 addr)
 {
   ++content_generation;
-  ++invalidation_generation;
+  NoteInvalidation(addr & ~31u, 32);
   auto [set, way] = GetCache(memory, addr, true);
 
   if (way == 0xff)
@@ -299,7 +331,7 @@ void Cache::Read(Memory::MemoryManager& memory, u32 addr, void* buffer, u32 len,
 void Cache::Write(Memory::MemoryManager& memory, u32 addr, const void* buffer, u32 len, bool locked)
 {
   ++content_generation;
-  ++invalidation_generation;
+  NoteInvalidation(addr, len);
   auto* value = static_cast<const u8*>(buffer);
 
   while (len > 0)
@@ -331,7 +363,7 @@ void Cache::DoState(Memory::MemoryManager& memory, PointerWrap& p)
   if (p.IsReadMode())
   {
     ++content_generation;
-    ++invalidation_generation;
+    NoteFullInvalidation();
     // Clear valid parts of the lookup tables (this is done instead of using fill(0xff) to avoid
     // loading the entire 4MB of tables into cache)
     for (u32 set = 0; set < CACHE_SETS; set++)
@@ -393,7 +425,7 @@ void InstructionCache::Invalidate(Memory::MemoryManager& memory, JitInterface& j
                                   u32 addr)
 {
   ++content_generation;
-  ++invalidation_generation;
+  NoteInvalidation(addr & ~31u, 32);
   // Per the 750cl manual, section 3.4.1.5 Instruction Cache Enabling/Disabling (page 137)
   // and section 3.4.2.6 Instruction Cache Block Invalidate (icbi) (page 140), the icbi
   // instruction always invalidates, even if the instruction cache is disabled or locked,
@@ -422,7 +454,7 @@ void InstructionCache::Invalidate(Memory::MemoryManager& memory, JitInterface& j
 
 void InstructionCache::RefreshConfig()
 {
-  ++invalidation_generation;
+  NoteFullInvalidation();
   m_disable_icache = Config::Get(Config::MAIN_DISABLE_ICACHE);
 }
 }  // namespace PowerPC
