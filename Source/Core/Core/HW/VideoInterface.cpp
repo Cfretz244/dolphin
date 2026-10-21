@@ -737,10 +737,20 @@ void VideoInterfaceManager::UpdateParameters()
 
 void VideoInterfaceManager::UpdateRefreshRate()
 {
+  const u32 old_numerator = m_target_refresh_rate_numerator;
+  const u32 old_denominator = m_target_refresh_rate_denominator;
   m_target_refresh_rate_numerator = m_system.GetSystemTimers().GetTicksPerSecond() * 2;
   m_target_refresh_rate_denominator = GetTicksPerEvenField() + GetTicksPerOddField();
   m_target_refresh_rate =
       static_cast<double>(m_target_refresh_rate_numerator) / m_target_refresh_rate_denominator;
+  // #34 pace1: Delta's game-loop period follows this pair; log it once per change.
+  if (m_target_refresh_rate_numerator != old_numerator ||
+      m_target_refresh_rate_denominator != old_denominator)
+  {
+    INFO_LOG_FMT(VIDEOINTERFACE, "target refresh rate {}/{} = {:.6f} Hz",
+                 m_target_refresh_rate_numerator, m_target_refresh_rate_denominator,
+                 m_target_refresh_rate);
+  }
 }
 
 double VideoInterfaceManager::GetTargetRefreshRate() const

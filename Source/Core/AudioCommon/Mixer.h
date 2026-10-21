@@ -60,6 +60,18 @@ public:
   // Racy by design (atomic head/tail snapshot); used only to pace the jukebox
   // decode thread against wall-clock playback.
   std::size_t GetJukeboxQueuedFrames() const;
+  // #34 pace1 (iOS bridge audio pull): input frames queued in the DMA granule FIFO and
+  // not yet mixed (each queued granule holds GRANULE_OVERLAP new frames), and the DMA
+  // input rate to turn them into time. Racy by design, like GetJukeboxQueuedFrames.
+  std::size_t GetDMAQueuedFrames() const
+  {
+    return m_dma_mixer.QueuedGranules() * MixerFifo::GetGranuleOverlap();
+  }
+  double GetDMAInputSampleRate() const
+  {
+    return static_cast<double>(m_dma_mixer.GetInputSampleRateDividend()) /
+           m_dma_mixer.GetInputSampleRateDivisor();
+  }
 
   void StartLogDTKAudio(const std::string& filename);
   void StopLogDTKAudio();
